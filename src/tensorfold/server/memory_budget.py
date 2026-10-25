@@ -35,9 +35,19 @@ def process_footprint() -> int | None:
         info = Usage()
         if libc.proc_pid_rusage(os.getpid(), 4, ctypes.byref(info)) != 0:
             return None
+        return int(info.footprint)
     except (OSError, AttributeError):
+        pass
+    # Linux (Omarchy) has no libSystem: the resident set from /proc is the same
+    # accounting to within shared file pages, which the GPU budget rounds away.
+    try:
+        with open("/proc/self/status") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
         return None
-    return int(info.footprint)
+    return None
 
 
 def model_fraction(package: Any, ram: int | None = None) -> float:
