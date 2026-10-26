@@ -27,9 +27,14 @@ class Backend:
 
 
 def simd_qmm_backend() -> Backend:
-    """``simd_qmm`` (4-bit) and ``simd_qmm_bits`` (5/6/8-bit, groups of 64), else affine_rows; checked per shape."""
+    """Use affine_rows without native Metal, otherwise choose simd_qmm, simd_qmm_bits or affine_rows per shape."""
 
-    from tensorfold.kernels.qwen.dense.v1 import affine_rows, simd_qmm, simd_qmm_bits
+    from tensorfold.kernels.qwen.dense.v1 import affine_rows
+
+    # The Vulkan MSL translator cannot lower simdgroup_matrix operations.
+    if not mx.metal.is_available():
+        return Backend("affine_rows", affine_rows.qmm, affine_rows.MAX_ROWS, affine_rows.fits)
+    from tensorfold.kernels.qwen.dense.v1 import simd_qmm, simd_qmm_bits
 
     def prepare(weights: list[tuple[mx.array, mx.array, mx.array, int, int]]) -> None:
         seen: set[tuple[Any, ...]] = set()

@@ -62,6 +62,7 @@ class Linear:
 def mx(monkeypatch):
     fake = ModuleType("mlx.core")
     fake.bfloat16, fake.float16, fake.float32, fake.uint32 = "bf16", "f16", "f32", "u32"
+    fake.metal = NS(is_available=lambda: True)
     fake.int32 = "i32"
     fake.array, fake.contiguous, fake.concatenate = Array, lambda value: value, concatenate
     fake.eval, fake.clear_cache = lambda *args: None, lambda: None
@@ -211,13 +212,30 @@ def backend(mx, monkeypatch):
     monkeypatch.setitem(sys.modules, simd.__name__, simd)
     # `from package import simd_qmm` reads the package attribute first, set once the real module was imported
     monkeypatch.setattr(sys.modules["tensorfold.kernels.qwen.dense.v1"], "simd_qmm", simd, raising=False)
-    monkeypatch.setattr(affine_rows, "qmm", lambda x, w, s, b, gs, bits:
+    simd_bits = ModuleType("tensorfold.kernels.qwen.dense.v1.simd_qmm_bits")
+    simd_bits.fits = lambda *args: False
+    monkeypatch.setitem(sys.modules, simd_bits.__name__, simd_bits)
+    monkeypatch.setattr(sys.modules["tensorfold.kernels.qwen.dense.v1"], "simd_qmm_bits", simd_bits, raising=False)
+    monkeypatch.setattr(affine_rows, "qmm", lambda x, w, s, b, gs, bits=4:
                         calls.append(("generic", gs, bits)) or Array((*x.shape[:-1], w.shape[0])))
     namespace = {"mx": mx, "FRAGMENT_ROWS": 8, "_ATTR": "_stacks", "BACKEND": None}
     names = {"Backend", "Stack", "_stackable", "project", "project_stack", "logits", "simd_qmm_backend"}
     load_definitions("row_matmul.py", namespace, names)
     namespace["BACKEND"] = namespace["simd_qmm_backend"]()
     return NS(api=namespace, calls=calls, simd=simd)
+
+
+@pytest.mark.parametrize("bits,group,rows", [(4, 64, 1), (4, 64, 8), (3, 32, 16), (8, 128, 16)])
+def test_non_metal_backend_uses_affine_rows_without_matrix_preparation(backend, mx, bits, group, rows):
+    mx.metal.is_available = lambda: False
+    target = backend.api["simd_qmm_backend"]()
+    assert target.name == "affine_rows"
+    assert target.prepare is None
+    assert target.max_rows == affine_rows.MAX_ROWS
+    module = Linear(bits=bits, gs=group)
+    assert target.fits(module)
+    assert target(Array((1, rows, 128)), module.weight, module.scales, module.biases, group, bits).shape == (1, rows, 8)
+    assert backend.calls == [("generic", group, bits)]
 
 
 @pytest.mark.parametrize("bits,gs,rows,kind", [(4, 64, 1, ("fast", 64)), (4, 32, 4, ("fast", 32)),
