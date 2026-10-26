@@ -1,4 +1,4 @@
-"""Metal validation of packed affine values and identical rows across verifier widths."""
+"""GPU validation of packed affine values and identical rows across verifier widths."""
 from __future__ import annotations
 
 import numpy as np
@@ -7,7 +7,7 @@ import pytest
 mx = pytest.importorskip('mlx.core')
 from tensorfold.kernels.qwen.dense.v1 import affine_rows
 
-pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason='requires Metal')
+pytestmark = pytest.mark.skipif(mx.default_device() != mx.gpu, reason='requires GPU')
 
 
 def _pack(values, bits):

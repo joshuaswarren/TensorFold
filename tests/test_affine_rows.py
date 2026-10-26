@@ -169,6 +169,26 @@ def test_every_width_launches_256_threads_and_one_kernel_per_row_bucket(mx, monk
         assert rows <= rt or rt == 8
 
 
+@pytest.mark.parametrize("bits,group,shape", [(4, 64, (1, 64, 128)), (3, 32, (2, 3, 128)),
+                                            (8, 128, (1, 1, 128))])
+def test_non_metal_uses_same_packed_weights_in_one_gpu_matmul_per_row(mx, monkeypatch, bits, group, shape):
+    mx.metal.is_available = lambda: False
+    calls = []
+
+    def qmm(x, weight, scales, biases, **kwargs):
+        calls.append((x.shape, weight, scales, biases, kwargs))
+        return Array((1, weight.shape[0]))
+
+    mx.quantized_matmul = qmm
+    monkeypatch.setattr(affine_rows, "_kernel", lambda *args: pytest.fail("non-Metal reached a custom Metal header"))
+    module = Linear(n=37, bits=bits, gs=group)
+    actual = affine_rows.qmm(Array(shape), module.weight, module.scales, module.biases, group, bits)
+    assert actual.shape == (*shape[:-1], 37) and actual.dtype == "bf16"
+    assert len(calls) == math.prod(shape[:-1])
+    assert all(call == ((1, 128), module.weight, module.scales, module.biases,
+                        {"transpose": True, "group_size": group, "bits": bits}) for call in calls)
+
+
 @pytest.mark.parametrize("bits", affine_rows.BITS)
 @pytest.mark.parametrize("group", affine_rows.GROUP_SIZES)
 def test_tiny_kernel_inputs_are_padded_without_changing_logical_layout(mx, monkeypatch, bits, group):
@@ -185,7 +205,9 @@ def test_tiny_kernel_inputs_are_padded_without_changing_logical_layout(mx, monke
 
 
 @pytest.mark.parametrize("x", [Array((2, 127)), Array((2, 128), "f32"), Array((128,)), Array((0, 128))])
-def test_bad_inputs_fail_before_a_kernel_is_requested(mx, monkeypatch, x):
+@pytest.mark.parametrize("metal", [True, False])
+def test_bad_inputs_fail_before_a_kernel_is_requested(mx, monkeypatch, x, metal):
+    mx.metal.is_available = lambda: metal
     monkeypatch.setattr(affine_rows, "_kernel", lambda: pytest.fail("invalid inputs reached Metal"))
     module = Linear(bits=8, gs=128)
     with pytest.raises(ValueError):

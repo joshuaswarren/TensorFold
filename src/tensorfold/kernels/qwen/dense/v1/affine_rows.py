@@ -174,6 +174,15 @@ def qmm(x: Any, weight: Any, scales: Any, biases: Any, group_size: int = 64, bit
     rows = int(x.size) // k
     if not 1 <= rows <= MAX_ROWS:
         raise ValueError(f"Affine rows take 1..{MAX_ROWS} input rows")
+    if not mx.metal.is_available():
+        # shortcut: serial GPU rows limit throughput; batch only after proving window/serial bit parity.
+        flat = x.reshape(rows, k)
+        output = mx.concatenate([
+            mx.quantized_matmul(flat[row:row + 1], weight, scales, biases, transpose=True,
+                                group_size=group_size, bits=bits)
+            for row in range(rows)
+        ])
+        return output.reshape(*x.shape[:-1], n)
     ops, rt = launch(rows)
     inputs = [mx.contiguous(x.reshape(rows, k)), padded(mx.contiguous(weight)), padded(mx.contiguous(scales)),
               padded(mx.contiguous(biases))]
