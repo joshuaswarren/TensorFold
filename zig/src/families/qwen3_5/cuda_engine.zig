@@ -192,6 +192,8 @@ pub const Engine = struct {
         e.mlp = null;
         e.taught = 0;
         e.kit = null;
+        e.arc = null; // the Allocation above leaves the whole struct undefined: a field default never runs, and a stale arc made the CUDA-only path call project()
+        e.routed = .{}; // same class: assigned only for MoE below, and the Allocation leaves it undefined on dense models
         e.d = d;
         e.g = g;
         e.geo = .{ .hid = @intCast(g.hidden), .nk = @intCast(g.k_heads), .nv = @intCast(g.v_heads), .qh = @intCast(g.q_heads), .kvh = @intCast(g.kv_heads), .nl = @intCast(g.deltas()) };

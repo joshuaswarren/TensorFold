@@ -486,3 +486,13 @@ test "the bridge's learning mode refuses before touching device state" {
     e.arc = &adapter;
     try std.testing.expectError(error.ArcHeadNoLearning, e.admit(&.{}, &.{}, .hidden));
 }
+
+test "the packed arc field is cleared by initWithArc: the engine allocation leaves defaults unapplied" {
+    // Source-order guard only (a behavioural check needs a CUDA Engine, so the GPU run is the proof): Allocation(T).create sets the
+    // struct to undefined, so `arc: ?*Adapter = null` never runs and initWithArc must clear arc itself, before its Arc branch.
+    const engine_src = @embedFile("cuda_engine.zig");
+    const cleared = std.mem.indexOf(u8, engine_src, "        e.arc = null;").?;
+    const arc_branch_set = std.mem.indexOf(u8, engine_src, "e.arc = try @import(\"cuda_arc_head.zig\").Adapter.init").?;
+    try std.testing.expect(cleared < arc_branch_set);
+    try std.testing.expect(std.mem.indexOf(u8, engine_src, "        e.routed = .{};") != null);
+}
