@@ -78,10 +78,11 @@ fn raw3Bytes(count: usize, n: usize, k: usize) usize {
 }
 
 /// What `load` takes from the arena: every packed projection and vector, each allocation aligned.
-pub fn total(g: Geometry) usize {
+/// `cuda_head` is false when the head runs on the Intel Arc GPU (cuda_arc_head.zig): its bytes are not taken.
+pub fn total(g: Geometry, cuda_head: bool) usize {
     const mo = g.kinds.modelopt;
     var t: usize = if (mo) aligned(g.vocab * g.hidden * 2) else embedBytes(g);
-    t += if (mo) modelopt.packedBytes(g.vocab, g.hidden, g.kinds.head) else packedBytes(g.vocab, g.hidden, g.bits.head); // the head
+    if (cuda_head) t += if (mo) modelopt.packedBytes(g.vocab, g.hidden, g.kinds.head) else packedBytes(g.vocab, g.hidden, g.bits.head); // the head
     t += aligned(g.hidden * 2);
     for (0..g.layers) |i| {
         t += 2 * aligned(g.hidden * 2);
@@ -341,7 +342,8 @@ pub fn load(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer) !void {
         e.embed_w = try embedWords(e, ck, stage, m);
         e.embed_s = try tensor(e, ck, "{s}embed_tokens.scales", .{m}, .bf16, &.{ g.vocab, g.hidden / 64 });
         e.embed_b = try tensor(e, ck, "{s}embed_tokens.biases", .{m}, .bf16, &.{ g.vocab, g.hidden / 64 });
-        e.head = if (g.tied) try linear(e, e, ck, stage, m, "embed_tokens", g.vocab, g.hidden, g.bits.head) else try linear(e, e, ck, stage, "language_model.", "lm_head", g.vocab, g.hidden, g.bits.head);
+        // the Arc GPU runs the head: its projection is neither packed nor kept on the CUDA device
+        e.head = if (e.arc != null) null else if (g.tied) try linear(e, e, ck, stage, m, "embed_tokens", g.vocab, g.hidden, g.bits.head) else try linear(e, e, ck, stage, "language_model.", "lm_head", g.vocab, g.hidden, g.bits.head);
     }
     e.final_norm = try normVec(e, ck, mo, "{s}norm.weight", .{m}, .bf16, &.{g.hidden});
     const conv = g.convWidth();
@@ -391,18 +393,18 @@ test "a uniform 4-bit checkpoint keeps its sizes; other modules take their own w
     var g: Geometry = undefined;
     g = .{ .hidden = 2048, .intermediate = 6144, .layers = 2, .vocab = 248320, .k_heads = 16, .v_heads = 16, .q_heads = 8, .kv_heads = 2, .eps = 1e-6, .tied = true, .context = 4096, .linear = @splat(false) };
     g.linear[0] = true;
-    const uniform = total(g);
+    const uniform = total(g, true);
     try std.testing.expectEqual(rawBytes(g.vocab, g.hidden, 4), stageBytes(g));
     g.bits.proj[1][@backingInt(Slot.down)] = 8;
     const nk = shape(g, .down);
-    try std.testing.expectEqual(uniform - packedBytes(nk[0], nk[1], 4) + packedBytes(nk[0], nk[1], 8), total(g));
+    try std.testing.expectEqual(uniform - packedBytes(nk[0], nk[1], 4) + packedBytes(nk[0], nk[1], 8), total(g, true));
     g.bits.proj[1][@backingInt(Slot.down)] = 3; // on 3-bit tiles: 3 bits a weight
-    try std.testing.expectEqual(uniform - packedBytes(nk[0], nk[1], 4) + packedBytes(nk[0], nk[1], 3), total(g));
+    try std.testing.expectEqual(uniform - packedBytes(nk[0], nk[1], 4) + packedBytes(nk[0], nk[1], 3), total(g, true));
     try std.testing.expect(packedBytes(nk[0], nk[1], 3) < packedBytes(nk[0], nk[1], 4));
     g.bits.proj[1][@backingInt(Slot.down)] = 4;
     g.bits.embed = 6;
     g.bits.head = 6;
-    try std.testing.expect(total(g) > uniform);
+    try std.testing.expect(total(g, true) > uniform);
     try std.testing.expectEqual(rawBytes(g.vocab, g.hidden, 6), stageBytes(g));
 }
 

@@ -289,6 +289,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     var probe: Probe = .{ .a = a, .io = io, .ctx = &g.ctx, .held = held0, .problem = problem };
     var opts: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide };
+    if (comptime @hasField(F.Options, "arc_head")) opts.arc_head = qwen35.arc_head_enabled;
     if (!family_options.set(F, o, &opts, problem)) return null;
     if (@hasField(F.Options, "room")) opts.room = .{ .ctx = &probe, .read = Probe.read };
     if (weights > before.room(held0)) {

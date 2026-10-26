@@ -214,7 +214,7 @@ pub const Kernels = struct {
                 };
             }
         };
-        most = Each.bytes(k.lane, e.head);
+        most = if (e.head) |h| Each.bytes(k.lane, h) else 0; // the Arc GPU's head is not on the CUDA device
         for (e.layers) |l| {
             switch (l.mlp) {
                 .dense => |m| for ([_]Proj{ m.gate, m.up, m.down }) |p| {

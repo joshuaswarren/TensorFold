@@ -16,6 +16,7 @@ pub const Cuda = struct {
     flashnext_ids: ?[]const u8,
     flashnext_count: []const u8,
     flashnext_fixtures: ?[]const u8,
+    arc_head: bool,
 };
 
 /// The CUDA options for every target: a script that passes them where no CUDA step runs is not refused.
@@ -36,6 +37,7 @@ pub fn cuda(b: *std.Build) Cuda {
         .flashnext_ids = b.option([]const u8, "flashnext_ids", "file of prompt token ids for the Flash Next prompt check"),
         .flashnext_count = b.option([]const u8, "flashnext_count", "greedy tokens to emit") orelse "8",
         .flashnext_fixtures = b.option([]const u8, "flashnext_fixtures", "capture_sparse.sh's selection fixtures folder"),
+        .arc_head = b.option(bool, "xpu-head", "Run the Qwen3.5 head on an Intel Arc GPU (needs ocloc and the Level Zero loader)") orelse false,
     };
 }
 

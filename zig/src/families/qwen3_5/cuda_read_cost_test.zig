@@ -19,7 +19,7 @@ const Recorder = struct {
     x: u64 = 200,
     logits: u64 = 300,
     final_norm: u64 = 400,
-    head: u64 = 500,
+    head: ?u64 = 500, // the head's projection, absent when the Arc GPU runs it
     stream: @import("cuda").Stream = undefined,
     norms: usize = 0,
     heads: usize = 0,
@@ -29,7 +29,7 @@ const Recorder = struct {
         r.norms += 1;
     }
     pub fn proj(r: *@This(), weight: u64, src: u64, dst: u64, rows: usize, prompt: bool) !void {
-        try t.expect(weight == r.head and dst == r.logits and rows == 1 and !prompt);
+        try t.expect(weight == r.head.? and dst == r.logits and rows == 1 and !prompt);
         r.heads += 1;
         r.src = src;
     }

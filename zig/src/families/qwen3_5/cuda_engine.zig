@@ -106,7 +106,9 @@ pub const Engine = struct {
     embed_b: u64,
     embed_bits: u8, // the embedding's rows' width: 4 or 8 (16: bf16 rows, an EXL3 checkpoint's)
     kit: ?*x3w.Kit = null, // an EXL3 checkpoint's kernels (g.exl3)
-    head: Proj,
+    /// The head on an Intel Arc GPU (cuda_arc_head.zig); the CUDA head is absent while it is on.
+    arc: ?*@import("cuda_arc_head.zig").Adapter = null,
+    head: ?Proj,
     final_norm: u64,
     layers: []Layer,
     // scratch, max_rows rows each
@@ -168,9 +170,15 @@ pub const Engine = struct {
     const tables_len = Round.bytes;
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kv8: bool) !*Engine {
+        return initWithArc(gpa, io, ctx, dir, kv8, false);
+    }
+
+    /// The engine with its head on an Intel Arc GPU (cuda_arc_head.zig): the CUDA head is neither loaded nor projected.
+    pub fn initWithArc(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kv8: bool, arc_head: bool) !*Engine {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         const started = profile.now(io);
         const g = try Geometry.read(gpa, io, dir);
+        if (arc_head) try @import("cuda_arc_head.zig").validateFormat(g);
         const d = ctx.d;
         const e = try @import("cuda_prompt_int8.zig").Allocation(Engine).create(gpa);
         errdefer gpa.destroy(e);
@@ -200,7 +208,7 @@ pub const Engine = struct {
         var ck = try core.Checkpoint.openModel(gpa, io, dir);
         defer ck.close();
         // an EXL3 checkpoint's weights are sized by a dry run of its loader (trellis widths come from the tensors)
-        const wbytes = if (g.exl3) try x3w.measure(e, &ck) else weights.total(g);
+        const wbytes = if (g.exl3) try x3w.measure(e, &ck) else weights.total(g, !arc_head);
         e.arena = try DeviceBuffer.alloc(d, wbytes + try e.scratch(.measure));
         errdefer e.arena.free();
         try e.arena.fill8(0, null); // touched once now: the driver commits memory on first touch, slowly
@@ -244,6 +252,11 @@ pub const Engine = struct {
             errdefer e.kit.?.deinit(gpa);
             try x3w.load(e, &ck);
         } else {
+            if (arc_head) {
+                // the head runs on the Intel Arc GPU: it is resident there, and the CUDA head is not loaded
+                e.arc = try @import("cuda_arc_head.zig").Adapter.init(gpa, &ck, g, d, &e.stream, most_verify);
+                errdefer e.arc.?.deinit();
+            }
             // each projection as stored, packed from here; freed before the server counts what streams can use
             var stage = try DeviceBuffer.alloc(d, weights.stageBytes(g));
             defer stage.free();
@@ -277,6 +290,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         recurrent.shutdown(e);
+        if (e.arc) |a| a.deinit();
         if (e.kit) |k| k.deinit(e.gpa);
         e.pockets.deinit();
         var it = e.graphs.valueIterator();
@@ -401,6 +415,7 @@ pub const Engine = struct {
 
     /// Refuse the whole frame before settling any prior window or launching work.
     pub fn admit(e: *const Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
+        if (e.learning != null and e.arc != null) return error.ArcHeadNoLearning;
         const g = e.g;
         if (!geometry.supported(g, ids.len, keep == .last, most_verify)) return error.UnsupportedQwenGeometry;
         var total: usize = 0;
@@ -509,6 +524,11 @@ pub const Engine = struct {
             }
             try gop.value_ptr.launchOn(e.stream);
         }
+        // the head on the Arc GPU, after the replay and before the caches advance: it reads the trunk's last rows
+        if (e.arc) |a| switch (keep) {
+            .hidden => {}, // a hidden forward keeps no logits
+            else => try a.project(e, total, heads),
+        };
         for (parts) |p| p.cache.advanced(p.rows, record);
         switch (keep) {
             .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them

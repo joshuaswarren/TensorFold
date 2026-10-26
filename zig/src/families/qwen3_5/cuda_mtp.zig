@@ -304,7 +304,8 @@ pub const Mtp = struct {
     /// Rows [first, first + n) of x through the target's head: their logits and best tokens' words, row 0's pick.
     fn draw(d: *Mtp, first: usize, n: usize, cands: bool) !void {
         const e = d.e;
-        try d.proj(e.head, d.x + first * e.g.hidden * 2, d.logits, n);
+        const head_proj = e.head orelse return error.NoDraftHead; // the Arc GPU's head leaves the drafter without one
+        try d.proj(head_proj, d.x + first * e.g.hidden * 2, d.logits, n);
         try e.run(e.fns.argmax, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, .{ d.logits, @as(c_int, @intCast(e.g.vocab)), d.tok });
         if (cands and d.trees) try e.draws.logprobRows(e.stream, d.logits, e.g.vocab, d.picks, ranks, false, d.words, n);
     }

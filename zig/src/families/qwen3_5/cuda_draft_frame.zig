@@ -149,7 +149,8 @@ fn narrow(contexts: []const *draft.Ctx) bool {
 /// The rows' draft logits over the spans' columns, packed in d.logits after the two projections (null: not this head).
 fn head(d: anytype, rows: usize) !?u64 {
     const e = d.e;
-    const q = switch (e.head) {
+    const proj = e.head orelse return full(d, rows); // the Arc GPU's head: the draft projects the whole vocabulary
+    const q = switch (proj) {
         .a4 => |q| q,
         .an, .ql => return full(d, rows),
         .x3, .bf => return full(d, rows),
@@ -173,6 +174,7 @@ fn head(d: anytype, rows: usize) !?u64 {
 
 /// The rows' draft logits over the whole vocabulary, in d.logits.
 fn full(d: anytype, rows: usize) !?u64 {
-    try draft.precision.project(d.e, d.e.head, d.x, d.xs, d.logits, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
+    const proj = d.e.head orelse return error.NoDraftHead; // the Arc GPU's head leaves the draft without one
+    try draft.precision.project(d.e, proj, d.x, d.xs, d.logits, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
     return null;
 }

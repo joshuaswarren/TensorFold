@@ -16,6 +16,7 @@ const reuse = @import("cuda_reuse.zig");
 const Mtp = @import("cuda_mtp.zig").Mtp;
 const pages_mod = @import("cuda_pages.zig");
 const cache_mod = @import("cuda_cache.zig");
+const arc_head = @import("cuda_arc_head.zig");
 const kv_pool = @import("core").kv_pool;
 const be = lanes.backend;
 pub const round_timing = @import("cuda_round_timing.zig");
@@ -45,7 +46,7 @@ pub const snap_grid: u32 = E.max_rows;
 /// explain() words open refusals too (--vision on a checkpoint without a tower it reads).
 pub const explains_open = true;
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, kv8: bool = false, prompt_int8: bool = false, precision: ?enum { full } = null };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, kv8: bool = false, prompt_int8: bool = false, precision: ?enum { full } = null, arc_head: bool = false };
 
 /// What the native server drives: the lane backend, the facts its round loop reads, and how to free it.
 pub const Loaded = struct {
@@ -109,7 +110,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const page_test = try cache_mod.pageTest();
     _ = try cache_mod.cacheRows(o.context, page_test);
     if (page_tokens > 0 and o.slide) return error.QwenPagesNoLearner;
-    const e = try E.Engine.init(gpa, io, ctx, dir, o.kv8);
+    const arc = o.arc_head or arc_head.requested(); // TF_Q35_ARC_HEAD=1 runs the head on an Intel Arc GPU
+    if (arc and o.drafts) return error.ArcHeadNoDrafts; // the drafter projects the target's head on the CUDA device
+    const e = try E.Engine.initWithArc(gpa, io, ctx, dir, o.kv8, arc);
     errdefer e.deinit();
     if (o.prompt_int8) try e.int8.enable(e); // --prompt-precision int8: prompt projections quantize their inputs
     if (e.g.vocab != c.vocab) return error.UnsupportedQwenVocab; // draw.zig's masks are sized by the 2B's vocabulary

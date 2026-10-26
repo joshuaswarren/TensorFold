@@ -137,7 +137,8 @@ fn cases(gpu: check.Gpu, model: []const u8, drafter: []const u8, ids: []const u3
     const opened = try q.native.openDrafter(gpu.gpa, gpu.io, loaded.ctx, drafter, 4);
     defer opened.close(opened.ctx);
     const d: *q.draft.Draft = @ptrCast(@alignCast(opened.ctx));
-    if (d.e.g.hidden != 5120 or d.e.g.layers != 64 or d.e.g.experts != 0 or d.c.block != plan.block or d.e.head != .a4 or d.e.window_rows < plan.block or d.e.verify_rows < plan.block) return error.FrameGateNeeds27BAffine4;
+    const head = d.e.head orelse return error.FrameGateNeeds27BAffine4;
+    if (d.e.g.hidden != 5120 or d.e.g.layers != 64 or d.e.g.experts != 0 or d.c.block != plan.block or head != .a4 or d.e.window_rows < plan.block or d.e.verify_rows < plan.block) return error.FrameGateNeeds27BAffine4;
     for (ids) |id| if (id >= d.e.g.vocab) return error.InvalidQwenToken;
     var proxy: Proxy = .{ .d = d };
     var wrapped = try lanes.drafted.Drafted.init(gpu.gpa, loaded.backend, proxy.interface());

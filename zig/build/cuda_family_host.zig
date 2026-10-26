@@ -3,6 +3,9 @@ const std = @import("std");
 
 pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.Build.Step) void {
     const host = b.graph.host;
+    const arc = b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{ "the bridge's", "the packed" } }));
+    b.step("test-qwen35-arc-head-host", "Arc head packing, conversion and FP64 projection contracts without devices").dependOn(&arc.step);
+    step.dependOn(&arc.step);
     const prefill = b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{"Qwen stepped prefill:"} }));
     b.step("test-qwen35-prefill-host", "Interrupted stepped prompt lifecycle without devices").dependOn(&prefill.step);
     step.dependOn(&prefill.step);

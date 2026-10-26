@@ -9,7 +9,7 @@ pub const kernels = catalog.kernels;
 pub const runtime = @import("cuda_runtime.zig").runtime;
 const stagger = @import("cuda_runtime.zig").stagger;
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module, radio: *std.Build.Module, living: *std.Build.Module } {
+fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module, arc_head: bool, xpu_tools: ?@import("xpu.zig").Options) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module, radio: *std.Build.Module, living: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core.addImport("gpu_memory", @import("gpu_memory.zig").module(b, target));
@@ -37,11 +37,18 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     qwen35.addImport("lanes", lanes);
     const qwen_vision = qwenVisionModule(b, target, optimize, cuda, core, lanes);
     qwen35.addImport("qwen_vision", qwen_vision);
+    // the Intel GPU modules: the head may run on an Arc card (-Dxpu-head); without the image it is refused
+    const arc = @import("xpu.zig").arcModules(b, target, optimize, arc_head, xpu_tools);
+    const arc_options = b.addOptions();
+    arc_options.addOption(bool, "enabled", arc_head);
+    qwen35.addOptions("arc_head_options", arc_options);
+    qwen35.addImport("xpu", arc.xpu);
+    qwen35.addImport("arc_kernels", arc.kernels);
     return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .qwen35 = qwen35, .qwen_vision = qwen_vision, .tokenizer = tokenizer, .heat = heat, .radio = radio, .living = living };
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
-pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options, opts: @import("options.zig").Cuda) void {
+pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options, opts: @import("options.zig").Cuda, xpu_tools: @import("xpu.zig").Options) void {
     const nvcc = opts.nvcc;
     const prebuilt = opts.fatbins;
     const sms = opts.sms;
@@ -70,7 +77,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     }, .{ .name = "h3", .flags = &.{"-O3"} }, sms) else null;
     @import("h3_host.zig").library(b, target, optimize, h3_image);
     const cuda = runtime(b, target, optimize, if (nvcc != null or prebuilt != null) &images else &.{});
-    const mods = family(b, target, optimize, cuda, draft_ids);
+    const mods = family(b, target, optimize, cuda, draft_ids, opts.arc_head, xpu_tools);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
     const native = engines(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision);
     for ([_]struct { []const u8, *std.Build.Module }{ .{ "cuda", cuda }, .{ "core", mods.core }, .{ "lanes", mods.lanes }, .{ "nemotron", mods.nemotron }, .{ "dory", native.engines.import_table.get("dory").? } }) |m| cli.addImport(m[0], m[1]);
@@ -123,7 +130,9 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     q35.addImport("cuda", cuda);
     q35.addImport("core", mods.core);
     q35.addImport("qwen35", mods.qwen35);
-    b.installArtifact(b.addExecutable(.{ .name = "tf-qwen35-cuda", .root_module = q35 }));
+    const q35_exe = b.addExecutable(.{ .name = "tf-qwen35-cuda", .root_module = q35 });
+    b.installArtifact(q35_exe);
+    b.step("compile-qwen35-cuda", "Compile the Qwen CUDA projection comparison runner without a GPU").dependOn(&q35_exe.step);
     const d3_tool = b.createModule(.{ .root_source_file = b.path("zig/src/families/drama3/generate.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "drama3", .module = @import("drama3_host.zig").module(b, target, optimize, cuda, mods.core) } } });
     const d3_exe = b.addExecutable(.{ .name = "drama3-generate", .root_module = d3_tool });
     b.step("drama3-generate", "Drama generation and replay controls on CUDA").dependOn(&b.addInstallArtifact(d3_exe, .{}).step);
@@ -250,7 +259,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     b.step("test-tp-id-host", "Bounded NCCL-ID TP fanout and independent wire controls without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{"tp id coverage:"} })).step);
     const runtime_host = b.step("test-runtime-host", "Shared CUDA runtime and graph host regressions");
     runtime_host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda })).step);
-    const mods = family(b, host, .debug, cuda, draft_ids);
+    const mods = family(b, host, .debug, cuda, draft_ids, false, null);
     @import("qwen_contract.zig").host(b, mods.core, step);
     @import("qwen_vision_weights_host.zig").host(b, mods.core, step);
     @import("inc4_host.zig").round(b, cuda, mods.core);
@@ -342,7 +351,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const bolt = b.step("test-bolt-host", "Nemotron Bolt and shared lane host contracts");
     const cuda_target = b.resolveTargetQuery(.{ .cpu_arch = host.result.cpu.arch, .os_tag = .linux, .abi = .gnu });
     const check_cuda = runtime(b, cuda_target, .debug, &.{});
-    const check_mods = family(b, cuda_target, .debug, check_cuda, draft_ids);
+    const check_mods = family(b, cuda_target, .debug, check_cuda, draft_ids, false, null);
     @import("cuda_census.zig").steps(b, cuda_target, check_cuda, check_mods.qwen35, check_mods.core, flashnextModule(b, cuda_target, .debug, check_cuda, check_mods.core, check_mods.lanes, check_mods.qwen_vision));
     const compile_bolt = b.addObject(.{ .name = "bolt_host_compile", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/bolt_compile.zig"),
@@ -531,7 +540,7 @@ pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *s
         image.* = b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) }));
     };
     const cuda = runtime(b, target, .fast, if (prebuilt != null) &images else &.{});
-    const mods = family(b, target, .fast, cuda, draft_ids);
+    const mods = family(b, target, .fast, cuda, draft_ids, false, null);
     return nativeServer(b, target, .fast, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision, mods.tokenizer, mods.living, build_options, false, null);
 }
 

@@ -225,9 +225,19 @@ pub const Runtime = struct {
 
     /// As `module` with driver build flags (e.g. "-cl-intel-128-GRF-per-thread").
     pub fn moduleWith(self: *Runtime, spv: []const u8, flags: ?[*:0]const u8) Error!Module {
+        return self.moduleImage(spv, 0, flags); // SPIR-V
+    }
+
+    /// A module from an offline-compiled image (ocloc's .bin): the driver loads it as it is, without a JIT.
+    pub fn moduleNative(self: *Runtime, bin: []const u8) Error!Module {
+        return self.moduleImage(bin, 1, null); // ZE_MODULE_FORMAT_NATIVE
+    }
+
+    /// The create both paths share: the image's format and the flags differ, the diagnostics do not.
+    fn moduleImage(self: *Runtime, image: []const u8, format: u32, flags: ?[*:0]const u8) Error!Module {
         var m: ze.H = null;
         var log: ze.H = null;
-        const md: ze.ModuleDesc = .{ .format = 0, .inputSize = spv.len, .pInputModule = spv.ptr, .pBuildFlags = flags }; // SPIR-V
+        const md: ze.ModuleDesc = .{ .format = format, .inputSize = image.len, .pInputModule = image.ptr, .pBuildFlags = flags };
         const res = self.drv.api.zeModuleCreate(self.ctx, self.device, &md, &m, &log);
         if (res != 0) {
             var sz: usize = 0;

@@ -3,14 +3,23 @@
 const std = @import("std");
 const exlr8_build = @import("exlr8.zig");
 
+pub const Options = struct { ocloc: []const u8, device: []const u8 };
+
+pub fn toolOptions(b: *std.Build) Options {
+    return .{
+        .ocloc = b.option([]const u8, "ocloc", "Intel offline compiler") orelse "ocloc",
+        .device = b.option([]const u8, "xpu-device", "ocloc device for the XPU kernels") orelse "bmg",
+    };
+}
+
 /// ze.zig as its own module: the Qwen27 runner and the Nemotron runtime share one Level Zero table.
 fn zeModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("zig/src/xpu/ze.zig"), .target = target, .optimize = optimize, .link_libc = true });
 }
 
-pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options) void {
-    const ocloc = b.option([]const u8, "ocloc", "Intel offline compiler") orelse "ocloc";
-    const device = b.option([]const u8, "xpu-device", "ocloc device for the XPU kernels") orelse "bmg";
+pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, build_options: *std.Build.Step.Options, tools: Options) void {
+    const ocloc = tools.ocloc;
+    const device = tools.device;
     const ngen_include = b.option([]const u8, "ngen-include", "nGEN header directory (oneDNN)") orelse "ngen";
     const files = b.addWriteFiles();
     const opts = "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread";
@@ -229,6 +238,38 @@ fn nemotronSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         mod.addImport("nemotron_xpu", mods.nemotron);
         tests_step.dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = b.fmt("tf-xpu-{s}-test", .{name}), .root_module = mod }), .{}).step);
     }
+}
+
+/// The Intel GPU modules a family needs to run a head on an Arc card: the Level Zero runtime and the head's kernels.
+pub const Arc = struct { xpu: *std.Build.Module, kernels: *std.Build.Module };
+
+/// The Arc head's modules: the runtime, and gemm.cl's w4_decode as ocloc's offline image (MLX affine 4/64,
+/// fp16 in and out). Without the image the family refuses the head at run time, and the build needs no ocloc.
+pub fn arcModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, enabled: bool, tools: ?Options) Arc {
+    const files = b.addWriteFiles();
+    const embedded = b.createModule(.{ .root_source_file = files.add("arc_kernels.zig",
+        \\pub const gemm align(8) = @embedFile("arc_gemm.bin").*;
+        \\
+    ) });
+    if (enabled) {
+        const options = tools orelse unreachable;
+        const ocloc = options.ocloc;
+        const device = options.device;
+        const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
+        c.addFileArg(b.path("zig/kernels/xpu/qwen27/gemm.cl"));
+        c.addArgs(&.{ "-device", device, "-options", "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread -DGSZ=64", "-output_no_suffix", "-output", "arc_gemm", "-out_dir" });
+        c.setCwd(b.path("."));
+        const dir = c.addOutputDirectoryArg("ocloc-arc_gemm");
+        _ = files.addCopyFile(dir.path(b, "arc_gemm.bin"), "arc_gemm.bin");
+    } else {
+        _ = files.add("arc_gemm.bin", ""); // no image: the family refuses the head at run time
+    }
+    // the runtime without Nemotron's images: the head's kernel module is its own
+    const options = b.createModule(.{ .root_source_file = files.add("arc_runtime_options.zig", "pub const with_kernels = false;\n") });
+    const xpu = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    xpu.addImport("kernel_options", options);
+    xpu.addImport("ze", zeModule(b, target, optimize));
+    return .{ .xpu = xpu, .kernels = embedded };
 }
 
 /// Host unit tests of the Intel GPU runtime, the Nemotron family on it and its CLI (no GPU, no ocloc), on any host.

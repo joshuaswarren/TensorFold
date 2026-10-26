@@ -6,6 +6,7 @@ pub const prompt_int8 = @import("cuda_prompt_int8.zig");
 pub const engine = @import("cuda_engine.zig");
 pub const signatures = @import("cuda_signatures.zig");
 pub const native = @import("cuda_native.zig");
+pub const arc_head_enabled = @import("arc_head_options").enabled;
 pub const native_moe = @import("cuda_native_moe.zig");
 pub const mtp = @import("cuda_mtp.zig");
 pub const mtp_check = @import("cuda_mtp_check.zig");
@@ -51,6 +52,7 @@ pub const Engine = engine.Engine;
 
 test {
     _ = @import("cuda_completion.zig");
+    _ = @import("cuda_arc_head.zig");
 }
 
 test {

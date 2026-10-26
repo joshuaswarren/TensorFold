@@ -21,6 +21,9 @@ const usage =
     \\windows, each row's KL(bf16 || fp8) of the next-token distributions, top-1 agreement and both losses on the next
     \\id; control: bf16 against bf16 whose every other window rotates three positions on (a uniform shift cancels).
     \\int8: fp8 caches on both sides, the second's prompt chunks through int8 activations (w4a8_prefill.cu).
+    \\arc: the head on an Intel Arc GPU (TF_Q35_ARC_HEAD=1), compared on identical ids and checkpoint; the selected device
+    \\and module input format are logged. Every row's greedy top-1 must match, and relative L2 must be <=1%; margins are
+    \\diagnostic only. Arc logits land in <out>. Exit 1 if either measured gate fails.
     \\
 ;
 
@@ -46,6 +49,16 @@ pub fn main(init: std.process.Init) !u8 {
         const control = args.len == 8 and std.mem.eql(u8, args[7], "control");
         const int8 = args.len == 8 and std.mem.eql(u8, args[7], "int8");
         return kl(init, a, args[1], args[3], args[4], skip, try std.fmt.parseInt(usize, args[6], 10), control, int8);
+    }
+    if (args.len >= 3 and std.mem.eql(u8, args[2], "arc")) {
+        if (args.len != 5) {
+            std.debug.print("{s}", .{usage});
+            return 2;
+        }
+        var arc_ids: std.ArrayList(u32) = .empty;
+        var arc_it = std.mem.tokenizeAny(u8, args[3], ", ");
+        while (arc_it.next()) |t| try arc_ids.append(a, try std.fmt.parseInt(u32, t, 10));
+        return arcCompare(init, a, args[1], arc_ids.items, args[4]);
     }
     if (args.len != 5 and !(args.len == 6 and std.mem.eql(u8, args[5], "fp8"))) {
         std.debug.print("{s}", .{usage});
@@ -489,6 +502,83 @@ fn paddedPos(a: std.mem.Allocator, pos: []const i32, p0: usize, n: usize) ![]i32
     for (0..3) |ax| {
         for (0..p0) |i| out[ax * m + i] = @intCast(i);
         @memcpy(out[ax * m + p0 ..][0..n], pos[ax * n ..][0..n]);
+    }
+    return out;
+}
+
+/// The head on Intel Arc against CUDA, on the same ids and checkpoint. Every row's greedy top-1 must match;
+/// relative L2 error is bounded to 1%, while margins are diagnostic only. The Arc logits land in `out`.
+fn arcCompare(init: std.process.Init, a: std.mem.Allocator, model: []const u8, ids: []const u32, out: []const u8) !u8 {
+    var driver = try cuda.Driver.open();
+    defer driver.close();
+    var ctx = try cuda.Context.init(&driver, 0);
+    defer ctx.deinit();
+    // the baseline: the CUDA head
+    const base = try E.Engine.init(init.gpa, init.io, &ctx, model, false);
+    defer base.deinit();
+    const base_rows = try arcRows(init, a, base, ids);
+    // the Arc: the same trunk, the head on the Intel Arc GPU
+    const arc = try E.Engine.initWithArc(init.gpa, init.io, &ctx, model, false, true);
+    defer arc.deinit();
+    const arc_rows = try arcRows(init, a, arc, ids);
+    const vocab = base.g.vocab;
+    if (vocab < 2) return error.ArcHeadVocab;
+    const relative_l2_limit = 1e-2;
+    var worst_relative_l2: f64 = 0;
+    var same: usize = 0;
+    var undecided_margins: usize = 0;
+    for (0..ids.len) |r| {
+        const b = base_rows[r * vocab ..][0..vocab];
+        const g = arc_rows[r * vocab ..][0..vocab];
+        var squared_error: f64 = 0;
+        var baseline_squared: f64 = 0;
+        var max_abs_error: f32 = 0;
+        for (b, g) |x, y| {
+            if (!std.math.isFinite(x) or !std.math.isFinite(y)) return error.ArcHeadNotFinite;
+            const delta = @as(f64, x) - @as(f64, y);
+            squared_error += delta * delta;
+            baseline_squared += @as(f64, x) * x;
+            max_abs_error = @max(max_abs_error, @abs(x - y));
+        }
+        worst_relative_l2 = @max(worst_relative_l2, @sqrt(squared_error) / @max(@sqrt(baseline_squared), 1e-30));
+        // Keep two distinct baseline candidates, including when column zero is already the winner.
+        var t1: usize = 0;
+        var t2: usize = 1;
+        if (b[t2] > b[t1]) std.mem.swap(usize, &t1, &t2);
+        for (b[2..], 2..) |x, i| {
+            if (x > b[t1]) {
+                t2 = t1;
+                t1 = i;
+            } else if (x > b[t2]) t2 = i;
+        }
+        var a1: usize = 0;
+        for (g, 0..) |x, i| {
+            if (x > g[a1]) a1 = i;
+        }
+        if (a1 == t1) same += 1;
+        if (b[t1] - b[t2] <= 2 * max_abs_error) undecided_margins += 1;
+    }
+    std.debug.print("arc head: {d} rows, worst relative L2 {d:.5} (limit {d:.3}), top-1 same {d}/{d}, {d} diagnostic margins within 2x max error\n", .{ ids.len, worst_relative_l2, relative_l2_limit, same, ids.len, undecided_margins });
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out, .data = std.mem.sliceAsBytes(arc_rows) });
+    if (same != ids.len) {
+        std.debug.print("arc head: {d} rows picked a different greedy top-1 token\n", .{ids.len - same});
+        return 1;
+    }
+    if (worst_relative_l2 > relative_l2_limit) {
+        std.debug.print("arc head: relative L2 exceeded the conservative tolerance\n", .{});
+        return 1;
+    }
+    return 0;
+}
+
+/// The ids one at a time through the engine: every step's logits as f32, the rows in order.
+fn arcRows(init: std.process.Init, a: std.mem.Allocator, e: *E.Engine, ids: []const u32) ![]f32 {
+    var cache = try E.Cache.init(init.gpa, e, 4096);
+    defer cache.deinit(init.gpa);
+    const out = try a.alloc(f32, ids.len * e.g.vocab);
+    for (ids, 0..) |id, r| {
+        try e.forward(&.{.{ .cache = &cache, .rows = 1 }}, &.{id}, .logits);
+        for (e.rowLogits(0), 0..) |h, n| out[r * e.g.vocab + n] = @floatCast(bf(h));
     }
     return out;
 }

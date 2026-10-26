@@ -137,8 +137,8 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
     const g = e.g;
     try e.norm(true, e.final_norm, total);
     if (e.learning) |k| try k.final(e.h, total);
-    // the head over the kept rows
-    try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
+    // the head over the kept rows (the Arc GPU's head, when it runs, lands in the same buffer)
+    if (e.head) |h| try e.proj(h, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
     if (e.learning) |k| try hooks.logits(k, e.logits, e.stream);
 }
 

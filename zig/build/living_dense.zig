@@ -16,7 +16,7 @@ pub fn host(b: *std.Build, cuda: *std.Build.Module, qwen: *std.Build.Module, dra
     const placeholder = b.addWriteFiles().add("fake-driver-only.fatbin", "FAKE DRIVER ONLY, NEVER A DEVICE IMAGE");
     const images: [n]?std.Build.LazyPath = @splat(placeholder);
     const fake_cuda = runtime(b, t, .debug, &images);
-    const fake = family(b, t, .debug, fake_cuda, draft_ids);
+    const fake = family(b, t, .debug, fake_cuda, draft_ids, false, null);
     const constructors = b.addRunArtifact(b.addTest(.{ .root_module = fake.qwen35, .filters = &.{"dense constructor:"} }));
     b.step("test-dense-constructors-host", "Actual dense constructor ownership and completion failures").dependOn(&constructors.step);
     _ = cuda;

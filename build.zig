@@ -133,11 +133,12 @@ pub fn build(b: *std.Build) void {
     const voice_exe = b.addExecutable(.{ .name = "drama3-voice", .root_module = voice_tool });
     b.step("drama3-voice", "Attested Drama voice files from reference WAVs, coded by drama3-generate --encode").dependOn(&b.addInstallArtifact(voice_exe, .{}).step);
     // the backend options are declared for every target, so one build script may pass the same flags on every OS
+    const xpu_options = xpu_build.toolOptions(b);
     const cuda_options = @import("zig/build/options.zig").cuda(b);
     const tp_options = @import("zig/build/options.zig").tp(b);
     switch (target.result.os.tag) {
         .macos => metalTargets(b, target, optimize, draft_ids, build_options, test_step),
-        .linux, .windows => cuda_build.targets(b, target, optimize, draft_ids, build_options, cuda_options),
+        .linux, .windows => cuda_build.targets(b, target, optimize, draft_ids, build_options, cuda_options, xpu_options),
         else => {},
     }
     const gemma4_host_sources = b.createModule(.{ .root_source_file = b.path("zig/kernels/metal/sources.zig"), .target = b.graph.host });
@@ -171,7 +172,7 @@ pub fn build(b: *std.Build) void {
     hip_build.loaderTests(b, test_step);
     if (with_hip) hip_build.steps(b, target, optimize, build_options, test_step, hip_options);
     exlr8_build.hostTests(b, target, test_step);
-    xpu_build.steps(b, target, optimize, build_options);
+    xpu_build.steps(b, target, optimize, build_options, xpu_options);
     video_build.steps(b, target, test_step);
     const lanes_cpu = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true });
     const disk_cpu = b.addTest(.{ .root_module = b.createModule(.{
