@@ -51,6 +51,18 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const stage2_host = b.step("stage2-host-test", "Stage 2 norm/MLP operator-plan host tests and the stage 2 fixture suite, without GPU work");
     stage2_host.dependOn(&b.addRunArtifact(vk_host_tests).step);
     stage2_host.dependOn(&b.addRunArtifact(stage2_fixture_tests).step);
+    // The stage 2 probe's host tests: the Bound16 view-derivation regression (binding lifetime),
+    // pure host. `shaders` and `main` stay unanalyzed here; the SPIR-V assets belong to the GPU build.
+    const stage2_probe_host_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/stage2_probe.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+        .imports = &.{
+            .{ .name = "vulkan", .module = module(b, b.graph.host, .debug, o) },
+            .{ .name = "contract", .module = @import("kernel_contract.zig").module(b, b.graph.host, .debug) },
+        },
+    }) });
+    stage2_host.dependOn(&b.addRunArtifact(stage2_probe_host_tests).step);
     const vulkan = module(b, target, optimize, o);
     const gpu = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/vulkan/gpu_tests.zig"),
