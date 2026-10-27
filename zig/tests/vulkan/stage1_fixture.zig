@@ -40,7 +40,7 @@ pub const cases = [_]Case{
     .{ .name = "m1 n8 k64", .shape = .{ .rows = 1, .n = 8, .k = 64 } },
     .{ .name = "m2 n257 k128", .shape = .{ .rows = 2, .n = 257, .k = 128 } },
     .{ .name = "m2 n256 k128 offsets", .shape = .{ .rows = 2, .n = 256, .k = 128 }, .at = .{ .x = 128, .w = 64, .scales = 256, .biases = 384, .out = 512 } },
-    .{ .name = "m3 n8 k64 cancel", .shape = .{ .rows = 3, .n = 8, .k = 64 }, .fill = .cancel, .at = .{ .x = 128, .w = 192, .scales = 256, .biases = 320, .out = 384 } },
+    .{ .name = "m3 n8 k64 cancel", .shape = .{ .rows = 3, .n = 8, .k = 64 }, .fill = .cancel, .at = .{ .x = 128, .w = 192, .scales = 256, .biases = 384, .out = 384 } },
 };
 
 const served = blk: {
@@ -296,6 +296,14 @@ const testing = std.testing;
 test "bf16 vectors agree with the contract's RNE cast at every stated geometry" {
     for (bf16_vectors) |v| try testing.expectEqual(v.want, c.toBf16(v.in));
     try testing.expectEqual(@as(u16, 0x3f81), c.toBf16(1.0 + 0x1p-8 + 0x1p-20)); // a hair above half
+}
+
+test "projection fixture bindings meet the largest Vulkan storage alignment" {
+    for (cases) |case| {
+        for ([_]usize{ case.at.x * 2, case.at.w * 4, case.at.scales * 2, case.at.biases * 2, case.at.out * 2 }) |bytes| {
+            try testing.expectEqual(@as(usize, 0), bytes % 256);
+        }
+    }
 }
 
 test "both cast widths check the actual tail after a whole output readback" {
