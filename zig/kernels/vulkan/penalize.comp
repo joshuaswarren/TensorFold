@@ -1,0 +1,45 @@
+// Presence and frequency penalties over one BF16 logits row: the CUDA
+// tf_penalize_rows primitive on the single-sequence engine (every entry is
+// row 0, so no ROW table). Entry i widens the logit of TOK[i] exactly to
+// fp32 (bits << 16), subtracts SUB[i] once in fp32 and rounds once to BF16
+// RNE — the same single-store rounding the repo's bf16_store applies — so
+// the greedy finite/argmax scan reads the penalized row. The host stages one
+// entry per DISTINCT reply token, so no two threads write the same uint16
+// halfword: plain read-modify-write, no atomics, no packed-u32 races.
+// Grid: x = ceil(count / 256).
+
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) buffer Logits {
+  uint16_t values[];
+} logits;
+layout(set = 0, binding = 1, std430) readonly buffer Tok {
+  uint toks[];
+};
+layout(set = 0, binding = 2, std430) readonly buffer Sub {
+  float subs[];
+};
+
+layout(push_constant) uniform Params {
+  uint count;
+} params;
+
+uint16_t bf16_store(float value) {
+  uint bits = floatBitsToUint(value);
+  if (isnan(value)) {
+    return uint16_t((bits >> 16) | 0x40u);
+  }
+  return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= params.count) return;
+  float x = uintBitsToFloat(uint(logits.values[toks[i]]) << 16u);
+  logits.values[toks[i]] = bf16_store(x - subs[i]);
+}
