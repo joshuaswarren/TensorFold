@@ -29,6 +29,7 @@ const pinned = @import("../../config.zig");
 const weights = @import("weights.zig");
 const state = @import("state.zig");
 const fwd = @import("forward.zig");
+pub const penalties = @import("penalties.zig");
 
 const Allocator = std.mem.Allocator;
 const View = vk.tensor.View;
@@ -69,6 +70,9 @@ pub const ShaderBundle = struct {
     attention: vk.attention.Shaders,
     gdn: vk.gdn.Shaders,
     greedy: vk.greedy.Shaders,
+    /// The penalties' single-pass penalize image (the build compiles
+    /// penalize.comp; the engine only checks and pipelines it).
+    penalize: []align(4) const u8,
 };
 
 /// One engine's sequence plan: checked before any GPU work; pure and
@@ -112,6 +116,9 @@ pub const Engine = struct {
     attn: vk.Attention,
     gdn: vk.Gdn,
     greedy: vk.Greedy,
+    /// Presence/frequency penalties staged by the backend, applied by the
+    /// decode after the head and before the greedy draw (penalties.zig).
+    penalties: penalties.Penalties,
     arena: vk.arena.Arena,
     model: weights.Model,
     state: state.State,
@@ -171,6 +178,9 @@ pub const Engine = struct {
         errdefer e.gdn.deinit();
         e.greedy = try vk.Greedy.init(e.dev, bundle.greedy, pinned.vocab);
         errdefer e.greedy.deinit();
+        e.penalties = .{ .gpa = gpa, .dev = e.dev };
+        e.penalties.pipe = try vk.dispatch.Pipeline.init(e.dev, bundle.penalize, .{ .bindings = 3, .push_bytes = @sizeOf(u32), .writes = 1 });
+        errdefer e.penalties.deinit(); // the pipeline cleans up after itself inside init; from here deinit is total
 
         e.arena = try vk.arena.Arena.init(e.dev, arena_bytes);
         errdefer e.arena.deinit();
@@ -194,6 +204,8 @@ pub const Engine = struct {
     pub fn deinit(e: *Engine) void {
         e.state.deinit();
         e.model.deinit();
+        e.penalties.pipe.deinit();
+        e.penalties.deinit();
         e.arena.deinit();
         e.greedy.deinit();
         e.gdn.deinit();
@@ -216,6 +228,7 @@ pub const Engine = struct {
     /// cursor rewound to the persistent base.
     pub fn reset(e: *Engine) Error!void {
         try vk.orExit(e.state.reset(e.cmds, e.staging, e.timeout_ns));
+        e.penalties.clear(); // no staged entries survive a reset (poison recovery included)
         e.arena.reset(e.base_mark) catch {};
         e.poisoned = false;
     }
@@ -270,16 +283,18 @@ pub const Engine = struct {
 
     /// One steady decode token as ONE command buffer, ONE vkQueueSubmit and
     /// ONE fence wait: the fed token's ids upload, embed, all 24 layers,
-    /// final norm and head, the GPU greedy finite/argmax, the 12-byte
-    /// chosen-ID result copy and the optional full-row logits receipt copy
-    /// are all recorded into a single batch; the host reads the Result and
-    /// receipt only after that fence. Same op order, barriers, push values,
-    /// shaders and arithmetic as decode + draw + logitsBytes — only the
-    /// submission granularity differs. Every staging input and output gets
-    /// its own immutable slice within the batch; descriptor sets are banked
-    /// snapshots reused only after the fence. Wrap in vk.orExit as ever; a
-    /// pre-submit recording error aborts the batch cleanly and leaves the
-    /// engine poisoned (reset before reuse), exactly like decode.
+    /// final norm and head, the staged penalties' upload and one dispatch
+    /// (nothing at all with none staged), the GPU greedy finite/argmax, the
+    /// 12-byte chosen-ID result copy and the optional full-row logits
+    /// receipt copy are all recorded into a single batch; the host reads
+    /// the Result and receipt only after that fence. Same op order,
+    /// barriers, push values, shaders and arithmetic as decode + draw +
+    /// logitsBytes — only the submission granularity differs. Every staging
+    /// input and output gets its own immutable slice within the batch;
+    /// descriptor sets are banked snapshots reused only after the fence.
+    /// Wrap in vk.orExit as ever; a pre-submit recording error aborts the
+    /// batch cleanly and leaves the engine poisoned (reset before reuse),
+    /// exactly like decode.
     pub fn decodeDraw(e: *Engine, token: u32, receipt_out: ?[]u8) Error!u32 {
         if (e.poisoned) return error.Poisoned;
         try vk.ops_q4.checkIds(&.{token}, e.model.embed.n);
@@ -292,6 +307,10 @@ pub const Engine = struct {
         try vk.orExit(vk.upload(e.cmds, e.ids.buffer.*, e.ids.byte_offset, e.staging, std.mem.sliceAsBytes(&[1]u32{token}), e.timeout_ns));
         try vk.orExit(embed(e, try e.h[0].slice(0, pinned.hidden), 1));
         try runLayers(e, 1);
+        // staged penalties ride the same batch: upload and one dispatch
+        // after the head, before the greedy scan and every readback (a
+        // no-op with nothing staged); the staged lists clear inside
+        try vk.orExit(e.penalties.recordInto(e.cmds, e.staging, e.logits, e.timeout_ns));
         const result_at = try vk.orExit(e.greedy.recordInto(e.cmds, e.logits));
         const receipt_at: u64 = if (receipt_out != null)
             try vk.commands.batchDownload(e.cmds, e.logits.buffer.*, e.logits.byte_offset, e.logits.byteLen())
@@ -315,6 +334,9 @@ pub const Engine = struct {
     /// without a real reset.
     pub fn draw(e: *Engine) Error!u32 {
         try logitsReady(e.poisoned, e.state.visible());
+        // staged penalties first, in their own fenced submission, applied
+        // exactly once before the scan (a no-op with nothing staged)
+        try vk.orExit(e.penalties.runOnce(e.cmds, e.staging, e.logits, e.timeout_ns));
         return vk.orExit(e.greedy.select(e.cmds, e.staging, e.logits, e.timeout_ns)) catch |err| {
             if (err == error.NonFinite) e.poisoned = true;
             return err;

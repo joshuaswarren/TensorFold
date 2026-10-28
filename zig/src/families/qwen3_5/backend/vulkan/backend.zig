@@ -68,7 +68,7 @@ pub const Vulkan = struct {
     }
 
     pub fn backend(self: *Vulkan) be.Backend {
-        return .{ .ptr = self, .vtable = &.{
+        return .{ .ptr = self, .penalties = true, .vtable = &.{
             .prefill = prefillFn,
             .prefill_step = prefillStepFn,
             .cancel_prefill = cancelPrefillFn,
@@ -157,6 +157,10 @@ pub const Vulkan = struct {
             .handle => |h| std.math.cast(u32, h) orelse return error.InvalidQwenToken,
         };
         if (token >= pinned.vocab) return error.InvalidQwenToken;
+        // reply-only counts (the prompt is never counted): the committed
+        // reply plus this fed token, staged before the decode applies them
+        // on the GPU; inactive penalties stage nothing
+        try self.engine.penalties.stage(stream, self.engine.visible(), token, stream.penalties);
         // one combined engine operation: decode + GPU greedy draw in a
         // single submit/fence; the legacy decode/draw pair remains for
         // reference paths
@@ -179,6 +183,9 @@ pub const Vulkan = struct {
         if (self.owner != w.stream) return error.UnknownQwenStream;
         if (w.positions.len != 1 or w.positions[0] != self.engine.visible() + 1) return error.InvalidQwenPosition;
         if (samplingRefused(w.stream)) return error.UnsupportedQwenSampling;
+        // the same reply-only staging as queueFn: one row, the pending
+        // token, no drafts and no paths on this engine
+        try self.engine.penalties.stage(w.stream, self.engine.visible(), w.pending, w.stream.penalties);
         // the same combined engine operation as queueFn: decode + GPU greedy
         // draw in a single submit/fence
         o.sampled[0] = try self.engine.decodeDraw(w.pending, null);
@@ -218,6 +225,11 @@ test "facts pin the serial one-row greedy engine" {
     try std.testing.expectEqual(@as(u32, 1), cfg.batch_streams);
     try std.testing.expect(!cfg.family_streams);
     try std.testing.expect(!cfg.pipelined);
+}
+
+test "the backend advertises penalties: the lane host copies streams' penalties through" {
+    var v: Vulkan = .{ .gpa = undefined, .engine = undefined };
+    try std.testing.expect(v.backend().penalties);
 }
 
 test "prompt validation bounds: whole requests to the ceiling, never past, real ids only" {

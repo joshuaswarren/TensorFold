@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Qwen3.5-2B on Vulkan applies `presence_penalty` and `frequency_penalty` as the CUDA engines do: the reply's tokens (the prompt never counts, the pending token once) each lose presence + frequency x its count, subtracted in fp32 from the exact widened bf16 logit and rounded once to bf16 before the greedy draw; ties still go to the lowest id. The penalize dispatch rides the decode's one command buffer between the head and the greedy scan, and a request without penalties uploads and dispatches nothing. Limit: on the Apple GPUs we ran (M1 and M2 Max, Honeykrisp), fp32 denormals are flushed to zero: a penalty amount below 1.2e-38 changes nothing. Real penalties are far above that. A compile-only GPU probe (`zig build penalties-gpu-build`; `tf-penalties-gpu` runs it) checks fixed CUDA-formula bf16 words on a real device and reports that denormal row as a device limit.
+
 - Qwen3.5 and 3.6 on HIP (Linux): when a checkpoint shard can't be memory-mapped and is read into memory instead (for example on some network or FUSE mounts), releasing an uploaded layer no longer zeroes that copy. Before, it also zeroed neighbouring tensors not yet uploaded: 269 of 690 layer tensors on Qwen3.5-2B, so the model ran on wrong weights or the loader panicked at close. A malformed shard header is now refused by name. Loads that map their shards are byte-identical to before.
 
 - Nemotron on CUDA counts the checkpoint's bytes for admission from the shard headers alone, without reading the weights. The estimate is unchanged, and with memory mapping off the count no longer reads each shard into memory.
