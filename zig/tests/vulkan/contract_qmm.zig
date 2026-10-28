@@ -142,7 +142,11 @@ pub const Fixture = struct {
             const len: usize = f.bindings[i].len;
             const bad = try f.a.dupe(u8, f.input_snapshot[from..][0..len]);
             defer f.a.free(bad);
-            bad[len - 1] ^= 0x5a; // the last byte: a readback that stops one short misses it
+            // The last byte (a readback that stops one short misses it) takes a fixed value that differs from the
+            // input as uploaded, so the planted write is seen however many times the gate runs the kernel (a flip
+            // would cancel on an even count).
+            const uploaded = [4][]const u8{ std.mem.sliceAsBytes(f.x), std.mem.sliceAsBytes(f.w), std.mem.sliceAsBytes(f.scales), std.mem.sliceAsBytes(f.biases) };
+            bad[len - 1] = if (uploaded[i][len - 1] == 0x5a) 0xa5 else 0x5a;
             try vk.orExit(vk.upload(f.cmds, f.buffers[i], 0, f.staging, bad, timeout_ns));
         }
         try vk.orExit(vk.download(f.cmds, f.buffers[4], 0, f.staging, std.mem.sliceAsBytes(f.out), timeout_ns));
