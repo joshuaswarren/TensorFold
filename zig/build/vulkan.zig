@@ -501,6 +501,43 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     b.step("tf-vulkan-kernel-contract", "Build Vulkan QMM contract runner and planted control shaders without running them").dependOn(&contract_install.step);
     b.step("vulkan-kernel-contract", "Run Vulkan QMM contract gates and planted controls on the selected device").dependOn(&b.addRunArtifact(contract_exe).step);
 
+    // Penalties: penalize dispatch over staged entries, probed on a real GPU against fixed CUDA-formula words.
+    const penalties_fixture_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/penalties_fixture.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+    }) });
+    host.dependOn(&b.addRunArtifact(penalties_fixture_tests).step);
+    const penalties_host = b.step("penalties-host-test", "The penalties fixture suite (fixed CUDA-formula words), without GPU work");
+    penalties_host.dependOn(&b.addRunArtifact(penalties_fixture_tests).step);
+    const penalties_files = b.addWriteFiles();
+    const penalties_build = b.step("penalties-gpu-build", "Compile the penalties SPIR-V variants, install them under penalties/, and build the penalties GPU probe without running it");
+    const penalties_run = b.step("penalties-gpu-run", "Run the penalties GPU probe on the chosen device (args after --)");
+    for (penalties_probe_variants) |v| {
+        const cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-I." });
+        cmd.setCwd(kernel_dir);
+        for (v.defines) |d| cmd.addArg(d);
+        cmd.addArg("-o");
+        const spv = cmd.addOutputFileArg(b.fmt("{s}.spv", .{v.name}));
+        cmd.addFileArg(b.path(v.src));
+        penalties_build.dependOn(&b.addInstallFile(spv, b.fmt("penalties/{s}.spv", .{v.name})).step);
+        _ = penalties_files.addCopyFile(spv, b.fmt("{s}.spv", .{v.name}));
+    }
+    const penalties_probe = b.addExecutable(.{ .name = "tf-penalties-gpu", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/penalties_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "vulkan", .module = vulkan },
+            .{ .name = "penalties_shaders", .module = b.createModule(.{ .root_source_file = penalties_files.add("penalties_shaders.zig", penalties_shaders_src) }) },
+        },
+    }) });
+    penalties_build.dependOn(&b.addInstallArtifact(penalties_probe, .{}).step);
+    const penalties_probe_run = b.addRunArtifact(penalties_probe);
+    penalties_probe_run.addPassthruArgs();
+    penalties_run.dependOn(&penalties_probe_run.step);
+
     // Family host admission: refAllDeclsRecursive over the family modules; house wires attach in build.zig.
     const model_host_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/vulkan_model_host_tests.zig"),
@@ -603,6 +640,21 @@ const stage5_shaders_src =
     \\pub const argreduce_combine align(4) = @embedFile("argreduce_combine.spv").*;
 ;
 
+/// The penalties' own image: one fp32 subtract and one bf16 RNE over the staged (token, amount) entries.
+const penalize_variants = [_]ShaderVariant{
+    .{ .name = "penalize", .src = "zig/kernels/vulkan/penalize.comp", .defines = &.{} },
+};
+
+/// The penalties probe's closure: the penalize pass plus the stage 5 greedy gate it feeds; no defines.
+const penalties_probe_variants = penalize_variants ++ stage5_variants;
+
+const penalties_shaders_src =
+    \\pub const penalize align(4) = @embedFile("penalize.spv").*;
+    \\pub const finite_logits align(4) = @embedFile("finite_logits.spv").*;
+    \\pub const argreduce_chunk align(4) = @embedFile("argreduce_chunk.spv").*;
+    \\pub const argreduce_combine align(4) = @embedFile("argreduce_combine.spv").*;
+;
+
 /// The qwen3.5 Vulkan server's modules: the family root, the embedded SPIR-V bundle, the native_engines root.
 pub fn serverModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, o: Options, lanes: *std.Build.Module) struct { qwen35_vulkan: *std.Build.Module, qwen35_shaders: *std.Build.Module, native_engines: *std.Build.Module, engine_api: *std.Build.Module, core: *std.Build.Module } {
     const vulkan = module(b, target, optimize, o);
@@ -639,7 +691,7 @@ pub fn serverModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
 }
 
 /// Every image the bundle embeds: the real stage arrays, concatenated; names are what the adapter's bundle() reads.
-const server_shader_images = shader_variants ++ stage2_variants ++ stage3_variants ++ stage4_variants[0 .. stage4_variants.len - 1] ++ stage5_variants;
+const server_shader_images = shader_variants ++ stage2_variants ++ stage3_variants ++ stage4_variants[0 .. stage4_variants.len - 1] ++ stage5_variants ++ penalize_variants;
 
 /// The house core module the family loader's config/shard imports resolve through, built exactly as cuda.zig builds it.
 fn coreModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) *std.Build.Module {
