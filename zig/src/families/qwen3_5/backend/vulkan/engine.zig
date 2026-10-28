@@ -29,6 +29,7 @@ const pinned = @import("../../config.zig");
 const weights = @import("weights.zig");
 const state = @import("state.zig");
 const fwd = @import("forward.zig");
+pub const penalties = @import("penalties.zig");
 
 const Allocator = std.mem.Allocator;
 const View = vk.tensor.View;
@@ -69,6 +70,9 @@ pub const ShaderBundle = struct {
     attention: vk.attention.Shaders,
     gdn: vk.gdn.Shaders,
     greedy: vk.greedy.Shaders,
+    /// The penalties' single-pass penalize image (the build compiles
+    /// penalize.comp; the engine only checks and pipelines it).
+    penalize: []align(4) const u8,
 };
 
 /// One engine's sequence plan: checked before any GPU work; pure and
@@ -112,6 +116,9 @@ pub const Engine = struct {
     attn: vk.Attention,
     gdn: vk.Gdn,
     greedy: vk.Greedy,
+    /// Presence/frequency penalties staged by the backend, applied by the
+    /// draw before the greedy scan (penalties.zig).
+    penalties: penalties.Penalties,
     arena: vk.arena.Arena,
     model: weights.Model,
     state: state.State,
@@ -171,6 +178,9 @@ pub const Engine = struct {
         errdefer e.gdn.deinit();
         e.greedy = try vk.Greedy.init(e.dev, bundle.greedy, pinned.vocab);
         errdefer e.greedy.deinit();
+        e.penalties = .{ .gpa = gpa, .dev = e.dev };
+        e.penalties.pipe = try vk.dispatch.Pipeline.init(e.dev, bundle.penalize, .{ .bindings = 3, .push_bytes = @sizeOf(u32), .writes = 1 });
+        errdefer e.penalties.deinit(); // the pipeline cleans up after itself inside init; from here deinit is total
 
         e.arena = try vk.arena.Arena.init(e.dev, arena_bytes);
         errdefer e.arena.deinit();
@@ -196,6 +206,8 @@ pub const Engine = struct {
         e.model.deinit();
         e.arena.deinit();
         e.greedy.deinit();
+        e.penalties.pipe.deinit();
+        e.penalties.deinit();
         e.gdn.deinit();
         e.attn.deinit();
         e.norm.deinit();
@@ -216,6 +228,7 @@ pub const Engine = struct {
     /// cursor rewound to the persistent base.
     pub fn reset(e: *Engine) Error!void {
         try vk.orExit(e.state.reset(e.cmds, e.staging, e.timeout_ns));
+        e.penalties.clear(); // no staged entries survive a reset (poison recovery included)
         e.arena.reset(e.base_mark) catch {};
         e.poisoned = false;
     }
@@ -275,6 +288,9 @@ pub const Engine = struct {
     /// without a real reset.
     pub fn draw(e: *Engine) Error!u32 {
         try logitsReady(e.poisoned, e.state.visible());
+        // staged penalties first, in their own fenced submission, applied
+        // exactly once before the scan (a no-op with nothing staged)
+        try vk.orExit(e.penalties.runOnce(e.cmds, e.staging, e.logits, e.timeout_ns));
         return vk.orExit(e.greedy.select(e.cmds, e.staging, e.logits, e.timeout_ns)) catch |err| {
             if (err == error.NonFinite) e.poisoned = true;
             return err;
