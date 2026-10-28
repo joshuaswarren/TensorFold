@@ -573,6 +573,67 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     penalties_probe_run.addPassthruArgs();
     penalties_run.dependOn(&penalties_probe_run.step);
 
+    // The penalties kernel contract: penalize.comp through the shared gates
+    // 1-4, four planted controls compiled from a COPY of the penalize source
+    // (the kernel itself stays untouched), and the fp32-denormal row as its
+    // own gate whose flush reads as a KNOWN finding exactly where the device
+    // reports no denormal preservation. Host half runs with the fixture suite.
+    const penalty_ctl_variants = .{
+        .{ "ctl_double", "-DTF_CTL_DOUBLE=1" },
+        .{ "ctl_bf16_sub", "-DTF_CTL_BF16=1" },
+        .{ "ctl_scribble", "-DTF_CTL_SCRIBBLE=1" },
+        .{ "ctl_tail", "-DTF_CTL_TAIL=1" },
+    };
+    const penalty_ctl_spv: [4]std.Build.LazyPath = blk: {
+        var out: [4]std.Build.LazyPath = undefined;
+        inline for (penalty_ctl_variants, 0..) |v, i| {
+            const command = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", v[1], "-o" });
+            out[i] = command.addOutputFileArg(v[0] ++ ".spv");
+            command.addFileArg(b.path("zig/kernels/vulkan/contract_controls_penalties.comp"));
+            _ = penalties_files.addCopyFile(out[i], v[0] ++ ".spv");
+        }
+        break :blk out;
+    };
+    const penalties_contract_shaders = b.createModule(.{ .root_source_file = penalties_files.add("penalties_contract_shaders.zig",
+        \\pub const penalize align(4) = @embedFile("penalize.spv").*;
+        \\pub const ctl_double align(4) = @embedFile("ctl_double.spv").*;
+        \\pub const ctl_bf16_sub align(4) = @embedFile("ctl_bf16_sub.spv").*;
+        \\pub const ctl_scribble align(4) = @embedFile("ctl_scribble.spv").*;
+        \\pub const ctl_tail align(4) = @embedFile("ctl_tail.spv").*;
+        \\
+    ) });
+    const penalties_contract_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/contract_penalties.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+        .imports = &.{
+            .{ .name = "vulkan", .module = module(b, b.graph.host, .debug, o) },
+            .{ .name = "contract", .module = @import("kernel_contract.zig").module(b, b.graph.host, .debug) },
+            .{ .name = "penalties_contract_shaders", .module = penalties_contract_shaders },
+        },
+    }) });
+    host.dependOn(&b.addRunArtifact(penalties_contract_tests).step);
+    b.step("contract-penalties-host-test", "The penalties contract fixture's host suite (f64 reference, checkers, staging rule, geometry, control images), without GPU work").dependOn(host);
+    const penalties_contract = b.addExecutable(.{ .name = "tf-contract-penalties", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/contract_penalties_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "vulkan", .module = vulkan },
+            .{ .name = "contract", .module = @import("kernel_contract.zig").module(b, target, .debug) },
+            .{ .name = "penalties_contract_shaders", .module = penalties_contract_shaders },
+        },
+    }) });
+    const penalties_contract_install = b.addInstallArtifact(penalties_contract, .{});
+    inline for (penalty_ctl_variants, 0..) |v, i| {
+        penalties_contract_install.step.dependOn(&b.addInstallFile(penalty_ctl_spv[i], b.fmt("penalties/{s}.spv", .{v[0]})).step);
+    }
+    b.step("contract-penalties-build", "Compile the penalize SPIR-V, its four planted controls, and the penalties contract runner without running GPU work").dependOn(&penalties_contract_install.step);
+    const penalties_contract_run = b.addRunArtifact(penalties_contract);
+    penalties_contract_run.addPassthruArgs();
+    b.step("contract-penalties", "Run the penalties kernel contract (penalize, its four controls, the denormal finding) on the chosen GPU (args after --)").dependOn(&penalties_contract_run.step);
+
     // The qwen3.5 Vulkan family weights/state host admission (auditable in this
     // tree, unlike a child harness): refAllDeclsRecursive over the family
     // modules, with the production vulkan module. The house wires (sys,
