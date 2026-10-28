@@ -28,7 +28,13 @@
 //!    the shader needs no atomics. The contract feeds distinct tokens (its
 //!    generator draws distinct even tokens; odd neighbors are never entries),
 //!    stages them the way the engine does (stageEntries below), and its
-//!    checker refuses a duplicate list.
+//!    checker refuses a duplicate list. Every staged amount provably moves
+//!    its logit's bf16 word (informativeAmount): an entry whose penalty
+//!    rounds back to its input carries no evidence, and one such entry was
+//!    exactly how the tail control — whose only informative token is the last
+//!    — went green on a real device. The controls run the 255/256/257
+//!    dispatch-edge shapes, and their host semantics are asserted rejected at
+//!    every shape, so a control that cannot go red fails at build time.
 //!  - Depth 0, accum none, in_place: one exact widening, one fp32 subtract,
 //!    one RNE store that rewrites the logits row — the outputs are compared
 //!    bit for bit (the checker hook), never inside a rounding budget.
@@ -101,7 +107,11 @@ pub const spec: c.Spec = .{
     },
 };
 
-const control_served = [_]c.Shape{.{ .rows = 8, .n = vocab, .k = 0 }};
+const control_served = [_]c.Shape{
+    .{ .rows = 255, .n = vocab, .k = 0 },
+    .{ .rows = 256, .n = vocab, .k = 0 },
+    .{ .rows = 257, .n = vocab, .k = 0 },
+};
 
 /// The four planted controls and the gate each must go red at.
 pub const Kind = enum { double, bf16_sub, scribble, tail };
@@ -144,6 +154,22 @@ fn controlSpec(kind: Kind) c.Spec {
 pub fn wantBits(logit_bits: u16, amount: f32) u16 {
     const diff: f64 = @as(f64, c.fromBf16(logit_bits)) - @as(f64, amount);
     return c.toBf16(@as(f32, @floatCast(diff)));
+}
+
+/// The double control's arithmetic: each subtract rounds to f32 (the shader's
+/// `(x - subs[i]) - subs[i]`), one RNE store.
+pub fn doubleBits(logit_bits: u16, amount: f32) u16 {
+    const x: f64 = c.fromBf16(logit_bits);
+    const once: f64 = @as(f32, @floatCast(x - amount));
+    return c.toBf16(@as(f32, @floatCast(once - amount)));
+}
+
+/// The bf16-subtract control's arithmetic: both operands rounded to bf16
+/// before the f32 subtract (the shader's bf16_round pair).
+pub fn bf16SubBits(logit_bits: u16, amount: f32) u16 {
+    const x = c.toBf16(@as(f32, @floatCast(c.fromBf16(logit_bits))));
+    const s = c.toBf16(amount);
+    return c.toBf16(@as(f32, @floatCast(c.fromBf16(x) - c.fromBf16(s))));
 }
 
 pub const Fault = struct { token: usize, got: u16, want: u16 };
@@ -274,6 +300,23 @@ fn randomAmount(rng: std.Random) f32 {
     const sign: f32 = if (rng.boolean()) -1 else 1;
     const exp: i32 = @as(i32, 67 + rng.uintLessThan(u8, 121)) - 127;
     return sign * std.math.pow(f32, 2, @floatFromInt(exp)) * (1 + rng.float(f32));
+}
+
+/// An amount that provably moves its logit's bf16 word. A plain random draw
+/// mostly does not (an amount below half the logit's bf16 ulp rounds straight
+/// back), and an entry whose penalty rounds to a no-op carries no evidence:
+/// the tail control's ONLY informative token is the last entry, so one no-op
+/// there silences the control (the missed control on the M2 Max run). The
+/// fallback subtracts the logit's own magnitude, which always leaves the word.
+fn informativeAmount(rng: std.Random, logit_bits: u16) f32 {
+    var s = randomAmount(rng);
+    var tries: usize = 0;
+    while (wantBits(logit_bits, s) == logit_bits) {
+        s = randomAmount(rng);
+        tries += 1;
+        if (tries == 10_000) return @abs(c.fromBf16(logit_bits));
+    }
+    return s;
 }
 
 /// Distinct even tokens in [0, vocab): the contract's entries never collide
@@ -452,7 +495,7 @@ pub const Penalize = struct {
             for (self.input) |*w| w.* = randomLogit(rng);
             const picks = try distinctTokens(a, rng, self.n);
             @memcpy(self.toks, picks);
-            for (self.subs) |*s| s.* = randomAmount(rng);
+            for (self.subs, self.toks) |*s, t| s.* = informativeAmount(rng, self.input[t]);
             if (fill == .nonfinite) plantNonfinite(self.toks, self.subs, self.input);
         }
         for (self.toks) |t| self.named[t] = true;
@@ -617,6 +660,74 @@ test "the denormal verdict is KNOWN only for the unchanged-logit flush on a devi
     var scribbled = input;
     scribbled[3] = 0x2180; // a bf16 word at 2^-60: any wrong value fails
     try testing.expectEqual(Verdict.fail, subnormalVerdict(&scribbled, &want, &input, false));
+}
+
+test "every staged entry's amount moves its bf16 word: a plain random draw often does not" {
+    var prng = std.Random.DefaultPrng.init(0x70e7);
+    const rng = prng.random();
+    for (0..2000) |_| {
+        const x = randomLogit(rng);
+        try testing.expect(wantBits(x, informativeAmount(rng, x)) != x);
+    }
+    // the condition that silenced the tail control on the device: an
+    // unfiltered random amount frequently rounds straight back to its logit
+    var noops: usize = 0;
+    for (0..2000) |_| {
+        const x = randomLogit(rng);
+        if (wantBits(x, randomAmount(rng)) == x) noops += 1;
+    }
+    try testing.expect(noops > 0);
+}
+
+test "every control's host semantics are rejected by the exact check at every control shape" {
+    inline for (control_served) |shape| {
+        const n: usize = shape.rows;
+        var prng = std.Random.DefaultPrng.init(0x70e8 + n);
+        const rng = prng.random();
+        const input = try testing.allocator.alloc(u16, vocab);
+        defer testing.allocator.free(input);
+        const want = try testing.allocator.alloc(u16, vocab);
+        defer testing.allocator.free(want);
+        const named = try testing.allocator.alloc(bool, vocab);
+        defer testing.allocator.free(named);
+        const toks = try distinctTokens(testing.allocator, rng, @intCast(n));
+        defer testing.allocator.free(toks);
+        const subs = try testing.allocator.alloc(f32, n);
+        defer testing.allocator.free(subs);
+        for (input) |*w| w.* = randomLogit(rng);
+        for (subs, toks) |*s, t| s.* = informativeAmount(rng, input[t]);
+        @memset(named, false);
+        for (toks) |t| named[t] = true;
+        @memcpy(want, input);
+        for (toks, subs) |t, s| want[t] = wantBits(input[t], s);
+        const rejects = struct {
+            fn f(got: []const u16, w: []const u16, i: []const u16, nm: []const bool) !void {
+                if (firstFault(got, w, i, nm) == null) return error.ControlPassedTheExactCheck;
+            }
+        }.f;
+        // tail: the last entry unapplied
+        const tail_got = try testing.allocator.dupe(u16, want);
+        defer testing.allocator.free(tail_got);
+        tail_got[toks[n - 1]] = input[toks[n - 1]];
+        try rejects(tail_got, want, input, named);
+        // double: every entry subtracted twice
+        const dbl_got = try testing.allocator.alloc(u16, vocab);
+        defer testing.allocator.free(dbl_got);
+        @memcpy(dbl_got, input);
+        for (toks, subs) |t, s| dbl_got[t] = doubleBits(input[t], s);
+        try rejects(dbl_got, want, input, named);
+        // bf16 subtract: both operands rounded before the subtract
+        const bf_got = try testing.allocator.alloc(u16, vocab);
+        defer testing.allocator.free(bf_got);
+        @memcpy(bf_got, input);
+        for (toks, subs) |t, s| bf_got[t] = bf16SubBits(input[t], s);
+        try rejects(bf_got, want, input, named);
+        // scribble: the word beside the first token
+        const scr_got = try testing.allocator.dupe(u16, want);
+        defer testing.allocator.free(scr_got);
+        scr_got[toks[0] ^ 1] = input[toks[0] ^ 1] ^ 1;
+        try rejects(scr_got, want, input, named);
+    }
 }
 
 test "staging is one entry per distinct token with the engine's amounts; duplicates and out-of-range refuse" {
