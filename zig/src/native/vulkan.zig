@@ -114,6 +114,7 @@ fn bundle() fam.engine.ShaderBundle {
             .argreduce_chunk = &sh.argreduce_chunk,
             .argreduce_combine = &sh.argreduce_combine,
         },
+        .penalize = &sh.penalize,
     };
 }
 
@@ -190,6 +191,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         .context_window = @intCast(engine.capacity()),
         .prefill_step = fam.backend.max_prompt_rows,
         .greedy_only = true,
+        .penalties = true, // the backend applies request penalties on the GPU (backend.zig's flag)
     });
     try h.host.start();
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };

@@ -270,6 +270,7 @@ fn bundle() engine_mod.ShaderBundle {
             .copy_u16 = &q35s.copy_u16,
         },
         .greedy = .{ .finite_logits = &q35s.finite_logits, .argreduce_chunk = &q35s.argreduce_chunk, .argreduce_combine = &q35s.argreduce_combine },
+        .penalize = &q35s.penalize,
     };
 }
 
