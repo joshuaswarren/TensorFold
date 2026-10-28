@@ -103,15 +103,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const stage1_files = b.addWriteFiles();
     const stage1_build = b.step("stage1-gpu-build", "Compile the stage 1 SPIR-V variants, install them under stage1/, and build the stage 1 GPU probe without running it");
     const stage1_run = b.step("stage1-gpu-run", "Run the stage 1 GPU probe on the chosen device (args after --)");
-    for (shader_variants) |v| {
-        const cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp" });
-        for (v.defines) |d| cmd.addArg(d);
-        cmd.addArg("-o");
-        const spv = cmd.addOutputFileArg(b.fmt("{s}.spv", .{v.name}));
-        cmd.addFileArg(b.path(v.src));
-        stage1_build.dependOn(&b.addInstallFile(spv, b.fmt("stage1/{s}.spv", .{v.name})).step);
-        _ = stage1_files.addCopyFile(spv, b.fmt("{s}.spv", .{v.name}));
-    }
+    shaderClosure(b, glslang, stage1_files, stage1_build, "stage1", &shader_variants);
     const probe_root = b.path(o.stage1_root orelse "zig/tests/vulkan/stage1_probe.zig");
     const stage1_probe = b.addExecutable(.{ .name = "tf-stage1-gpu", .root_module = b.createModule(.{
         .root_source_file = probe_root,
@@ -130,20 +122,13 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     stage1_run.dependOn(&stage1_probe_run.step);
 
     // Stage 2: the norm/MLP pointwise variants — norm and swiglu compiled as the Ash8c
-    // Metal-oracle form (ASH_QWEN35), add the plain bf16 form; all with -DUSE_BF16 —
-    // and the GPU probe over the production NormMlp operator. Compile only: no GPU work.
+    // Metal-oracle form (ASH_QWEN35), add the plain bf16 form and the f32-preserving form
+    // (no type define) — and the GPU probe over the production NormMlp operator.
     const stage2_files = b.addWriteFiles();
     const stage2_build = b.step("stage2-gpu-build", "Compile the stage 2 SPIR-V variants, install them under stage2/, and build the stage 2 GPU probe without running it");
     const stage2_run = b.step("stage2-gpu-run", "Run the stage 2 GPU probe on the chosen device (args after --)");
-    for (stage2_variants) |v| {
-        const cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp" });
-        for (v.defines) |d| cmd.addArg(d);
-        cmd.addArg("-o");
-        const spv = cmd.addOutputFileArg(b.fmt("{s}.spv", .{v.name}));
-        cmd.addFileArg(b.path(v.src));
-        stage2_build.dependOn(&b.addInstallFile(spv, b.fmt("stage2/{s}.spv", .{v.name})).step);
-        _ = stage2_files.addCopyFile(spv, b.fmt("{s}.spv", .{v.name}));
-    }
+    shaderClosure(b, glslang, stage2_files, stage2_build, "stage2", &stage2_variants);
+    const stage2_shaders_module = b.createModule(.{ .root_source_file = stage2_files.add("stage2_shaders.zig", stage2_shaders_src) });
     const stage2_probe = b.addExecutable(.{ .name = "tf-stage2-gpu", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/vulkan/stage2_probe.zig"),
         .target = target,
@@ -151,7 +136,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .link_libc = true,
         .imports = &.{
             .{ .name = "vulkan", .module = vulkan },
-            .{ .name = "stage2_shaders", .module = b.createModule(.{ .root_source_file = stage2_files.add("stage2_shaders.zig", stage2_shaders_src) }) },
+            .{ .name = "stage2_shaders", .module = stage2_shaders_module },
             .{ .name = "contract", .module = @import("kernel_contract.zig").module(b, target, .debug) },
         },
     }) });
@@ -159,6 +144,59 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const stage2_probe_run = b.addRunArtifact(stage2_probe);
     stage2_probe_run.addPassthruArgs();
     stage2_run.dependOn(&stage2_probe_run.step);
+
+    // The pointwise contract: all six pointwise closures (stage 2's three plus the preserve
+    // add, the attention output gate and the gated RMSNorm) against one GPU probe, and the
+    // fixtures' host suite in `test`.
+    const stage3_files = b.addWriteFiles();
+    const stage3_build = b.step("stage3-gpu-build", "Compile the stage 3 SPIR-V variants, install them under stage3/, and build the pointwise contract probe without running it");
+    shaderClosure(b, glslang, stage3_files, stage3_build, "stage3", &stage3_variants);
+    const stage4_files = b.addWriteFiles();
+    const stage4_build = b.step("stage4-gpu-build", "Compile the stage 4 SPIR-V variants, install them under stage4/, and build the pointwise contract probe without running it");
+    shaderClosure(b, glslang, stage4_files, stage4_build, "stage4", &stage4_variants);
+    const pointwise_fixture = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/contract_pointwise.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+        .imports = &.{.{ .name = "contract", .module = @import("kernel_contract.zig").module(b, b.graph.host, .debug) }},
+    });
+    const pointwise_fixture_tests = b.addTest(.{ .root_module = pointwise_fixture });
+    host.dependOn(&b.addRunArtifact(pointwise_fixture_tests).step);
+    b.step("contract-pointwise-host-test", "The pointwise contract fixtures' host suite (references and checkers), without GPU work").dependOn(host);
+    const pointwise = b.addExecutable(.{ .name = "tf-contract-pointwise", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/contract_pointwise_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "vulkan", .module = vulkan },
+            .{ .name = "stage2_shaders", .module = stage2_shaders_module },
+            .{ .name = "stage3_shaders", .module = b.createModule(.{ .root_source_file = stage3_files.add("stage3_shaders.zig", stage3_shaders_src) }) },
+            .{ .name = "stage4_shaders", .module = b.createModule(.{ .root_source_file = stage4_files.add("stage4_shaders.zig", stage4_shaders_src) }) },
+            .{ .name = "contract", .module = @import("kernel_contract.zig").module(b, target, .debug) },
+        },
+    }) });
+    const pointwise_install = b.addInstallArtifact(pointwise, .{});
+    stage3_build.dependOn(&pointwise_install.step);
+    stage4_build.dependOn(&pointwise_install.step);
+    b.step("contract-pointwise-build", "Compile the six pointwise SPIR-V images and the pointwise contract probe without running GPU work").dependOn(&pointwise_install.step);
+    const pointwise_run = b.addRunArtifact(pointwise);
+    pointwise_run.addPassthruArgs();
+    b.step("contract-pointwise", "Run the pointwise shader contract on the chosen GPU (args after --)").dependOn(&pointwise_run.step);
+}
+
+/// Compiles one stage's SPIR-V variants: installed under `dir/` for the record and copied
+/// into `files` for the probes' @embedFile modules.
+fn shaderClosure(b: *std.Build, glslang: []const u8, files: *std.Build.Step.WriteFile, build_step: *std.Build.Step, dir: []const u8, variants: []const ShaderVariant) void {
+    for (variants) |v| {
+        const cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp" });
+        for (v.defines) |d| cmd.addArg(d);
+        cmd.addArg("-o");
+        const spv = cmd.addOutputFileArg(b.fmt("{s}.spv", .{v.name}));
+        cmd.addFileArg(b.path(v.src));
+        build_step.dependOn(&b.addInstallFile(spv, b.fmt("{s}/{s}.spv", .{ dir, v.name })).step);
+        _ = files.addCopyFile(spv, b.fmt("{s}.spv", .{v.name}));
+    }
 }
 
 const ShaderVariant = struct { name: []const u8, src: []const u8, defines: []const []const u8 };
@@ -187,17 +225,39 @@ const stage1_shaders_src =
 ;
 
 /// The stage 2 closure's shader images: norm and swiglu carry the Ash8c Metal-oracle variant
-/// (single store rounding; weight applied to the product), add the plain bf16 form.
+/// (single store rounding; weight applied to the product), add the plain bf16 form and the
+/// f32-preserving form (no type define: f32 storage, the exact f32 sum).
 const stage2_variants = [_]ShaderVariant{
     .{ .name = "norm_bf16", .src = "zig/kernels/vulkan/fast_norm.comp", .defines = &.{ "-DUSE_BF16", "-DASH_QWEN35" } },
     .{ .name = "add_bf16", .src = "zig/kernels/vulkan/binary_vec.comp", .defines = &.{"-DUSE_BF16"} },
+    .{ .name = "add_preserve_bf16", .src = "zig/kernels/vulkan/binary_vec.comp", .defines = &.{} },
     .{ .name = "swiglu_bf16", .src = "zig/kernels/vulkan/swiglu.comp", .defines = &.{ "-DUSE_BF16", "-DASH_QWEN35" } },
 };
 
 const stage2_shaders_src =
     \\pub const norm_bf16 align(4) = @embedFile("norm_bf16.spv").*;
     \\pub const add_bf16 align(4) = @embedFile("add_bf16.spv").*;
+    \\pub const add_preserve_bf16 align(4) = @embedFile("add_preserve_bf16.spv").*;
     \\pub const swiglu_bf16 align(4) = @embedFile("swiglu_bf16.spv").*;
+;
+
+/// The stage 3 closure's shader image: the attention output gate as written (no type define).
+const stage3_variants = [_]ShaderVariant{
+    .{ .name = "gate_bf16", .src = "zig/kernels/vulkan/attention_gate.comp", .defines = &.{} },
+};
+
+const stage3_shaders_src =
+    \\pub const gate_bf16 align(4) = @embedFile("gate_bf16.spv").*;
+;
+
+/// The stage 4 closure's shader image: the gated RMSNorm in the production default build
+/// (-DUSE_BF16, both modes; the wrapper drives mode 0 at runtime), matching gdn.zig.
+const stage4_variants = [_]ShaderVariant{
+    .{ .name = "fast_norm_gated_bf16", .src = "zig/kernels/vulkan/fast_norm_gated.comp", .defines = &.{"-DUSE_BF16"} },
+};
+
+const stage4_shaders_src =
+    \\pub const fast_norm_gated_bf16 align(4) = @embedFile("fast_norm_gated_bf16.spv").*;
 ;
 
 /// The backend over `vk`, vulkan_core.h translated without prototypes: every entry point comes from the loader.
