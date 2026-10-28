@@ -34,7 +34,22 @@ pub fn chunkRows(l: Limits, k: u64, n: u64) Error!u64 {
     return (l.max_range / group_bytes) * step;
 }
 
+/// qmm_q4_pk arithmetic, read from the push flags: 0 = plain f32 partials (the frozen v0 candidate),
+/// bit 0 = contiguous lane ranges, bit 1 = Neumaier-compensated sums with a TwoSum tree. The CANDIDATE
+/// build is fixed at 2 (strided lanes, compensated); nothing selects it at run time.
+pub var pk_variant: u32 = 2;
+
 const Geometry = struct { m: u64, n: u64 };
+
+/// Workgroups for one qmm_q4_pk dispatch: one 64-lane workgroup per output, capped at the
+/// device's maxComputeWorkGroupCount[0] (the kernel grid-strides the rest, so the cap never
+/// drops work). Zero outputs cannot happen past the geometry checks but is refused, not
+/// dispatched as zero groups. Pure and host-tested.
+pub fn pkGroups(outputs: u64, max_groups: u32) Error!u32 {
+    if (outputs == 0) return error.Invalid;
+    const groups = std.math.cast(u32, outputs) orelse return error.TooLarge;
+    return @min(groups, max_groups);
+}
 
 /// The projection's m and n from the views and k, or the named reason it cannot run; pure.
 fn projectGeometry(out: View, x: View, w: View, scales: View, biases: View, k: u64) Error!Geometry {
@@ -67,9 +82,10 @@ fn q4Push(m: u64, n: u64, k: u64) Error!params.Params {
 }
 
 /// Q4 affine projection out[m, n] = x[m, k] . dequant(w, scales, biases)[n, k], group 64, transposed.
-/// One qmm dispatch when the w view fits maxStorageBufferRange; otherwise n-row chunks write packed
-/// blocks to `scratch` and a copy_general scatter places each block's columns. Every range and shape
-/// is validated before the first dispatch; x and out must each fit one binding.
+/// One qmm_q4_pk dispatch (one 64-lane workgroup per output, parallel over K) when the w view fits
+/// maxStorageBufferRange; otherwise n-row chunks write packed blocks to `scratch` and a copy_general
+/// scatter places each block's columns. Every range and shape is validated before the first dispatch;
+/// x and out must each fit one binding.
 pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: View, biases: View, k: u64, scratch: *Arena, timeout_ns: u64) Error!void {
     const g = try projectGeometry(out, x, w, scales, biases, k);
     const limits = o.dev.properties.limits;
@@ -77,10 +93,12 @@ pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: Vi
     if (x.byteLen() > lim.max_range or out.byteLen() > lim.max_range) return error.TooLarge;
     const rows = try chunkRows(lim, k, g.n);
     if (rows == 0) {
-        const pipe = &o.qmm_bf16;
+        const pipe = &o.qmm_q4_pk;
         try pipe.bind(&.{ x.bind(), w.bind(), scales.bind(), biases.bind(), out.bind() });
-        const p = try q4Push(g.m, g.n, k);
-        try pipe.run(cmds, std.mem.asBytes(&p), ops_mod.dispatchGroups(p.count, pipe.local[0]), timeout_ns);
+        var p = try q4Push(g.m, g.n, k);
+        p.flags = pk_variant;
+        const groups = try pkGroups(p.count, limits.maxComputeWorkGroupCount[0]);
+        try pipe.run(cmds, std.mem.asBytes(&p), .{ groups, 1, 1 }, timeout_ns);
         return;
     }
     const block = try scratch.alloc(.bf16, g.m * rows);
@@ -95,10 +113,12 @@ pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: Vi
         const s_chunk = try scales.slice(first * row_groups, chunk * row_groups);
         const b_chunk = try biases.slice(first * row_groups, chunk * row_groups);
         const block_chunk = try block.slice(0, g.m * chunk);
-        const pipe = &o.qmm_bf16;
+        const pipe = &o.qmm_q4_pk;
         try pipe.bind(&.{ x.bind(), w_chunk.bind(), s_chunk.bind(), b_chunk.bind(), block_chunk.bind() });
-        const p = try q4Push(g.m, chunk, k);
-        try pipe.run(cmds, std.mem.asBytes(&p), ops_mod.dispatchGroups(p.count, pipe.local[0]), timeout_ns);
+        var p = try q4Push(g.m, chunk, k);
+        p.flags = pk_variant;
+        const groups = try pkGroups(p.count, limits.maxComputeWorkGroupCount[0]);
+        try pipe.run(cmds, std.mem.asBytes(&p), .{ groups, 1, 1 }, timeout_ns);
         // Scatter the packed block into the full row-major output; raw u16 columns keep every RNE byte.
         const scatter = &o.copy_u16;
         try scatter.bind(&.{ block_chunk.bind(), o.dummyBinding(), out.bind(), o.dummyBinding() });
@@ -178,6 +198,17 @@ test "chunkRows refuses an aligned group larger than the range" {
     try testing.expectError(error.TooLarge, chunkRows(absurd, 64, 1 << 20));
 }
 
+test "chunkRows plans the production head: one binding when the range allows, aligned chunks below" {
+    const wide: Limits = .{ .max_range = 1 << 32, .alignment = 256 };
+    try testing.expectEqual(@as(u64, 0), try chunkRows(wide, 2048, 248320));
+    const mobile: Limits = .{ .max_range = 128 << 20, .alignment = 256 };
+    const rows = try chunkRows(mobile, 2048, 248320); // 242.6 MiB of head w never fits one 128 MiB binding
+    try testing.expect(rows > 0 and rows < 248320);
+    try testing.expectEqual(@as(u64, 0), rows % 2); // whole aligned row groups per chunk
+    try testing.expect(rows * 1024 <= mobile.max_range); // every chunk's w bytes stay in range
+    try testing.expectEqual(@as(u64, 0), try chunkRows(mobile, 6144, 2048)); // the down proj always fits
+}
+
 test "project geometry derives m and n and refuses torn or wrong-kind views" {
     const dev: @import("device.zig").Device = undefined;
     const buf = @import("memory.zig").Buffer{ .dev = &dev, .handle = null, .memory = null, .len = 1 << 20, .kind = .device, .mapped = null, .coherent = false };
@@ -227,4 +258,19 @@ test "checkIds refuses any id past the table" {
     try checkIds(&.{ 0, 3, 99 }, 100);
     try checkIds(&.{}, 1);
     try testing.expectError(error.OutOfRange, checkIds(&.{ 0, 100 }, 100));
+}
+
+test "pkGroups plans one workgroup per output and clamps at the device limit" {
+    const roomy: u32 = 0x7fff_ffff; // above every output count below: no clamp
+    const smallest: u32 = 65535; // the smallest maxComputeWorkGroupCount[0] Vulkan requires
+    try testing.expectEqual(@as(u32, 1), try pkGroups(1, roomy)); // M=1, N=1
+    try testing.expectEqual(@as(u32, 16), try pkGroups(16, roomy)); // M=1, N=16: a group each, the lanes split K
+    try testing.expectEqual(@as(u32, 512), try pkGroups(32 * 16, roomy)); // M=32, N=16
+    try testing.expectEqual(@as(u32, 248320), try pkGroups(248320, roomy)); // M=1 at the head's N
+    try testing.expectEqual(@as(u32, 7946240), try pkGroups(32 * 248320, roomy)); // M=32 prefill at the head
+    try testing.expectEqual(@as(u32, 65535), try pkGroups(248320, smallest)); // the cap: the kernel grid-strides the rest
+    try testing.expectEqual(@as(u32, 1000), try pkGroups(1 << 20, 1000));
+    try testing.expectEqual(@as(u32, 1), try pkGroups(1 << 20, 1));
+    try testing.expectError(error.Invalid, pkGroups(0, roomy));
+    try testing.expectError(error.TooLarge, pkGroups(1 << 32, roomy));
 }
