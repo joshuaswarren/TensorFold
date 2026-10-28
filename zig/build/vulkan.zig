@@ -419,6 +419,37 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     greedy_contract_run.addPassthruArgs();
     b.step("greedy-contract-run", "Run the greedy contract (the composed draw and its planted control) on the chosen device (args after --)").dependOn(&greedy_contract_run.step);
 
+    // The exp(-inf) probe: one standalone dispatch answering whether exp(-inf) is +0 and
+    // whether the GDN gate chain gives g = 0 for a = +inf, against f64 expectations.
+    const expinf_fixture_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/expinf_fixture.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+    }) });
+    host.dependOn(&b.addRunArtifact(expinf_fixture_tests).step);
+    const expinf_cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-o" });
+    const expinf_spv = expinf_cmd.addOutputFileArg("expinf_probe.spv");
+    expinf_cmd.addFileArg(b.path("zig/kernels/vulkan/expinf_probe.comp"));
+    const expinf_files = b.addWriteFiles();
+    _ = expinf_files.addCopyFile(expinf_spv, "expinf_probe.spv");
+    const expinf_shaders = b.createModule(.{ .root_source_file = expinf_files.add("expinf_shaders.zig",
+        "pub const expinf_probe align(4) = @embedFile(\"expinf_probe.spv\").*;\n") });
+    const expinf = b.addExecutable(.{ .name = "tf-expinf-probe", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/expinf_probe_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "vulkan", .module = vulkan },
+            .{ .name = "expinf_shaders", .module = expinf_shaders },
+        },
+    }) });
+    const expinf_install = b.addInstallArtifact(expinf, .{});
+    b.step("expinf-probe-build", "Compile the expinf SPIR-V image and install zig-out/bin/tf-expinf-probe without running GPU work").dependOn(&expinf_install.step);
+    const expinf_run = b.addRunArtifact(expinf);
+    expinf_run.addPassthruArgs();
+    b.step("expinf-probe", "Run the expinf probe on the chosen GPU (args after --)").dependOn(&expinf_run.step);
+
     const contract_fixture = b.createModule(.{
         .root_source_file = b.path("zig/tests/vulkan/contract_qmm.zig"),
         .target = b.graph.host,

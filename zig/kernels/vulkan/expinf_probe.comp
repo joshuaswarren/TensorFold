@@ -1,0 +1,39 @@
+#version 460
+
+// tf-expinf-probe: does exp(-inf) evaluate to +0 on this driver, and does the GDN gate
+// chain give g = 0 for a = +inf? Every input arrives as a uint bit pattern through a
+// storage buffer, so nothing here can be constant-folded. One invocation per input.
+layout(local_size_x = 8) in;
+layout(set = 0, binding = 0, std430) buffer InX { uint x[]; } input_x;
+layout(set = 0, binding = 1, std430) buffer OutY { uint y[]; } output_y;
+layout(push_constant) uniform Params { uint n; } p;
+
+// The gate chain's softplus leg: max(x,0) + log(1 + exp(-|x|)).
+float softplus(float v) { return max(v, 0.0) + log(1.0 + exp(-abs(v))); }
+
+// The FIXED helper path: bf16 store done safely — RNE truncation of the f32 bits to
+// bf16 with a NaN guard — then widened back to f32. Never NaN for finite or inf input.
+float bf16_safe(float v) {
+  if (isnan(v)) return uintBitsToFloat(0x7fc00000u);
+  uint u = floatBitsToUint(v);
+  return uintBitsToFloat((u + 0x7fffu + ((u >> 16u) & 1u)) & 0xffff0000u);
+}
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= p.n) return;
+  float z = uintBitsToFloat(input_x.x[7u]); // runtime zero read from the buffer
+  float x = uintBitsToFloat(input_x.x[i]);
+  float sp = softplus(x);
+  float spb = softplus(bf16_safe(x));
+  uint base = i * 9u;
+  output_y.y[base + 0u] = floatBitsToUint(exp(x));
+  output_y.y[base + 1u] = floatBitsToUint(exp(-x));
+  output_y.y[base + 2u] = floatBitsToUint(exp(-abs(x)));
+  output_y.y[base + 3u] = floatBitsToUint(exp2(x));
+  output_y.y[base + 4u] = floatBitsToUint(exp(-(1.0 * x)));
+  output_y.y[base + 5u] = floatBitsToUint(exp(-(exp(z) * x)));
+  output_y.y[base + 6u] = floatBitsToUint(sp);
+  output_y.y[base + 7u] = floatBitsToUint(exp(-(exp(z) * sp)));
+  output_y.y[base + 8u] = floatBitsToUint(exp(-(exp(z) * spb)));
+}
