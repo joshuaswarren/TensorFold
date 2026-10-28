@@ -111,7 +111,7 @@ fn probe(a: std.mem.Allocator, clock: Elapsed, vendor: ?u32, timeout_ms: u64) !b
             if (!ok) {
                 switch (v) {
                     .class_mismatch => |m| std.debug.print("FAIL expinf x={s} {s}: class {s}, expected {s} (observed bits above are quotable)\n", .{ fx.input_names[i], fx.formulas[f], fx.className(m.got), fx.className(m.want) }),
-                    .value_mismatch => |m| std.debug.print("FAIL expinf x={s} {s}: got {e}, expected {e} within {d} ulp (observed bits above are quotable)\n", .{ fx.input_names[i], fx.formulas[f], m.got, m.want, fx.ulp_tolerance }),
+                    .value_mismatch => |m| std.debug.print("FAIL expinf x={s} {s}: got {e}, expected {e} within {d} ulp (observed bits above are quotable)\n", .{ fx.input_names[i], fx.formulas[f], m.got, m.want, fx.ulps(i, f) }),
                     .ok => {},
                 }
             } else passed += 1;

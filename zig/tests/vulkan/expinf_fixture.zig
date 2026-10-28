@@ -78,6 +78,31 @@ fn bf16Safe64(v: f64) f64 {
     return @as(f32, @bitCast(rounded));
 }
 
+/// The f64 expectation cast to what an IEEE f32 result must be: values above the f32
+/// maximum overflow to +inf, tiny values land in the underflow window the caller checks.
+pub fn want32(i: usize, f: usize) f32 {
+    return @floatCast(want(i, f));
+}
+
+/// The exp argument of formula `f` at input `i` in f64 — the driver's exp/exp2 bound is
+/// 3 + 2*|arg| ulp (GLSL.std.450), so the tolerance derives from it per formula.
+pub fn expArg(i: usize, f: usize) f64 {
+    std.debug.assert(i < n_inputs and f < n_formulas);
+    const x: f64 = @as(f32, @bitCast(input_bits[i]));
+    const z: f64 = @as(f32, @bitCast(input_bits[7]));
+    const sp = softplus64(x);
+    const spb = softplus64(bf16Safe64(x));
+    return switch (f) {
+        0 => x,
+        1, 2, 4 => -x,
+        3 => x * 1.4426950408889634, // exp2(x) as exp(x*log2 e)
+        5 => @exp(z) * x,
+        6 => std.math.nan(f64), // softplus: not exp-based, flat tolerance below
+        7, 8 => @exp(z) * (if (f == 7) sp else spb),
+        else => unreachable,
+    };
+}
+
 pub const Verdict = union(enum) {
     ok,
     class_mismatch: struct { want: Class, got: Class },
@@ -88,17 +113,25 @@ pub const Verdict = union(enum) {
 /// itself below it (denormal or flushed-to-zero).
 pub const underflow = 1e-37;
 
-/// ulp tolerance for finite comparisons.
-pub const ulp_tolerance = 4;
+/// Flat ulp tolerance for the non-exp formula (softplus: max + log1p legs).
+pub const softplus_ulp = 4;
+
+/// Allowed f32 ulp for formula `f`: GLSL.std.450's 3 + 2*|arg| for the exp/exp2-based
+/// formulas, a flat 4 for softplus.
+pub fn ulps(i: usize, f: usize) u32 {
+    if (f == 6) return softplus_ulp;
+    return @intFromFloat(3.0 + 2.0 * @abs(expArg(i, f)));
+}
 
 pub fn check(got_bits: u32, i: usize, f: usize) Verdict {
     const w = want(i, f);
+    const w32 = want32(i, f);
     const got: f32 = @bitCast(got_bits);
     if (std.math.isNan(w)) {
         if (std.math.isNan(got)) return .ok;
         return .{ .class_mismatch = .{ .want = .nan, .got = classify(got) } };
     }
-    const wc = classify(w);
+    const wc = classify(w32);
     const gc = classify(got);
     if (@abs(w) < underflow) {
         // exp underflow: exact zero or denormal-flush-to-zero accepted.
@@ -107,13 +140,13 @@ pub fn check(got_bits: u32, i: usize, f: usize) Verdict {
     }
     if (wc != gc) return .{ .class_mismatch = .{ .want = wc, .got = gc } };
     if (wc == .zero) return .ok;
-    if (!withinUlp(got, @floatCast(w), ulp_tolerance)) return .{ .value_mismatch = .{ .want = w, .got = got } };
+    if (!withinUlp(got, w32, ulps(i, f))) return .{ .value_mismatch = .{ .want = w, .got = got } };
     return .ok;
 }
 
-fn withinUlp(got: f32, want32: f32, n: u32) bool {
-    if (got == want32) return true;
-    var cur = want32;
+fn withinUlp(got: f32, expected: f32, n: u32) bool {
+    if (got == expected) return true;
+    var cur = expected;
     for (0..n) |_| {
         cur = std.math.nextAfter(f32, cur, got);
         if (got == cur) return true;
@@ -162,4 +195,22 @@ test "the checker accepts the honest f32 answers and refuses faults" {
     // -88 input, e1 = exp(-88): underflow window accepts zero or a denormal-class value.
     try std.testing.expectEqual(Verdict.ok, check(0x00000000, 2, 0));
     try std.testing.expectEqual(.value_mismatch, std.meta.activeTag(check(@bitCast(@as(f32, 1e-30)), 2, 0)));
+}
+
+test "the 3 + 2*|arg| exp tolerance admits the observed -88 result and the overflow rule sends -104's exp(-x) to +inf" {
+    // x = -88, exp(-x): f64 expectation ~1.6516e38; the device answered ~15 ulp above,
+    // inside GLSL.std.450's 3 + 2*88 = 179-ulp bound for exp.
+    const w32 = want32(2, 1);
+    try std.testing.expectApproxEqRel(@as(f64, 1.6516362549940018e38), w32, 1e-6);
+    const got15: u32 = @as(u32, @bitCast(w32)) + 15;
+    try std.testing.expectEqual(Verdict.ok, check(got15, 2, 1));
+    // 200 ulp off is outside the bound: a real fault.
+    try std.testing.expectEqual(.value_mismatch, std.meta.activeTag(check(@as(u32, @bitCast(w32)) + 200, 2, 1)));
+    try std.testing.expectEqual(@as(u32, 179), ulps(2, 1));
+    // x = -104, exp(-x): the f64 expectation 1.47e45 overflows f32, so the required f32
+    // answer is +inf; inf passes, a large finite value is a class fault.
+    try std.testing.expect(want(3, 1) > 1e44);
+    try std.testing.expectEqual(Class.pinf, classify(want32(3, 1)));
+    try std.testing.expectEqual(Verdict.ok, check(0x7f800000, 3, 1));
+    try std.testing.expectEqual(.class_mismatch, std.meta.activeTag(check(@bitCast(@as(f32, 3.4e38)), 3, 1)));
 }
