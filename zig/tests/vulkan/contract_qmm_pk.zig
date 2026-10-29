@@ -12,6 +12,7 @@ const g = contract.gates;
 const dispatch = vk.dispatch;
 const qmm = @import("contract_qmm.zig");
 const group: usize = 64;
+const pk_src = @import("pk_src");
 pub const local_size_x: u32 = 64;
 pub const poison: u16 = 0x7fc5;
 const timeout_ns: u64 = 10 * std.time.ns_per_s;
@@ -625,4 +626,18 @@ test "the fixture keeps the qmm storage discipline: raw u16 poison, guards align
     try testing.expectEqual(poison, values[0]);
     try testing.expectEqual(qmm.poison, poison);
     try testing.expectEqual(@as(u32, 64), local_size_x);
+}
+
+test "the shipped pk kernel keeps its per-element TwoSum, class fix and six tree levels" {
+    // A source-level pin: a later edit of qmm_q4_pk.comp must not silently drop the
+    // compensated per-element sum, the non-finite class fix at the high+low combine,
+    // the six tree levels (strides 32, 16, 8, 4, 2, 1), the ascending 8-element pack
+    // order or the one-64-lane-workgroup-per-output shape.
+    const src = pk_src.qmm_q4_pk;
+    try testing.expect(std.mem.indexOf(u8, src, "comp += (partial - t) + term;") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "comp += (term - t) + partial;") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "isnan(tree[0]) || isinf(tree[0])") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "stride = 32u; stride >= 1u; stride >>= 1u") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "for (uint e = 0u; e < 8u; ++e)") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "layout(local_size_x = 64) in;") != null);
 }
