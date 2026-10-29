@@ -333,6 +333,21 @@ pub fn main(init: std.process.Init) !u8 {
     };
     const timeout = opts.timeout_ms * std.time.ns_per_ms;
 
+    // PREFLIGHT ONLY, NOT A RESULT: this throwaway build admits a CPU
+    // (lavapipe) device under BW_PREFLIGHT_CPU and divides the sweep sizes by
+    // BW_PREFLIGHT_SCALE so every case line executes without minutes of CPU
+    // memcpy. Neither knob exists in the real branch.
+    var scale: u64 = 1;
+    if (std.c.getenv("BW_PREFLIGHT_SCALE")) |v| scale = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 1;
+    if (scale == 0) scale = 1;
+    const preflight_cpu = std.c.getenv("BW_PREFLIGHT_CPU") != null;
+    std.debug.print("PREFLIGHT ONLY, NOT A RESULT: cpu-allowed={} scale={d}\n", .{ preflight_cpu, scale });
+    var stream_scaled: [stream_sizes.len]u64 = undefined;
+    for (stream_sizes, 0..) |s, i| stream_scaled[i] = s / scale;
+    var small_scaled: [copy_small_sizes.len]u64 = undefined;
+    for (copy_small_sizes, 0..) |s, i| small_scaled[i] = s / scale;
+    const big = big_bytes / scale;
+
     var rt = try vk.Runtime.open();
     defer rt.close();
     var dev = try vk.Device.open(&rt, .{}); // refuses CPU (software) devices and Vulkan below 1.3
@@ -342,7 +357,7 @@ pub fn main(init: std.process.Init) !u8 {
     const types = [_][]const u8{ "other", "integrated", "discrete", "virtual", "cpu" };
     const kind = if (pr.deviceType < types.len) types[pr.deviceType] else "unknown";
     std.debug.print("MILESTONE device-found name=\"{s}\" vendor=0x{x:0>4} device=0x{x:0>4} type={s} timeout={d}ms\n", .{ name, pr.vendorID, pr.deviceID, kind, opts.timeout_ms });
-    if (pr.deviceType == c.VK_PHYSICAL_DEVICE_TYPE_CPU) {
+    if (pr.deviceType == c.VK_PHYSICAL_DEVICE_TYPE_CPU and !preflight_cpu) {
         std.debug.print("FAIL device: a CPU (software) Vulkan device is never a GPU result\n", .{});
         return 1;
     }
@@ -353,12 +368,12 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Sweep plan against the device's real binding limits; sizes above them
     // are skipped with a message and the rest of the run continues.
-    var plan = planSweep(pr.limits.maxStorageBufferRange, dev.v13.maxBufferSize);
+    var plan = planSweep(pr.limits.maxStorageBufferRange * scale, dev.v13.maxBufferSize * scale);
     for (stream_sizes, plan.stream) |size, on| if (!on) {
         std.debug.print("SKIP sweep {d:.0} MiB: exceeds {s}={d}\n", .{ mib(size), if (size > pr.limits.maxStorageBufferRange) "maxStorageBufferRange" else "maxBufferSize", @min(pr.limits.maxStorageBufferRange, dev.v13.maxBufferSize) });
     };
-    if (plan.len < big_bytes) {
-        std.debug.print("FAIL device: the largest allocatable sweep buffer is {d:.0} MiB; the ramp and idle cases need {d:.0} MiB\n", .{ mib(plan.len), mib(big_bytes) });
+    if (plan.len / scale < big) {
+        std.debug.print("FAIL device: the largest allocatable sweep buffer is {d:.0} MiB; the ramp and idle cases need {d:.0} MiB\n", .{ mib(plan.len / scale), mib(big) });
         return 1;
     }
 
@@ -367,12 +382,12 @@ pub fn main(init: std.process.Init) !u8 {
     var src: vk.Buffer = undefined;
     var dst: vk.Buffer = undefined;
     while (true) {
-        src = vk.Buffer.init(&dev, .device, plan.len) catch {
+        src = vk.Buffer.init(&dev, .device, plan.len / scale) catch {
             plan.len /= 2;
             if (plan.len < big_bytes) break;
             continue;
         };
-        dst = vk.Buffer.init(&dev, .device, plan.len) catch {
+        dst = vk.Buffer.init(&dev, .device, plan.len / scale) catch {
             src.deinit();
             plan.len /= 2;
             if (plan.len < big_bytes) break;
@@ -380,8 +395,8 @@ pub fn main(init: std.process.Init) !u8 {
         };
         break;
     }
-    if (plan.len < big_bytes) {
-        std.debug.print("FAIL device: could not allocate a {d:.0} MiB src/dst pair; the ramp and idle cases need it\n", .{mib(big_bytes)});
+    if (plan.len / scale < big) {
+        std.debug.print("FAIL device: could not allocate a {d:.0} MiB src/dst pair; the ramp and idle cases need it\n", .{mib(big)});
         return 1;
     }
     for (stream_sizes, 0..) |size, i| if (plan.stream[i] and size > plan.len) {
@@ -484,13 +499,13 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("MILESTONE checks-passed copy/read/write byte-exact on {d} KiB; timing begins\n", .{check_bytes >> 10});
 
     // ---- (1) cold-to-warm ramp: the first timed GPU work after the checks
-    const ramp_bytes = ramp_dep * 2 * big_bytes;
+    const ramp_bytes = ramp_dep * 2 * big;
     var ramp_unit = copy_unit;
-    ramp_unit.shader.push = std.mem.asBytes(&Push{ .count_words = @intCast(big_bytes / 4) })[0..@sizeOf(Push)];
-    std.debug.print("MILESTONE ramp-start: {d} batches x {d} dependent {d:.0} MiB copies ({d:.2} GiB per batch), cold-to-warm\n", .{ ramp_batches, ramp_dep, mib(big_bytes), mib(ramp_bytes) / 1024.0 });
+    ramp_unit.shader.push = std.mem.asBytes(&Push{ .count_words = @intCast(big / 4) })[0..@sizeOf(Push)];
+    std.debug.print("MILESTONE ramp-start: {d} batches x {d} dependent {d:.0} MiB copies ({d:.2} GiB per batch), cold-to-warm\n", .{ ramp_batches, ramp_dep, mib(big), mib(ramp_bytes) / 1024.0 });
     var ramp_ns: [ramp_batches]u64 = undefined;
     for (0..ramp_batches) |b| {
-        ramp_ns[b] = try sampleBatch(io, &cmds, staging, ramp_unit, big_bytes, ramp_dep, timeout);
+        ramp_ns[b] = try sampleBatch(io, &cmds, staging, ramp_unit, big, ramp_dep, timeout);
         std.debug.print("RAMP {d: >2}: {d:.1} us {d:.2} GB/s\n", .{ b, us(ramp_ns[b]), effectiveGbps(ramp_bytes, ramp_ns[b]) });
     }
     var scratch8: [8]u64 = undefined;
@@ -502,20 +517,20 @@ pub fn main(init: std.process.Init) !u8 {
     // ---- (2) size sweep, warm: shader kernels, then the driver copy
     const small_on = [_]bool{ plan.small, plan.small };
     std.debug.print("MILESTONE sweep shader copy (uvec4): small sizes then 64/256/512/1024 MiB at N=1/4/16 (1 GiB at N=1/4/8); 2x size moved per dispatch\n", .{});
-    try runSweep(io, &cmds, staging, "shader copy (uvec4)", copy_unit, &copy_small_sizes, &small_on, &copy_small_deps, null, 2, timeout);
-    try runSweep(io, &cmds, staging, "shader copy (uvec4)", copy_unit, &stream_sizes, &plan.stream, &stream_deps, &stream_1gib_deps, 2, timeout);
+    try runSweep(io, &cmds, staging, "shader copy (uvec4)", copy_unit, &small_scaled, &small_on, &copy_small_deps, null, 2, timeout);
+    try runSweep(io, &cmds, staging, "shader copy (uvec4)", copy_unit, &stream_scaled, &plan.stream, &stream_deps, &stream_1gib_deps, 2, timeout);
     std.debug.print("MILESTONE sweep read (xor-reduce): 64/256/512/1024 MiB at N=1/4/16 (1 GiB at N=1/4/8); size moved per dispatch\n", .{});
-    try runSweep(io, &cmds, staging, "read (xor-reduce)", read_unit, &stream_sizes, &plan.stream, &stream_deps, &stream_1gib_deps, 1, timeout);
+    try runSweep(io, &cmds, staging, "read (xor-reduce)", read_unit, &stream_scaled, &plan.stream, &stream_deps, &stream_1gib_deps, 1, timeout);
     std.debug.print("MILESTONE sweep write (pattern): 64/256/512/1024 MiB at N=1/4/16 (1 GiB at N=1/4/8); size moved per dispatch\n", .{});
-    try runSweep(io, &cmds, staging, "write (pattern)", write_unit, &stream_sizes, &plan.stream, &stream_deps, &stream_1gib_deps, 1, timeout);
+    try runSweep(io, &cmds, staging, "write (pattern)", write_unit, &stream_scaled, &plan.stream, &stream_deps, &stream_1gib_deps, 1, timeout);
     std.debug.print("MILESTONE sweep driver copy (vkCmdCopyBuffer): 64/256/512/1024 MiB at N=1/4/16 (1 GiB at N=1/4/8); a transfer barrier between copies; 2x size moved per dispatch\n", .{});
-    try runSweep(io, &cmds, staging, "driver copy (vkCmdCopyBuffer)", driver_unit, &stream_sizes, &plan.stream, &stream_deps, &stream_1gib_deps, 2, timeout);
+    try runSweep(io, &cmds, staging, "driver copy (vkCmdCopyBuffer)", driver_unit, &stream_scaled, &plan.stream, &stream_deps, &stream_1gib_deps, 2, timeout);
 
     // ---- (3) idle re-entry: does the memory clock fall back?
-    std.debug.print("MILESTONE idle-re-entry: {d} s host sleep, then one batch of {d} dependent {d:.0} MiB copies\n", .{ idle_sleep_ms / 1000, ramp_dep, mib(big_bytes) });
+    std.debug.print("MILESTONE idle-re-entry: {d} s host sleep, then one batch of {d} dependent {d:.0} MiB copies\n", .{ idle_sleep_ms / 1000, ramp_dep, mib(big) });
     std.Io.sleep(io, .fromMilliseconds(idle_sleep_ms), .awake) catch {};
-    const idle_ns = try sampleBatch(io, &cmds, staging, ramp_unit, big_bytes, ramp_dep, timeout);
-    std.debug.print("IDLE after {d} s: {d:.1} us {d:.2} GB/s ({d} dependent {d:.0} MiB copies per batch)\n", .{ idle_sleep_ms / 1000, us(idle_ns), effectiveGbps(ramp_bytes, idle_ns), ramp_dep, mib(big_bytes) });
+    const idle_ns = try sampleBatch(io, &cmds, staging, ramp_unit, big, ramp_dep, timeout);
+    std.debug.print("IDLE after {d} s: {d:.1} us {d:.2} GB/s ({d} dependent {d:.0} MiB copies per batch)\n", .{ idle_sleep_ms / 1000, us(idle_ns), effectiveGbps(ramp_bytes, idle_ns), ramp_dep, mib(big) });
 
     var enabled: usize = 0;
     for (plan.stream) |on| enabled += @intFromBool(on);

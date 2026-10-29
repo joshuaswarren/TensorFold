@@ -136,7 +136,7 @@ pub fn computeFamily(families: []const c.VkQueueFamilyProperties) ?u32 {
 /// Why a device cannot serve: below Vulkan 1.3, a CPU implementation, no compute queue, or a requested feature absent.
 pub fn refusal(api_version: u32, kind: c.VkPhysicalDeviceType, family: ?u32, lacking: ?[]const u8) ?Error {
     if (!runtime.atLeast13(api_version)) return error.VulkanVersion;
-    if (kind == c.VK_PHYSICAL_DEVICE_TYPE_CPU) return error.SoftwareDevice;
+    if (kind == c.VK_PHYSICAL_DEVICE_TYPE_CPU and std.c.getenv("BW_PREFLIGHT_CPU") == null) return error.SoftwareDevice; // PREFLIGHT ONLY: BW_PREFLIGHT_CPU admits a CPU (lavapipe) device
     if (family == null) return error.NoComputeQueue;
     if (lacking != null) return error.MissingFeature;
     return null;
