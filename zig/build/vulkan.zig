@@ -402,7 +402,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         },
     });
     host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = contract_fixture })).step);
-    // The parallel-K fixture's host proofs: stated depth, one-row routing, every control's arithmetic refused by its checker.
+    // The parallel-K fixture's host proofs: stated depth, one-row routing, its controls' checkers, and the shipped kernel source pinned.
+    const pk_src_files = b.addWriteFiles();
+    _ = pk_src_files.addCopyFile(b.path("zig/kernels/vulkan/qmm_q4_pk.comp"), "qmm_q4_pk.comp");
     const contract_pk_fixture = b.createModule(.{
         .root_source_file = b.path("zig/tests/vulkan/contract_qmm_pk.zig"),
         .target = b.graph.host,
@@ -411,6 +413,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
             .{ .name = "vulkan", .module = module(b, b.graph.host, .debug, o) },
             .{ .name = "contract", .module = @import("kernel_contract.zig").module(b, b.graph.host, .debug) },
             .{ .name = "qwen35_chunk_cap", .module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/backend/vulkan/chunk_cap.zig"), .target = b.graph.host, .optimize = .debug }) },
+            .{ .name = "pk_src", .module = b.createModule(.{ .root_source_file = pk_src_files.add("pk_src.zig", "pub const qmm_q4_pk = @embedFile(\"qmm_q4_pk.comp\");\n") }) },
         },
     });
     host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = contract_pk_fixture })).step);

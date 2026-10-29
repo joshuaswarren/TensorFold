@@ -2,8 +2,10 @@
 
 // The qmm_q4_pk kernel with one planted fault per variant, for the Vulkan kernel contract's
 // controls: each control is this copy compiled with one define, and the shipped qmm_q4_pk.comp
-// stays untouched. Every variant reads the same bindings and push constants and evaluates the
-// same per-element expression as the kernel it copies; the fault is only the one the define
+// stays untouched. The copy follows the kernel's software-pipelined loads (the next pack's
+// word, scale, bias and widened x elements issue one pack ahead) with the same arithmetic,
+// order, tree and store. Every variant reads the same bindings and push constants and evaluates
+// the same per-element expression as the kernel it copies; the fault is only the one the define
 // names, and the runner pushes the same flags (2: strided lanes, compensated sums) so each
 // fault lands on the path the real kernel takes.
 //
@@ -117,19 +119,54 @@ void main() {
     uint last = contiguous ? first + chunk : packs;
     float partial = 0.0;
     float comp = 0.0;
-    for (uint pack = first; pack < last; pack += step) {
-#ifdef TF_CTL_PK_DROP_TAIL
-      // the fault: the last lane skips the row's final pack
-      if (lane == 63u && pack + 1u == packs) continue;
-#endif
-      float scale = bf16_load(scales.values[column * groups_per_row + pack / 8u]);
-      float bias = bf16_load(biases.values[column * groups_per_row + pack / 8u]);
-      uint word = input_w.values[w_base + pack];
+    // the pipeline's current pack, loaded before the loop (lanes with no packs stay at zeros)
+    uint pack = first;
+    float scale = 0.0;
+    float bias = 0.0;
+    uint word = 0u;
+    uint16_t xb[8];
+    float q[8];
+    for (uint e = 0u; e < 8u; ++e) {
+      xb[e] = uint16_t(0u);
+      q[e] = 0.0;
+    }
+    if (pack < last) {
+      scale = bf16_load(scales.values[column * groups_per_row + pack / 8u]);
+      bias = bf16_load(biases.values[column * groups_per_row + pack / 8u]);
+      word = input_w.values[w_base + pack];
       uint k_base = pack * 8u;
       for (uint e = 0u; e < 8u; ++e) {
-        float q = float((word >> (e * 4u)) & 0xFu);
-        precise float term = bf16_load(input_x.values[x_base + k_base + e]) *
-            (scale * q + bias);
+        xb[e] = input_x.values[x_base + k_base + e];
+        q[e] = float((word >> (e * 4u)) & 0xFu); // exact, so hoisting changes no value
+      }
+    }
+    while (pack < last) {
+      // issue the next pack's loads now; this pack's arithmetic overlaps them
+      uint next = pack + step;
+      bool has_next = next < last;
+      float n_scale = scale;
+      float n_bias = bias;
+      uint n_word = word;
+      uint16_t n_xb[8];
+      float n_q[8];
+      if (has_next) {
+        n_scale = bf16_load(scales.values[column * groups_per_row + next / 8u]);
+        n_bias = bf16_load(biases.values[column * groups_per_row + next / 8u]);
+        n_word = input_w.values[w_base + next];
+        uint n_k_base = next * 8u;
+        for (uint e = 0u; e < 8u; ++e) {
+          n_xb[e] = input_x.values[x_base + n_k_base + e];
+          n_q[e] = float((n_word >> (e * 4u)) & 0xFu);
+        }
+      }
+      // the frozen per-element arithmetic, unchanged in value and order
+      for (uint e = 0u; e < 8u; ++e) {
+#ifdef TF_CTL_PK_DROP_TAIL
+        // the fault: the last lane skips its row's final pack's arithmetic
+        if (lane == 63u && pack + 1u == packs) break;
+#endif
+        precise float term = bf16_load(xb[e]) *
+            (scale * q[e] + bias);
 #ifdef TF_CTL_PK_FP16
         // the fault: the running sum keeps fp16 precision
         partial = float(float16_t(partial) + float16_t(term));
@@ -146,6 +183,14 @@ void main() {
           partial += term;
         }
 #endif
+      }
+      pack = next;
+      scale = n_scale;
+      bias = n_bias;
+      word = n_word;
+      for (uint e = 0u; e < 8u; ++e) {
+        xb[e] = n_xb[e];
+        q[e] = n_q[e];
       }
     }
     tree[lane] = partial;
