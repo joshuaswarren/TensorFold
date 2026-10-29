@@ -1,6 +1,7 @@
 //! Real Vulkan device checks, run only by `zig build vulkan-gpu-test -Dvulkan=true`: staged round trips and refusals.
 const std = @import("std");
 const vulkan = @import("vulkan");
+const test_shaders = @import("test_shaders");
 
 const timeout_ns = 10_000_000_000;
 
@@ -49,4 +50,38 @@ test "buffers and descriptors past the device's limits are refused" {
     try std.testing.expectError(error.NotMapped, gpu.bytes());
     if (limits.minStorageBufferOffsetAlignment > 1)
         try std.testing.expectError(error.Misaligned, gpu.descriptor(limits.minStorageBufferOffsetAlignment - 1, 4));
+}
+
+test "a timed batch of two dispatches leaves three stamps and two tally entries" {
+    var rt = try vulkan.Runtime.open();
+    defer rt.close();
+    var dev = try vulkan.Device.open(&rt, .{});
+    defer dev.close();
+    var cmds = try vulkan.Commands.init(&dev);
+    defer cmds.deinit();
+    var gpu = try vulkan.Buffer.init(&dev, .device, 64);
+    defer gpu.deinit();
+    var staging = try vulkan.Buffer.init(&dev, .staging, 64);
+    defer staging.deinit();
+    try vulkan.orExit(vulkan.fill(&cmds, gpu, 0, 64, 0, timeout_ns));
+    var pipe = try vulkan.dispatch.Pipeline.init(&dev, &test_shaders.timing_probe, .{ .bindings = 1, .push_bytes = 4, .writes = 0 });
+    defer pipe.deinit();
+    var kt = try vulkan.dispatch.Timing.create(std.testing.allocator, &dev);
+    defer kt.destroy(std.testing.allocator);
+    vulkan.dispatch.timing = kt;
+    defer vulkan.dispatch.timing = null;
+    try cmds.beginBatch(staging);
+    const cmd = try cmds.begin();
+    try pipe.bind(&.{.{ .buffer = &gpu, .len = 64 }});
+    try pipe.record(cmd, &[_]u8{ 1, 0, 0, 0 }, .{ 4, 1, 1 });
+    try pipe.record(cmd, &[_]u8{ 2, 0, 0, 0 }, .{ 4, 1, 1 }); // a different push, so a second tally key
+    try cmds.endBatch(timeout_ns);
+    try std.testing.expectEqual(@as(u32, 3), kt.n);
+    var prev: u64 = 0;
+    for (kt.stamps[0..kt.n]) |s| {
+        try std.testing.expect((s & kt.valid_mask) >= prev);
+        prev = s & kt.valid_mask;
+    }
+    try std.testing.expectEqual(@as(u32, 2), kt.tally.n);
+    for (kt.tally.entries[0..kt.tally.n]) |e| try std.testing.expectEqual(@as(u64, 1), e.calls);
 }

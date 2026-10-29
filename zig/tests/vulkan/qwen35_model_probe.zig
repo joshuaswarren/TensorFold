@@ -274,6 +274,53 @@ fn bundle() engine_mod.ShaderBundle {
     };
 }
 
+/// The tally entry's kernel name, resolved against the probe's own shader
+/// images; a module the probe does not embed prints as unknown<len>.
+fn kernelName(a: std.mem.Allocator, spirv_ptr: usize, spirv_len: u32) []const u8 {
+    const bytes = @as([*]const u8, @ptrFromInt(spirv_ptr))[0..spirv_len];
+    inline for (comptime std.meta.declarations(q35s)) |name| {
+        const image = &@field(q35s, name);
+        if (std.mem.eql(u8, std.mem.sliceAsBytes(image), bytes)) return name;
+    }
+    return std.fmt.allocPrint(a, "unknown<{d}>", .{spirv_len}) catch "unknown";
+}
+
+/// One `KTIME ` block per steady window: every tally entry, heaviest first,
+/// then the window's per-token GPU total and wall time. Diagnostic only —
+/// it never changes the run's result or exit code.
+fn ktimeReport(a: std.mem.Allocator, kt: *q35v.vk.dispatch.Timing, run: []const u8, samples: []const SteadySample) void {
+    const per_token: u64 = @max(samples.len, 1);
+    var wall_ns: u64 = 0;
+    for (samples) |s| wall_ns += s.wall_ns;
+    const entries = a.alloc(q35v.vk.dispatch.TallyEntry, kt.tally.n) catch {
+        std.debug.print("KTIME report failed: OutOfMemory\n", .{});
+        return;
+    };
+    defer a.free(entries);
+    @memcpy(entries, kt.tally.entries[0..kt.tally.n]);
+    std.mem.sort(q35v.vk.dispatch.TallyEntry, entries, {}, struct {
+        fn desc(_: void, x: q35v.vk.dispatch.TallyEntry, y: q35v.vk.dispatch.TallyEntry) bool {
+            return x.total_ns > y.total_ns;
+        }
+    }.desc);
+    for (entries) |e| {
+        const name = kernelName(a, e.key.spirv, e.spirv_len);
+        const calls_per_token = @as(f64, @floatFromInt(e.calls)) / @as(f64, @floatFromInt(per_token));
+        const mean_us = @as(f64, @floatFromInt(e.total_ns)) / @as(f64, @floatFromInt(@max(e.calls, 1))) / 1000.0;
+        const total_us_per_token = @as(f64, @floatFromInt(e.total_ns)) / 1000.0 / @as(f64, @floatFromInt(per_token));
+        std.debug.print("KTIME {s} {s} push={x:0>8},{x:0>8},{x:0>8},{x:0>8} groups={d},{d},{d} calls_per_token={d:.2} mean_us={d:.2} total_us_per_token={d:.2} share={d:.4}\n", .{
+            run,                          name,
+            e.key.push_words[0],          e.key.push_words[1],
+            e.key.push_words[2],          e.key.push_words[3],
+            e.key.groups[0],              e.key.groups[1],
+            e.key.groups[2],              calls_per_token,
+            mean_us,                      total_us_per_token,
+            kt.tally.share(e.total_ns),
+        });
+    }
+    std.debug.print("KTIME total {s} gpu_ns_per_token={d} wall_ns_per_token={d}\n", .{ run, kt.tally.total_ns / per_token, wall_ns / per_token });
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const clock: Elapsed = .{ .io = init.io, .start = std.Io.Clock.awake.now(init.io) };
     const args = try init.minimal.args.toSlice(init.arena.allocator());
@@ -380,6 +427,20 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer engine.deinit();
     std.debug.print("MILESTONE engine-ready elapsed_ms={d} capacity={d} model_context={d} logits_bytes={d}\n", .{ clock.ms(), engine.capacity(), engine.modelContext(), engine.logitsLen() });
+
+    // TF_VK_KTIME=1 opts into per-dispatch GPU timestamps for the steady
+    // decode windows of both runs; anything that refuses is named and the
+    // run continues uninstrumented. The destroy defer registered here runs
+    // before engine.deinit's, so the pool dies while the device lives.
+    var kt: ?*q35v.vk.dispatch.Timing = null;
+    if (std.c.getenv("TF_VK_KTIME")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
+        kt = q35v.vk.dispatch.Timing.create(a, engine.dev) catch |err| blk: {
+            std.debug.print("KTIME refused: {s}\n", .{@errorName(err)});
+            break :blk null;
+        };
+    };
+    defer if (kt) |t| t.destroy(a);
+
     if (opts.vendor) |want| if (engine.vendorId() != want) {
         std.debug.print("FAIL device: vendor 0x{x:0>4} is not the requested 0x{x:0>4}\n", .{ engine.vendorId(), want });
         return 1;
@@ -399,13 +460,13 @@ pub fn main(init: std.process.Init) !u8 {
     const samples_b = try a.alloc(SteadySample, expected.len - 1);
     defer a.free(samples_b);
 
-    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_a, rows_a, row_len, samples_a, io) catch |e| {
+    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_a, rows_a, row_len, samples_a, io, a, "run_a", kt) catch |e| {
         std.debug.print("FAIL run1: {s}\n", .{@errorName(e)});
         return 1;
     };
     std.debug.print("MILESTONE run1-done elapsed_ms={d}\n", .{clock.ms()});
     try engine.reset();
-    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_b, rows_b, row_len, samples_b, io) catch |e| {
+    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_b, rows_b, row_len, samples_b, io, a, "run_b", kt) catch |e| {
         std.debug.print("FAIL run2: {s}\n", .{@errorName(e)});
         return 1;
     };
@@ -552,7 +613,7 @@ fn steadyToken(io: std.Io, e: *Engine, s: u64, token: u32, row: []u8) !SteadySam
 /// anchor) feeds each draw back; the teacher-forced mode feeds the oracle's
 /// own id for the step just scored as the next input - a labelled per-step
 /// check, never a free-running chain proof.
-fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const u32, expected: []const u32, ids_out: []u32, rows_out: []u8, row_len: usize, samples_out: []SteadySample, io: std.Io) !void {
+fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const u32, expected: []const u32, ids_out: []u32, rows_out: []u8, row_len: usize, samples_out: []SteadySample, io: std.Io, a: std.mem.Allocator, run: []const u8, kt: ?*q35v.vk.dispatch.Timing) !void {
     if (samples_out.len != ids_out.len - 1) return error.Invalid;
     if (sequential) {
         for (prompt) |tok| try e.prefill(&.{tok});
@@ -561,11 +622,21 @@ fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const
     }
     ids_out[0] = try e.draw();
     try e.logitsBytes(rows_out[0..row_len]);
+    // TF_VK_KTIME's window: exactly the steady tokens. The prefill and the
+    // warm-up draw above ran uninstrumented; the tally restarts per window.
+    if (kt) |t| {
+        t.tally = .{};
+        q35v.vk.dispatch.timing = t;
+    }
+    defer if (kt != null) {
+        q35v.vk.dispatch.timing = null;
+    };
     for (1..ids_out.len) |step| {
         const feed: u32 = if (teacher_forced) expected[step - 1] else ids_out[step - 1];
         samples_out[step - 1] = try steadyToken(io, e, step, feed, rows_out[step * row_len ..][0..row_len]);
         ids_out[step] = samples_out[step - 1].id;
     }
+    if (kt) |t| ktimeReport(a, t, run, samples_out);
 }
 
 const RepeatChecks = struct { runs: u64 = 2, generated_ids_equal: bool, logits_bytes_equal: bool };

@@ -1,0 +1,7 @@
+#version 450
+// The timing gpu test's trivial kernel: one add per invocation, so a batch of
+// two dispatches exercises stamps without touching the model shaders.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0) buffer B { uint v[]; };
+layout(push_constant) uniform P { uint add; } p;
+void main() { v[gl_GlobalInvocationID.x] += p.add; }
