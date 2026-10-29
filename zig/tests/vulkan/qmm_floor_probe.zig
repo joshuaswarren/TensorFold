@@ -154,6 +154,16 @@ fn checkSpec() c.Spec {
     return .{ .name = "qmm-floor pk self-check", .accum = .f32, .depth = fxpk.depth, .out = .bf16, .served = &.{} };
 }
 
+/// Re-exports for tf-qmm-multi: Zig forbids a file living in two modules, so
+/// the multi probe takes the push-constant layout and the pk spec from here
+/// instead of importing contract_qmm.zig itself. Behavior-neutral for this
+/// probe's binary.
+pub const Params = qmm.Params;
+
+pub fn pkSpec() c.Spec {
+    return checkSpec();
+}
+
 fn us(ns: u64) f64 { return @as(f64, @floatFromInt(ns)) / 1000.0; }
 
 fn printStats(n: usize, stats: Stats) void {

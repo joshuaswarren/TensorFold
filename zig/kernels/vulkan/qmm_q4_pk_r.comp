@@ -1,0 +1,188 @@
+#version 460
+
+// OUT_PER_WG-way re-batching of qmm_q4_pk.comp (private probe kernel): one workgroup
+// now carries R outputs through the SAME per-output arithmetic as the one-output
+// kernel — same lane pack order (l, l+64, ...), same in-pack element order, same
+// scale*float(q)+bias expression, same fixed shared-memory binary tree with its 6
+// barriers, same compensated TwoSum and class fix, same bf16_store RNE. The R
+// outputs share the barriers: every tree level runs for all R rows between the
+// same two barriers, inactive tail rows carry zeros and never store. No per-output
+// operation is reordered or removed, so every output word must be bit-identical
+// to qmm_q4_pk.comp's; the probe proves that per shape before timing anything.
+// Grid-stride over ceil(total/R) workgroups; every barrier stays at uniform
+// control flow (active_r is workgroup-uniform) and no lane returns early.
+
+// Copyright © 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
+
+#ifndef OUT_PER_WG
+#error "define OUT_PER_WG (2, 4 or 8)"
+#endif
+#if OUT_PER_WG < 2 || OUT_PER_WG > 8
+#error "OUT_PER_WG must be 2, 4 or 8"
+#endif
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputX {
+  uint16_t values[];
+} input_x;
+layout(set = 0, binding = 1, std430) readonly buffer InputW {
+  uint values[];
+} input_w;
+layout(set = 0, binding = 2, std430) readonly buffer Scales {
+  uint16_t values[];
+} scales;
+layout(set = 0, binding = 3, std430) readonly buffer Biases {
+  uint16_t values[];
+} biases;
+layout(set = 0, binding = 4, std430) writeonly buffer Output {
+  uint16_t values[];
+} output_data;
+
+// The stage 1 120-byte ComputeParams; only matrix_m/matrix_n/matrix_k are read.
+layout(push_constant) uniform Params {
+  uint count;
+  uint operation;
+  uint lhs_size;
+  uint rhs_size;
+  uint reduce_size;
+  uint output_size;
+  uint lhs_offset;
+  uint rhs_offset;
+  uint output_offset;
+  uint aux_size;
+  uint aux_offset;
+  uint matrix_m;
+  uint matrix_n;
+  uint matrix_k;
+  uint flags;
+  float alpha;
+  float beta;
+  uint dims;
+  uint shape[4];
+  uint in_strides[4];
+  uint out_strides[4];
+} params;
+
+shared float tree[OUT_PER_WG][64];
+shared float tree_lo[OUT_PER_WG][64]; // compensated variants only
+
+// Widened bf16: exact f32, the qmm.comp LOAD_VALUE read.
+float bf16_load(uint16_t bits) {
+  return uintBitsToFloat(uint(bits) << 16u);
+}
+
+// The repo's bf16_store RNE, shared verbatim with qmm.comp (NaN keeps its quiet class).
+uint16_t bf16_store(float value) {
+  uint bits = floatBitsToUint(value);
+  if (isnan(value)) {
+    return uint16_t((bits >> 16) | 0x40u);
+  }
+  return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+
+void main() {
+  const uint R = uint(OUT_PER_WG);
+  uint lane = gl_LocalInvocationID.x;
+  uint words_per_row = params.matrix_k / 8u;   // 16 packed nibbles a word
+  uint groups_per_row = params.matrix_k / 64u; // group 64: 8 words a group
+  uint packs = params.matrix_k / 8u;           // one word packs 8 q4 elements
+  uint total = params.matrix_m * params.matrix_n;
+
+  // Grid-stride over output groups: workgroup w starts at w*R, advances by gl_NumWorkGroups.x*R.
+  for (uint index0 = gl_WorkGroupID.x * R; index0 < total; index0 += gl_NumWorkGroups.x * R) {
+    uint index_r[R];
+    uint column_r[R];
+    uint w_base_r[R];
+    uint x_base_r[R];
+    bool active_r[R];
+    float partial_r[R];
+    float comp_r[R];
+    for (uint r = 0u; r < R; ++r) {
+      index_r[r] = index0 + r;
+      active_r[r] = index_r[r] < total; // workgroup-uniform: the tail stays barrier-safe
+      uint row = index_r[r] / params.matrix_n;
+      column_r[r] = index_r[r] - row * params.matrix_n;
+      w_base_r[r] = column_r[r] * words_per_row;
+      x_base_r[r] = row * params.matrix_k;
+      partial_r[r] = 0.0;
+      comp_r[r] = 0.0;
+    }
+    // EXPERIMENT (flags): bit 0 = lanes take CONTIGUOUS pack ranges instead of strided
+    // packs; bit 1 = Neumaier-compensated lane sums and a TwoSum tree. flags == 0 is the
+    // frozen split-K arithmetic (strided packs, plain f32 partials, plain f32 tree).
+    bool contiguous = (params.flags & 1u) != 0u && (packs % 64u) == 0u;
+    bool compensated = (params.flags & 2u) != 0u;
+    uint chunk = packs / 64u;
+    uint first = contiguous ? lane * chunk : lane;
+    uint step = contiguous ? 1u : 64u;
+    uint last = contiguous ? first + chunk : packs;
+    for (uint pack = first; pack < last; pack += step) {
+      for (uint r = 0u; r < R; ++r) {
+        if (active_r[r]) {
+          float scale = bf16_load(scales.values[column_r[r] * groups_per_row + pack / 8u]);
+          float bias = bf16_load(biases.values[column_r[r] * groups_per_row + pack / 8u]);
+          uint word = input_w.values[w_base_r[r] + pack];
+          uint k_base = pack * 8u;
+          for (uint e = 0u; e < 8u; ++e) {
+            float q = float((word >> (e * 4u)) & 0xFu);
+            if (compensated) {
+              precise float term = bf16_load(input_x.values[x_base_r[r] + k_base + e]) *
+                  (scale * q + bias);
+              precise float t = partial_r[r] + term;
+              if (abs(partial_r[r]) >= abs(term)) {
+                comp_r[r] += (partial_r[r] - t) + term;
+              } else {
+                comp_r[r] += (term - t) + partial_r[r];
+              }
+              partial_r[r] = t;
+            } else {
+              // the frozen expression, unchanged
+              partial_r[r] += bf16_load(input_x.values[x_base_r[r] + k_base + e]) *
+                  (scale * q + bias);
+            }
+          }
+        }
+      }
+    }
+    for (uint r = 0u; r < R; ++r) {
+      tree[r][lane] = partial_r[r];
+      tree_lo[r][lane] = comp_r[r];
+    }
+    barrier();
+    for (uint stride = 32u; stride >= 1u; stride >>= 1u) {
+      if (lane < stride) {
+        for (uint r = 0u; r < R; ++r) {
+          if (compensated) {
+            precise float a = tree[r][lane];
+            precise float b2 = tree[r][lane + stride];
+            precise float sum = a + b2;
+            precise float bb = sum - a;
+            precise float err = (a - (sum - bb)) + (b2 - bb);
+            tree[r][lane] = sum;
+            tree_lo[r][lane] = tree_lo[r][lane] + tree_lo[r][lane + stride] + err;
+          } else {
+            tree[r][lane] += tree[r][lane + stride];
+          }
+        }
+      }
+      barrier();
+    }
+    if (lane == 0u) {
+      for (uint r = 0u; r < R; ++r) {
+        if (active_r[r]) {
+          // The class fix, once per output exactly as qmm_q4_pk.comp forms it.
+          float total_sum = tree[r][0];
+          if (compensated) {
+            total_sum = (isnan(tree[r][0]) || isinf(tree[r][0])) ? tree[r][0] : tree[r][0] + tree_lo[r][0];
+          }
+          output_data.values[index_r[r]] = bf16_store(total_sum);
+        }
+      }
+    }
+    barrier(); // orders this iteration's reads before the next grid-stride iteration's writes
+  }
+}
