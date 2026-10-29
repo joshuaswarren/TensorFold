@@ -110,7 +110,7 @@ pub const Commands = struct {
     /// buffer. Batched descriptor banks key on the new epoch, so every
     /// pipeline's snapshot cursor restarts only here — always after the
     /// previous batch's fence has been waited.
-    pub fn beginBatch(self: *Commands, staging: Buffer) Error!void {
+    pub fn beginBatch(self: *Commands, staging: Buffer) dispatch.Error!void {
         if (self.session) return error.Invalid;
         if (staging.dev != self.dev or staging.kind != .staging or staging.mapped == null) return error.Invalid;
         try self.lifecycle.start();
@@ -125,6 +125,7 @@ pub const Commands = struct {
             .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         };
         try check(self.dev.api.vkBeginCommandBuffer(self.cmd, &info));
+        if (dispatch.timing) |t| try t.batchBegin(self.cmd); // pool reset + stamp 0: the batch's anchor
         self.lifecycle.began(); // recording may start: the begin happened exactly once
         self.session = true;
         self.ledger = .{ .capacity = staging.len };
@@ -138,13 +139,14 @@ pub const Commands = struct {
     /// unconditionally closes them, so the next call starts clean; the fence
     /// discipline is unchanged (Timeout/InFlight still demand orExit at the
     /// call site).
-    pub fn endBatch(self: *Commands, timeout_ns: u64) Error!void {
+    pub fn endBatch(self: *Commands, timeout_ns: u64) dispatch.Error!void {
         if (!self.session) return error.Invalid;
         self.session = false;
         dispatch.batchEnd();
         defer self.lifecycle.finish();
         try self.batch_staging.flush(); // host writes visible to the copy engine before the submit
         try self.submitAndWait(timeout_ns);
+        if (dispatch.timing) |t| try t.collect(); // after the fence: stamps are final, fold the deltas
         try self.batch_staging.invalidate(); // device writes visible to the host, after the fence
     }
 

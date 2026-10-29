@@ -3,3 +3,6 @@
 pub const backend = @import("backend/vulkan/backend.zig");
 pub const engine = @import("backend/vulkan/engine.zig");
 pub const config = @import("config.zig");
+/// The engine's Vulkan backend module, for tools that drive the engine's own
+/// engine (the model probe's opt-in per-dispatch timing).
+pub const vk = @import("vulkan");

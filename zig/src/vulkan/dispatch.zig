@@ -8,9 +8,179 @@ const commands = @import("commands.zig");
 
 const check = runtime.check;
 
-pub const Error = runtime.Error || error{ BadSpirv, NoLocalSize, TooManyBindings, BadPushSize, BadWorkgroup, BadGroupCount, BadBindings, Aliased, BatchOverflow };
+pub const Error = runtime.Error || error{ BadSpirv, NoLocalSize, TooManyBindings, BadPushSize, BadWorkgroup, BadGroupCount, BadBindings, Aliased, BatchOverflow, TimingOverflow, TimestampUnsupported };
 
 pub const max_bindings = 10;
+
+/// Per-dispatch GPU timestamps, off until a caller points `timing` at its
+/// Timing. Null (the default) costs nothing: no query pool, no extra
+/// commands, no allocations.
+pub var timing: ?*Timing = null;
+
+/// Query-pool capacity: the worst token records ~490 dispatch stamps plus
+/// uploads between them; 16384 leaves order-of-magnitude headroom.
+pub const timing_capacity: u32 = 16384;
+
+/// What one timestamp followed: the dispatch's kernel (its SPIR-V image),
+/// its push bytes (hash and first words) and its group counts.
+pub const Stamp = struct {
+    spirv_ptr: usize = 0,
+    spirv_len: u32 = 0,
+    push_hash: u64 = 0,
+    push_words: [4]u32 = .{ 0, 0, 0, 0 },
+    groups: [3]u32 = .{ 0, 0, 0 },
+};
+
+/// A Tally key: one kernel invocation shape. The push words ride along so a
+/// report can name them; two dispatches with the same hash always share them.
+pub const Key = struct { spirv: usize, push_hash: u64, push_words: [4]u32, groups: [3]u32 };
+
+/// Where the deltas of one steady window accumulate, keyed by invocation
+/// shape. Linear scan over a bounded table: a token's distinct shapes are
+/// hundreds, adds happen once per dispatch after the fence, never in the
+/// recording path.
+pub const tally_cap: u32 = 4096;
+
+pub const TallyEntry = struct { key: Key, spirv_len: u32, calls: u64 = 0, total_ns: u64 = 0 };
+
+pub const Tally = struct {
+    entries: [tally_cap]TallyEntry = undefined,
+    n: u32 = 0,
+    total_ns: u64 = 0,
+
+    pub fn add(self: *Tally, key: Key, spirv_len: u32, ns: u64) Error!void {
+        for (self.entries[0..self.n]) |*e| if (std.meta.eql(e.key, key)) {
+            e.calls += 1;
+            e.total_ns += ns;
+            self.total_ns += ns;
+            return;
+        };
+        if (self.n >= tally_cap) return error.TimingOverflow; // the caller logs the refusal
+        self.entries[self.n] = .{ .key = key, .spirv_len = spirv_len, .calls = 1, .total_ns = ns };
+        self.n += 1;
+        self.total_ns += ns;
+    }
+
+    /// The fraction of the window's summed deltas this entry's total makes up.
+    pub fn share(self: *const Tally, entry_total_ns: u64) f64 {
+        if (self.total_ns == 0) return 0;
+        return @as(f64, @floatFromInt(entry_total_ns)) / @as(f64, @floatFromInt(self.total_ns));
+    }
+};
+
+/// Ticks are only valid in the family's low `valid_bits`; the delta wraps with the masked period.
+pub fn timestampMask(valid_bits: u32) u64 {
+    if (valid_bits == 0 or valid_bits >= 64) return ~@as(u64, 0);
+    return (@as(u64, 1) << @intCast(valid_bits)) - 1;
+}
+
+pub fn stampDelta(prev: u64, cur: u64, mask: u64) u64 {
+    const p = prev & mask;
+    const q = cur & mask;
+    return if (q >= p) q - p else q +% mask +% 1 -% p;
+}
+
+/// The enable-time gate: a family that cannot timestamp, or a device whose
+/// tick length is unknown, refuses the instrument instead of producing junk.
+pub fn checkTimestampSupport(valid_bits: u32, timestamp_period: f32) error{TimestampUnsupported}!void {
+    if (valid_bits == 0 or timestamp_period == 0) return error.TimestampUnsupported;
+}
+
+/// One VkQueryPool and the host-side record of what each stamp followed.
+/// Created only by an explicit enable; the pool lives and dies with it.
+pub const Timing = struct {
+    dev: *const Device,
+    pool: c.VkQueryPool = null,
+    stamps: [timing_capacity]u64 = undefined,
+    entries: [timing_capacity]Stamp = undefined,
+    n: u32 = 0,
+    valid_mask: u64 = ~@as(u64, 0),
+    period: f32 = 1,
+    tally: Tally = .{},
+
+    pub fn create(gpa: std.mem.Allocator, dev: *const Device) (runtime.Error || error{ OutOfMemory, TimestampUnsupported })!*Timing {
+        var fams: [32]c.VkQueueFamilyProperties = undefined;
+        var nf: u32 = fams.len;
+        dev.rt.api.vkGetPhysicalDeviceQueueFamilyProperties(dev.physical, &nf, &fams);
+        const bits: u32 = if (dev.queue_family < @min(nf, fams.len)) fams[dev.queue_family].timestampValidBits else 0;
+        const period = dev.properties.limits.timestampPeriod;
+        checkTimestampSupport(bits, period) catch |e| {
+            std.log.err("vulkan: per-dispatch timing refused: queue family {d} timestampValidBits={d}, timestampPeriod={d}", .{ dev.queue_family, bits, period });
+            return e;
+        };
+        const t = try gpa.create(Timing);
+        errdefer gpa.destroy(t);
+        t.* = .{ .dev = dev, .valid_mask = timestampMask(bits), .period = period };
+        const info: c.VkQueryPoolCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = c.VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = timing_capacity,
+        };
+        try check(dev.api.vkCreateQueryPool(dev.handle, &info, null, &t.pool));
+        return t;
+    }
+
+    /// Destroys the pool and the struct; call only after the last submission using it was fenced.
+    pub fn destroy(self: *Timing, gpa: std.mem.Allocator) void {
+        self.dev.api.vkDestroyQueryPool(self.dev.handle, self.pool, null);
+        gpa.destroy(self);
+    }
+
+    /// Called from beginBatch's freshly begun command buffer: the stamp list
+    /// restarts, the pool range resets, and stamp 0 anchors the batch.
+    pub fn batchBegin(self: *Timing, cmd: c.VkCommandBuffer) Error!void {
+        self.n = 0;
+        self.dev.api.vkCmdResetQueryPool(cmd, self.pool, 0, timing_capacity);
+        try self.write(cmd, 0, .{});
+    }
+
+    /// Called from record after its barrier, inside an open batch only.
+    pub fn stamp(self: *Timing, cmd: c.VkCommandBuffer, spirv: []align(4) const u8, push: []const u8, groups: [3]u32) Error!void {
+        var words: [4]u32 = .{ 0, 0, 0, 0 };
+        for (words[0..@min(4, push.len / 4)], 0..) |*w, i| w.* = std.mem.readInt(u32, push[i * 4 ..][0..4], .little);
+        try self.write(cmd, self.n, .{
+            .spirv_ptr = @intFromPtr(spirv.ptr),
+            .spirv_len = @intCast(spirv.len),
+            .push_hash = std.hash.Wyhash.hash(0, push),
+            .push_words = words,
+            .groups = groups,
+        });
+    }
+
+    fn write(self: *Timing, cmd: c.VkCommandBuffer, index: u32, entry: Stamp) Error!void {
+        if (index >= timing_capacity) {
+            std.log.err("vulkan: timing stamp {d} past capacity {d}; refusing", .{ index, timing_capacity });
+            return error.TimingOverflow;
+        }
+        self.dev.api.vkCmdWriteTimestamp(cmd, c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, self.pool, index);
+        self.stamps[index] = 0;
+        self.entries[index] = entry;
+        self.n = index + 1;
+    }
+
+    /// After the batch's fence: fetch the stamps, convert the deltas to ns
+    /// and fold them into the tally. Delta i names the dispatch of entry i.
+    pub fn collect(self: *Timing) Error!void {
+        if (self.n == 0) return;
+        try check(self.dev.api.vkGetQueryPoolResults(
+            self.dev.handle,
+            self.pool,
+            0,
+            self.n,
+            @as(u64, self.n) * @sizeOf(u64),
+            &self.stamps,
+            @sizeOf(u64),
+            c.VK_QUERY_RESULT_64_BIT | c.VK_QUERY_RESULT_WAIT_BIT,
+        ));
+        for (self.entries[1..self.n], self.stamps[1..self.n], 0..) |e, cur, i| {
+            const ns: u64 = @intFromFloat(@as(f64, @floatFromInt(stampDelta(self.stamps[i], cur, self.valid_mask))) * @as(f64, self.period));
+            self.tally.add(.{ .spirv = e.spirv_ptr, .push_hash = e.push_hash, .push_words = e.push_words, .groups = e.groups }, e.spirv_len, ns) catch |err| {
+                std.log.err("vulkan: timing tally overflowed {d} distinct kernels at stamp {d}; refusing", .{ tally_cap, i + 1 });
+                return err;
+            };
+        }
+    }
+};
 
 /// The bounded per-pipeline bank of immutable descriptor snapshots for
 /// batched recording. 512 covers the worst token (489 dispatch records; no
@@ -74,6 +244,8 @@ pub const Pipeline = struct {
     batch_epoch_seen: u32 = 0,
     stash: [max_bindings]Binding = undefined,
     stash_n: u32 = 0,
+    /// The module this pipeline was built from, so a timing stamp can name its kernel.
+    spirv: []align(4) const u8,
 
     /// Checks the module and the device's limits before creating anything; a failure destroys what was made.
     pub fn init(dev: *const Device, spirv: []align(4) const u8, layout: Layout) Error!Pipeline {
@@ -109,7 +281,7 @@ pub const Pipeline = struct {
             .descriptorCount = 1,
             .stageFlags = c.VK_SHADER_STAGE_COMPUTE_BIT,
         };
-        var p: Pipeline = .{ .dev = dev, .layout = layout, .local = local };
+        var p: Pipeline = .{ .dev = dev, .layout = layout, .local = local, .spirv = spirv };
         const set_info: c.VkDescriptorSetLayoutCreateInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .bindingCount = layout.bindings,
@@ -280,6 +452,10 @@ pub const Pipeline = struct {
         const reads = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT | c.VK_ACCESS_TRANSFER_READ_BIT | c.VK_ACCESS_TRANSFER_WRITE_BIT;
         const stages = c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | c.VK_PIPELINE_STAGE_TRANSFER_BIT;
         commands.barrier(p.dev, cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_ACCESS_SHADER_WRITE_BIT, stages, reads);
+        // Only inside an open batch: beginBatch anchors stamp 0 and endBatch
+        // reads exactly this batch's range, so a stamp outside one would be
+        // recorded but never collected.
+        if (timing) |t| if (batch_open) try t.stamp(cmd, p.spirv, push, groups);
     }
 
     /// One dispatch in its own submission; wrap it in commands.orExit, which ends the process on error.Timeout.
@@ -443,6 +619,48 @@ test "device limits refuse bindings, push bytes, workgroups and group counts pas
     try std.testing.expectError(error.TooManyBindings, fits(l, .{ .bindings = max_bindings + 1, .push_bytes = 120, .writes = 1 << 10 }, .{ 256, 1, 1 }));
     l.maxPerStageDescriptorStorageBuffers = 8;
     try std.testing.expectError(error.TooManyBindings, fits(l, .{ .bindings = max_bindings, .push_bytes = 120, .writes = 1 << 9 }, .{ 256, 1, 1 }));
+}
+
+test "timing deltas mask the valid bits and wrap with the masked period" {
+    const full = ~@as(u64, 0);
+    try std.testing.expectEqual(@as(u64, 5), stampDelta(10, 15, full));
+    try std.testing.expectEqual(@as(u64, 0), stampDelta(7, 7, full));
+    // a 24-bit family: the stamp wraps past the mask and the delta still counts the wrapped ticks
+    const m24 = timestampMask(24);
+    try std.testing.expectEqual(@as(u64, (1 << 24) - 1), m24);
+    try std.testing.expectEqual(@as(u64, 3), stampDelta(0xfffffe, 0x1000001, m24));
+    try std.testing.expectEqual(@as(u64, 4), stampDelta(0xfffffd, (1 << 24) + 1, m24));
+    // 64 valid bits: the natural u64 wrap IS the period
+    try std.testing.expectEqual(@as(u64, 1), stampDelta(std.math.maxInt(u64), 0, full));
+}
+
+test "the tally aggregates by key and shares partition the total" {
+    var t: Tally = .{};
+    const k1: Key = .{ .spirv = 0x1000, .push_hash = 1, .push_words = .{ 1, 0, 0, 0 }, .groups = .{ 4, 1, 1 } };
+    const k2: Key = .{ .spirv = 0x2000, .push_hash = 2, .push_words = .{ 2, 0, 0, 0 }, .groups = .{ 8, 1, 1 } };
+    try t.add(k1, 100, 300);
+    try t.add(k2, 200, 100);
+    try t.add(k1, 100, 100); // same key aggregates
+    try std.testing.expectEqual(@as(u32, 2), t.n);
+    try std.testing.expectEqual(@as(u64, 500), t.total_ns);
+    try std.testing.expectEqual(@as(u64, 2), t.entries[0].calls);
+    try std.testing.expectEqual(@as(u64, 400), t.entries[0].total_ns);
+    try std.testing.expectEqual(@as(u64, 100), t.entries[1].total_ns);
+    try std.testing.expectEqual(@as(f64, 0.8), t.share(t.entries[0].total_ns));
+    try std.testing.expectEqual(@as(f64, 1.0), t.share(t.total_ns));
+    // a distinct key past the bounded cap refuses loudly instead of dropping a kernel
+    var full: Tally = .{};
+    for (0..tally_cap) |i| try full.add(.{ .spirv = i, .push_hash = 0, .push_words = .{ 0, 0, 0, 0 }, .groups = .{ 1, 1, 1 } }, 0, 1);
+    try std.testing.expectError(error.TimingOverflow, full.add(.{ .spirv = tally_cap, .push_hash = 0, .push_words = .{ 0, 0, 0, 0 }, .groups = .{ 1, 1, 1 } }, 0, 1));
+}
+
+test "timing refuses a queue family without usable timestamps" {
+    try std.testing.expectError(error.TimestampUnsupported, checkTimestampSupport(0, 1.0));
+    try std.testing.expectError(error.TimestampUnsupported, checkTimestampSupport(64, 0.0));
+    try std.testing.expectEqual(@as(u64, (1 << 36) - 1), timestampMask(36));
+    try std.testing.expectEqual(@as(u64, ~@as(u64, 0)), timestampMask(64));
+    try checkTimestampSupport(64, 1.0);
+    try checkTimestampSupport(36, 0.5);
 }
 
 test "the batched bank cursor resets per epoch and refuses past the bounded cap" {
