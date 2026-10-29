@@ -640,4 +640,9 @@ test "the shipped pk kernel keeps its per-element TwoSum, class fix and six tree
     try testing.expect(std.mem.indexOf(u8, src, "stride = 32u; stride >= 1u; stride >>= 1u") != null);
     try testing.expect(std.mem.indexOf(u8, src, "for (uint e = 0u; e < 8u; ++e)") != null);
     try testing.expect(std.mem.indexOf(u8, src, "layout(local_size_x = 64) in;") != null);
+    // The accumulators are precise: on the device compiler the pipelined body with plain accumulators
+    // differed from the old kernel on real activations (1 of 6144 outputs, one bf16 ulp, on all three chips);
+    // precise accumulators match it. A later edit must not drop the qualifier.
+    try testing.expect(std.mem.indexOf(u8, src, "precise float partial = 0.0;") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "precise float comp = 0.0;") != null);
 }
