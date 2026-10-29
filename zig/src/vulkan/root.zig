@@ -18,6 +18,7 @@ pub const upload = commands.upload;
 pub const download = commands.download;
 pub const fill = commands.fill;
 pub const zero = commands.zero;
+pub const batchCopyBuffer = commands.batchCopyBuffer;
 pub const recordFill = commands.recordFill;
 pub const orExit = commands.orExit;
 pub const dispatch = @import("dispatch.zig");

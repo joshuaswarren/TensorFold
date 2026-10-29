@@ -310,6 +310,22 @@ pub fn zero(cmds: *Commands, dst: Buffer, offset: u64, len: u64, timeout_ns: u64
     try fill(cmds, dst, offset, len, 0, timeout_ns);
 }
 
+/// One device-local to device-local vkCmdCopyBuffer recorded into the OPEN
+/// batch, with the trailing transfer barrier that makes the next recorded
+/// copy or dispatch wait on it — the driver-copy case's dependent copies.
+/// endBatch's single submit owns them; no staging is involved.
+pub fn batchCopyBuffer(cmds: *Commands, src: Buffer, dst: Buffer, len: u64) Error!void {
+    if (!cmds.session) return error.Invalid;
+    if (src.dev != cmds.dev or dst.dev != cmds.dev) return error.Invalid;
+    if (src.kind != .device or dst.kind != .device) return error.Invalid;
+    try memory.span(src.len, 0, len);
+    try memory.span(dst.len, 0, len);
+    const cmd = try cmds.begin();
+    const region: c.VkBufferCopy = .{ .srcOffset = 0, .dstOffset = 0, .size = len };
+    cmds.dev.api.vkCmdCopyBuffer(cmd, src.handle, dst.handle, 1, &region);
+    barrier(cmds.dev, cmd, transfer, transfer_write, transfer, transfer_read | transfer_write);
+}
+
 const gpu_stages: u32 = c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | c.VK_PIPELINE_STAGE_TRANSFER_BIT;
 const gpu_writes: u32 = c.VK_ACCESS_SHADER_WRITE_BIT | c.VK_ACCESS_TRANSFER_WRITE_BIT;
 const gpu_access: u32 = gpu_writes | c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_TRANSFER_READ_BIT;

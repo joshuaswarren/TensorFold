@@ -15,12 +15,19 @@
 //!      256 MiB copies, each batch's GB/s printed in order, so a memory-clock
 //!      ramp shows as a rising series; first-batch GB/s vs the median of the
 //!      last 8.
-//!   2. SIZE SWEEP, warm: COPY at 4/16/64/256/512/1024 MiB with N=0 and
-//!      N=16/16/8/4/2/2 dependent dispatches per batch; READ at 256/512/1024
-//!      MiB (N=0 then 4/2/2); WRITE at 256/1024 MiB (N=0 then 4/2). Effective
-//!      GB/s = bytes moved per dispatch / per-dispatch time, the N=0 empty
-//!      batch subtracted, p50 and min. A size the device cannot bind or
-//!      allocate is skipped with a clear message and the run continues.
+//!   2. SIZE SWEEP, warm: COPY/READ/WRITE at 64/256/512/1024 MiB, each at
+//!      dependent depth N=0 floor plus N=1, 4 and 16 in one batched command
+//!      buffer (1 GiB runs N=1, 4 and 8 instead of 16 — Main's sanctioned
+//!      fallback, because 16 x 1 GiB batches can bust the two-minute cap at
+//!      slow clocks; the header says so when it runs). Per-dispatch p50 for
+//!      N=4 and N=16/8 comes from (p50(N)-p50(0))/N; the N=1 batch time is
+//!      printed as is, submit latency included. COPY also keeps its small
+//!      4/16 MiB rows at N=16. A size the device cannot bind or allocate is
+//!      skipped with a clear message and the run continues. A fourth sweep
+//!      runs the driver's own vkCmdCopyBuffer (device-local to device-local)
+//!      over the same sizes and depths, a transfer barrier between copies.
+//!      Timed samples shrink with batch cost (15..63) so the whole run holds
+//!      near two minutes.
 //!   3. IDLE RE-ENTRY: 3 s of host sleep with no GPU work, then one batch of
 //!      4 dependent 256 MiB copies — does the memory clock fall back?
 //!
@@ -56,18 +63,16 @@ const big_bytes: u64 = 256 << 20; // ramp + idle batch size; the smallest alloca
 const idle_sleep_ms = 3000;
 const groups_x: u32 = 4096; // 4096 x 256 = 1,048,576 invocations, grid-stride
 const red_words = groups_x; // the READ kernel stores one xor word per workgroup
-const copy_sizes = [_]u64{ 4 << 20, 16 << 20, 64 << 20, 256 << 20, 512 << 20, 1 << 30 };
-const copy_dep = [_]usize{ 16, 16, 8, 4, 2, 2 };
-const read_sizes = [_]u64{ 256 << 20, 512 << 20, 1 << 30 };
-const read_dep = [_]usize{ 4, 2, 2 };
-const write_sizes = [_]u64{ 256 << 20, 1 << 30 };
-const write_dep = [_]usize{ 4, 2 };
+const copy_small_sizes = [_]u64{ 4 << 20, 16 << 20 }; // COPY keeps its small rows
+const copy_small_deps = [_]usize{16};
+const stream_sizes = [_]u64{ 64 << 20, 256 << 20, 512 << 20, 1 << 30 };
+const stream_deps = [_]usize{ 1, 4, 16 };
+const stream_1gib_deps = [_]usize{ 1, 4, 8 }; // 16 x 1 GiB batches can bust the two-minute cap; the header says so
 
 comptime {
-    if (copy_sizes.len != copy_dep.len or read_sizes.len != read_dep.len or write_sizes.len != write_dep.len)
-        @compileError("sweep size and dispatch-count tables drifted");
-    for (copy_sizes ++ read_sizes ++ write_sizes) |s| if (s % 4 != 0) @compileError("sweep sizes must be whole uvec4s");
-    for (copy_dep ++ read_dep ++ write_dep) |n| if (n == 0 or n > dispatch.batch_cap) @compileError("sweep dispatch counts must be nonzero and fit one pipeline's descriptor bank");
+    for (stream_sizes[1..], 0..) |s, i| if (s <= stream_sizes[i]) @compileError("stream sizes must ascend");
+    for (copy_small_deps ++ stream_deps ++ stream_1gib_deps) |n| if (n == 0 or n > dispatch.batch_cap) @compileError("sweep dispatch counts must be nonzero and fit one pipeline's descriptor bank");
+    if (stream_1gib_deps.len != stream_deps.len) @compileError("the 1 GiB fallback must keep three depths");
 }
 
 /// The shader's push block, one word: the dispatch's coverage in u32 words.
@@ -162,20 +167,29 @@ pub fn xorWords(words: []const u32) u32 {
 pub const SweepPlan = struct {
     /// The one src/dst allocation covering every enabled size.
     len: u64,
-    copy: [copy_sizes.len]bool,
-    read: [read_sizes.len]bool,
-    write: [write_sizes.len]bool,
+    /// The 4/16 MiB small COPY rows; on whenever the ramp's allocation fits.
+    small: bool,
+    /// The 64/256/512/1024 MiB stream rows, all four kernels.
+    stream: [stream_sizes.len]bool,
 };
 
 /// Sweep sizes the device's storage-buffer limits allow; `len` never exceeds
 /// 1 GiB (the full sweep's allocation). Pure and host-tested.
 pub fn planSweep(max_range: u64, max_buffer: u64) SweepPlan {
     const limit = @min(max_range, max_buffer);
-    var p: SweepPlan = .{ .len = @min(@as(u64, 1 << 30), limit), .copy = undefined, .read = undefined, .write = undefined };
-    for (copy_sizes, 0..) |s, i| p.copy[i] = s <= limit;
-    for (read_sizes, 0..) |s, i| p.read[i] = s <= limit;
-    for (write_sizes, 0..) |s, i| p.write[i] = s <= limit;
+    var p: SweepPlan = .{ .len = @min(@as(u64, 1 << 30), limit), .small = 16 << 20 <= limit, .stream = undefined };
+    for (stream_sizes, 0..) |s, i| p.stream[i] = s <= limit;
     return p;
+}
+
+/// Timed samples for one sweep case: 63 when the batch is cheap, shrinking
+/// with batch cost (a 3 s-per-case budget at 40 GB/s) so the whole run holds
+/// near two minutes; never fewer than 15, always odd for a clean nearest-rank
+/// p50. Pure and host-tested.
+pub fn sampleCount(batch_bytes: u64) usize {
+    if (batch_bytes == 0) return sample_count;
+    const budget: u64 = 120_000_000_000 / batch_bytes; // 3 s of that batch at 40 GB/s
+    return @intCast(@min(63, @max(15, budget | 1)));
 }
 
 fn us(ns: u64) f64 {
@@ -192,79 +206,117 @@ fn printStats(n: usize, st: Stats) void {
     });
 }
 
-/// One sample: the whole batch cycle for N dispatches of one shape, timed
-/// from just before the first bind/record to just after the fence returns.
+/// One recorded sweep unit: a shader dispatch's bind+record, or a driver
+/// vkCmdCopyBuffer of `len` bytes.
+const Unit = union(enum) {
+    shader: struct {
+        pipes: []const *dispatch.Pipeline,
+        binds: []const dispatch.Binding,
+        push: []const u8,
+        groups: [3]u32,
+    },
+    driver: struct { src: vk.Buffer, dst: vk.Buffer },
+};
+
+/// One sample: the whole batch cycle for N dependent units, timed from just
+/// before the first record to just after the fence returns. Every unit
+/// records into the open batch and carries the trailing barrier (dispatch
+/// end barrier, or the copy's transfer barrier), so the N units are
+/// dependent; one pipeline's descriptor bank holds batch_cap snapshots and
+/// every sweep depth is comptime-bounded below it.
 fn sampleBatch(
     io: std.Io,
     cmds: *vk.Commands,
     staging: vk.Buffer,
-    pipes: []const *dispatch.Pipeline,
-    binds: []const dispatch.Binding,
-    push: []const u8,
-    groups: [3]u32,
+    unit: Unit,
+    len: u64,
     n: usize,
     timeout: u64,
 ) !u64 {
     try vk.orExit(cmds.beginBatch(staging));
     errdefer cmds.abortBatch();
     const t0 = std.Io.Clock.awake.now(io);
-    for (0..n) |i| {
-        const pipe = pipes[i * pipes.len / n];
-        try vk.orExit(pipe.bind(binds)); // staged while the batch is open, snapshotted at record
-        try vk.orExit(pipe.record(try cmds.begin(), push, groups)); // dispatch + the end barrier
+    for (0..n) |_| {
+        switch (unit) {
+            .shader => |s| {
+                const pipe = s.pipes[0];
+                try vk.orExit(pipe.bind(s.binds)); // staged while the batch is open, snapshotted at record
+                try vk.orExit(pipe.record(try cmds.begin(), s.push, s.groups)); // dispatch + the end barrier
+            },
+            .driver => |d| try vk.orExit(vk.batchCopyBuffer(cmds, d.src, d.dst, len)),
+        }
     }
     try vk.orExit(cmds.endBatch(timeout)); // flush, one submit, one fence wait, invalidate
     const t1 = std.Io.Clock.awake.now(io);
     return @intCast(t1.nanoseconds - t0.nanoseconds);
 }
 
-/// 3 warmups, then 63 timed samples of one N; the summary lands in `out`.
+/// 3 warmups, then `samples` timed batches of one case; the summary lands in
+/// `out`.
 fn runCase(
     io: std.Io,
     cmds: *vk.Commands,
     staging: vk.Buffer,
-    pipes: []const *dispatch.Pipeline,
-    binds: []const dispatch.Binding,
-    push: []const u8,
-    groups: [3]u32,
+    unit: Unit,
+    len: u64,
     n: usize,
+    samples: usize,
     timeout: u64,
     out: *Stats,
 ) !void {
-    var samples: [sample_count]u64 = undefined;
-    for (0..warmups) |_| _ = try sampleBatch(io, cmds, staging, pipes, binds, push, groups, n, timeout);
-    for (0..sample_count) |i| samples[i] = try sampleBatch(io, cmds, staging, pipes, binds, push, groups, n, timeout);
+    var arr: [sample_count]u64 = undefined;
     var scratch: [sample_count]u64 = undefined;
-    out.* = statsOf(&samples, &scratch).?; // fixed sizes: cannot fail
+    for (0..warmups) |_| _ = try sampleBatch(io, cmds, staging, unit, len, n, timeout);
+    for (0..samples) |i| arr[i] = try sampleBatch(io, cmds, staging, unit, len, n, timeout);
+    out.* = statsOf(arr[0..samples], &scratch).?; // samples <= sample_count: cannot fail
 }
 
-/// N=0 floor plus N dependent dispatches, the per-dispatch p50/min derived by
-/// subtraction, and effective GB/s from `bytes_moved` per dispatch.
-fn sweepCase(
+/// One kernel's sweep: for each enabled size, the N=0 empty-batch floor, then
+/// each dependent depth. N>=4 gets per-dispatch p50/min from floor
+/// subtraction and effective GB/s from `bytes_moved_of * size` per dispatch;
+/// the N=1 batch prints as recorded, submit latency included.
+fn runSweep(
     io: std.Io,
     cmds: *vk.Commands,
     staging: vk.Buffer,
-    pipes: []const *dispatch.Pipeline,
-    binds: []const dispatch.Binding,
-    push: []const u8,
-    groups: [3]u32,
-    n: usize,
-    bytes_moved: u64,
+    label: []const u8,
+    unit: Unit,
+    sizes: []const u64,
+    enabled: []const bool,
+    deps: []const usize,
+    big_dep: ?[]const usize,
+    bytes_moved_of: u64, // 2 for a copy (read + write), 1 for read- or write-only
     timeout: u64,
 ) !void {
-    var s0: Stats = undefined;
-    var s1: Stats = undefined;
-    try runCase(io, cmds, staging, pipes, binds, push, groups, 0, timeout, &s0);
-    try runCase(io, cmds, staging, pipes, binds, push, groups, n, timeout, &s1);
-    printStats(0, s0);
-    printStats(n, s1);
-    const per50 = try perDispatchNs(s1.p50_ns, s0.p50_ns, @intCast(n));
-    const perMin = try perDispatchNs(s1.min_ns, s0.min_ns, @intCast(n));
-    const g50 = effectiveGbps(bytes_moved, @intFromFloat(@max(per50, 1.0)));
-    const gMin = effectiveGbps(bytes_moved, @intFromFloat(@max(perMin, 1.0)));
-    std.debug.print("    per-dispatch p50={d:.3} ms min={d:.3} ms -> {d:.1} MiB/dispatch: {d:.2} GB/s (p50), {d:.2} GB/s (min)\n", .{
-        per50 / 1e6, perMin / 1e6, mib(bytes_moved), g50, gMin,
-    });
+    for (sizes, enabled) |size, on| {
+        if (!on) continue;
+        const chosen: []const usize = if (big_dep) |bd| (if (size >= (1 << 30)) bd else deps) else deps;
+        const bytes_moved = bytes_moved_of * size;
+        std.debug.print("MILESTONE sweep {s} {d:.0} MiB: N=0 floor then dependent N=1/4/{d}, {d:.0} MiB moved per dispatch\n", .{ label, mib(size), chosen[chosen.len - 1], mib(bytes_moved) });
+        var u = unit;
+        if (u == .shader) u.shader.push = std.mem.asBytes(&Push{ .count_words = @intCast(size / 4) })[0..@sizeOf(Push)];
+        var s0: Stats = undefined;
+        try runCase(io, cmds, staging, u, size, 0, sample_count, timeout, &s0);
+        printStats(0, s0);
+        for (chosen) |dep| {
+            var s1: Stats = undefined;
+            try runCase(io, cmds, staging, u, size, dep, sampleCount(dep * bytes_moved), timeout, &s1);
+            printStats(dep, s1);
+            if (dep == 1) {
+                std.debug.print("    N=  1 batch p50={d:.3} ms as recorded (includes submit latency) -> {d:.2} GB/s\n", .{
+                    us(s1.p50_ns) / 1000.0, effectiveGbps(bytes_moved, s1.p50_ns),
+                });
+            } else {
+                const per50 = try perDispatchNs(s1.p50_ns, s0.p50_ns, @intCast(dep));
+                const perMin = try perDispatchNs(s1.min_ns, s0.min_ns, @intCast(dep));
+                std.debug.print("    per-dispatch p50={d:.3} ms min={d:.3} ms -> {d:.2} GB/s (p50), {d:.2} GB/s (min)\n", .{
+                    per50 / 1e6, perMin / 1e6,
+                    effectiveGbps(bytes_moved, @intFromFloat(@max(per50, 1.0))),
+                    effectiveGbps(bytes_moved, @intFromFloat(@max(perMin, 1.0))),
+                });
+            }
+        }
+    }
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -302,14 +354,8 @@ pub fn main(init: std.process.Init) !u8 {
     // Sweep plan against the device's real binding limits; sizes above them
     // are skipped with a message and the rest of the run continues.
     var plan = planSweep(pr.limits.maxStorageBufferRange, dev.v13.maxBufferSize);
-    for (copy_sizes, plan.copy) |size, on| if (!on) {
-        std.debug.print("SKIP sweep copy {d:.0} MiB: exceeds {s}={d}\n", .{ mib(size), if (size > pr.limits.maxStorageBufferRange) "maxStorageBufferRange" else "maxBufferSize", @min(pr.limits.maxStorageBufferRange, dev.v13.maxBufferSize) });
-    };
-    for (read_sizes, plan.read) |size, on| if (!on) {
-        std.debug.print("SKIP sweep read {d:.0} MiB: exceeds {s}={d}\n", .{ mib(size), if (size > pr.limits.maxStorageBufferRange) "maxStorageBufferRange" else "maxBufferSize", @min(pr.limits.maxStorageBufferRange, dev.v13.maxBufferSize) });
-    };
-    for (write_sizes, plan.write) |size, on| if (!on) {
-        std.debug.print("SKIP sweep write {d:.0} MiB: exceeds {s}={d}\n", .{ mib(size), if (size > pr.limits.maxStorageBufferRange) "maxStorageBufferRange" else "maxBufferSize", @min(pr.limits.maxStorageBufferRange, dev.v13.maxBufferSize) });
+    for (stream_sizes, plan.stream) |size, on| if (!on) {
+        std.debug.print("SKIP sweep {d:.0} MiB: exceeds {s}={d}\n", .{ mib(size), if (size > pr.limits.maxStorageBufferRange) "maxStorageBufferRange" else "maxBufferSize", @min(pr.limits.maxStorageBufferRange, dev.v13.maxBufferSize) });
     };
     if (plan.len < big_bytes) {
         std.debug.print("FAIL device: the largest allocatable sweep buffer is {d:.0} MiB; the ramp and idle cases need {d:.0} MiB\n", .{ mib(plan.len), mib(big_bytes) });
@@ -338,20 +384,12 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("FAIL device: could not allocate a {d:.0} MiB src/dst pair; the ramp and idle cases need it\n", .{mib(big_bytes)});
         return 1;
     }
-    for (copy_sizes, 0..) |size, i| if (plan.copy[i] and size > plan.len) {
-        plan.copy[i] = false;
-        std.debug.print("SKIP sweep copy {d:.0} MiB: the device refused a {d:.0} MiB allocation\n", .{ mib(size), mib(size * 2) });
-    };
-    for (read_sizes, 0..) |size, i| if (plan.read[i] and size > plan.len) {
-        plan.read[i] = false;
-        std.debug.print("SKIP sweep read {d:.0} MiB: the device refused a {d:.0} MiB allocation\n", .{ mib(size), mib(size) });
-    };
-    for (write_sizes, 0..) |size, i| if (plan.write[i] and size > plan.len) {
-        plan.write[i] = false;
-        std.debug.print("SKIP sweep write {d:.0} MiB: the device refused a {d:.0} MiB allocation\n", .{ mib(size), mib(size) });
+    for (stream_sizes, 0..) |size, i| if (plan.stream[i] and size > plan.len) {
+        plan.stream[i] = false;
+        std.debug.print("SKIP sweep {d:.0} MiB: the device refused a {d:.0} MiB allocation\n", .{ mib(size), mib(size * 2) });
     };
 
-    std.debug.print("MILESTONE bw-ceiling cases: (1) cold-to-warm ramp: {d} batches x {d} dependent {d:.0} MiB copies; (2) copy sweep: 4/16/64/256/512/1024 MiB x N=0 then 16/16/8/4/2/2; (3) read sweep: 256/512/1024 MiB x N=0 then 4/2/2; (4) write sweep: 256/1024 MiB x N=0 then 4/2; (5) idle re-entry: 3 s host sleep then {d} dependent {d:.0} MiB copies\n", .{ ramp_batches, ramp_dep, mib(big_bytes), ramp_dep, mib(big_bytes) });
+    std.debug.print("MILESTONE bw-ceiling cases: (1) cold-to-warm ramp: {d} batches x {d} dependent {d:.0} MiB copies; (2) shader copy (uvec4) sweep: 4/16 MiB x N=16 then 64/256/512/1024 MiB x N=1/4/16 (1 GiB at N=1/4/8, since 16 x 1 GiB batches can bust the two-minute cap); (3) read sweep and (4) write sweep: 64/256/512/1024 MiB x N=1/4/16 (1 GiB at N=1/4/8); (5) driver copy (vkCmdCopyBuffer) sweep: 64/256/512/1024 MiB x N=1/4/16 (1 GiB at N=1/4/8), a transfer barrier between copies; (6) idle re-entry: 3 s host sleep then {d} dependent {d:.0} MiB copies; timed samples shrink with batch cost (15..63) to hold the two-minute cap\n", .{ ramp_batches, ramp_dep, mib(big_bytes), ramp_dep, mib(big_bytes) });
 
     var cmds = try vk.Commands.init(&dev);
     defer cmds.deinit();
@@ -392,6 +430,10 @@ pub fn main(init: std.process.Init) !u8 {
     const copy_pipes = [_]*dispatch.Pipeline{&copy_pipe};
     const read_pipes = [_]*dispatch.Pipeline{&read_pipe};
     const write_pipes = [_]*dispatch.Pipeline{&write_pipe};
+    const copy_unit: Unit = .{ .shader = .{ .pipes = &copy_pipes, .binds = &copy_binds, .push = &[_]u8{}, .groups = groups } };
+    const read_unit: Unit = .{ .shader = .{ .pipes = &read_pipes, .binds = &read_binds, .push = &[_]u8{}, .groups = groups } };
+    const write_unit: Unit = .{ .shader = .{ .pipes = &write_pipes, .binds = &write_binds, .push = &[_]u8{}, .groups = groups } };
+    const driver_unit: Unit = .{ .driver = .{ .src = src, .dst = dst } };
 
     // ---- (0) byte-exact self-check on a 1 MiB buffer, before any timing
     const check_words: u32 = check_bytes / 4;
@@ -443,12 +485,12 @@ pub fn main(init: std.process.Init) !u8 {
 
     // ---- (1) cold-to-warm ramp: the first timed GPU work after the checks
     const ramp_bytes = ramp_dep * 2 * big_bytes;
-    const ramp_push = Push{ .count_words = @intCast(big_bytes / 4) };
-    const ramp_push_bytes = std.mem.asBytes(&ramp_push)[0..@sizeOf(Push)];
+    var ramp_unit = copy_unit;
+    ramp_unit.shader.push = std.mem.asBytes(&Push{ .count_words = @intCast(big_bytes / 4) })[0..@sizeOf(Push)];
     std.debug.print("MILESTONE ramp-start: {d} batches x {d} dependent {d:.0} MiB copies ({d:.2} GiB per batch), cold-to-warm\n", .{ ramp_batches, ramp_dep, mib(big_bytes), mib(ramp_bytes) / 1024.0 });
     var ramp_ns: [ramp_batches]u64 = undefined;
     for (0..ramp_batches) |b| {
-        ramp_ns[b] = try sampleBatch(io, &cmds, staging, &copy_pipes, &copy_binds, ramp_push_bytes, groups, ramp_dep, timeout);
+        ramp_ns[b] = try sampleBatch(io, &cmds, staging, ramp_unit, big_bytes, ramp_dep, timeout);
         std.debug.print("RAMP {d: >2}: {d:.1} us {d:.2} GB/s\n", .{ b, us(ramp_ns[b]), effectiveGbps(ramp_bytes, ramp_ns[b]) });
     }
     var scratch8: [8]u64 = undefined;
@@ -457,45 +499,30 @@ pub fn main(init: std.process.Init) !u8 {
     const warm_gbps = effectiveGbps(ramp_bytes, warm_ns);
     std.debug.print("RAMP summary: first batch {d:.2} GB/s; median of last 8 batches {d:.2} GB/s; warm/cold ratio {d:.2}x\n", .{ cold_gbps, warm_gbps, rampRatio(warm_gbps, cold_gbps) });
 
-    // ---- (2) size sweep, warm
-    std.debug.print("MILESTONE sweep copy: sizes 4/16/64/256/512/1024 MiB, N=0 then N=16/16/8/4/2/2 dependent dispatches (2x size moved per dispatch)\n", .{});
-    for (copy_sizes, copy_dep, 0..) |size, dep, i| {
-        if (!plan.copy[i]) continue;
-        std.debug.print("MILESTONE sweep copy {d:.0} MiB N={d}\n", .{ mib(size), dep });
-        const push = Push{ .count_words = @intCast(size / 4) };
-        try sweepCase(io, &cmds, staging, &copy_pipes, &copy_binds, std.mem.asBytes(&push)[0..@sizeOf(Push)], groups, dep, 2 * size, timeout);
-    }
-    std.debug.print("MILESTONE sweep read: sizes 256/512/1024 MiB, N=0 then N=4/2/2 dependent dispatches (size moved per dispatch)\n", .{});
-    for (read_sizes, read_dep, 0..) |size, dep, i| {
-        if (!plan.read[i]) continue;
-        std.debug.print("MILESTONE sweep read {d:.0} MiB N={d}\n", .{ mib(size), dep });
-        const push = Push{ .count_words = @intCast(size / 4) };
-        try sweepCase(io, &cmds, staging, &read_pipes, &read_binds, std.mem.asBytes(&push)[0..@sizeOf(Push)], groups, dep, size, timeout);
-    }
-    std.debug.print("MILESTONE sweep write: sizes 256/1024 MiB, N=0 then N=4/2 dependent dispatches (size moved per dispatch)\n", .{});
-    for (write_sizes, write_dep, 0..) |size, dep, i| {
-        if (!plan.write[i]) continue;
-        std.debug.print("MILESTONE sweep write {d:.0} MiB N={d}\n", .{ mib(size), dep });
-        const push = Push{ .count_words = @intCast(size / 4) };
-        try sweepCase(io, &cmds, staging, &write_pipes, &write_binds, std.mem.asBytes(&push)[0..@sizeOf(Push)], groups, dep, size, timeout);
-    }
+    // ---- (2) size sweep, warm: shader kernels, then the driver copy
+    const small_on = [_]bool{ plan.small, plan.small };
+    std.debug.print("MILESTONE sweep shader copy (uvec4): small sizes then 64/256/512/1024 MiB at N=1/4/16 (1 GiB at N=1/4/8); 2x size moved per dispatch\n", .{});
+    try runSweep(io, &cmds, staging, "shader copy (uvec4)", copy_unit, &copy_small_sizes, &small_on, &copy_small_deps, null, 2, timeout);
+    try runSweep(io, &cmds, staging, "shader copy (uvec4)", copy_unit, &stream_sizes, &plan.stream, &stream_deps, &stream_1gib_deps, 2, timeout);
+    std.debug.print("MILESTONE sweep read (xor-reduce): 64/256/512/1024 MiB at N=1/4/16 (1 GiB at N=1/4/8); size moved per dispatch\n", .{});
+    try runSweep(io, &cmds, staging, "read (xor-reduce)", read_unit, &stream_sizes, &plan.stream, &stream_deps, &stream_1gib_deps, 1, timeout);
+    std.debug.print("MILESTONE sweep write (pattern): 64/256/512/1024 MiB at N=1/4/16 (1 GiB at N=1/4/8); size moved per dispatch\n", .{});
+    try runSweep(io, &cmds, staging, "write (pattern)", write_unit, &stream_sizes, &plan.stream, &stream_deps, &stream_1gib_deps, 1, timeout);
+    std.debug.print("MILESTONE sweep driver copy (vkCmdCopyBuffer): 64/256/512/1024 MiB at N=1/4/16 (1 GiB at N=1/4/8); a transfer barrier between copies; 2x size moved per dispatch\n", .{});
+    try runSweep(io, &cmds, staging, "driver copy (vkCmdCopyBuffer)", driver_unit, &stream_sizes, &plan.stream, &stream_deps, &stream_1gib_deps, 2, timeout);
 
     // ---- (3) idle re-entry: does the memory clock fall back?
     std.debug.print("MILESTONE idle-re-entry: {d} s host sleep, then one batch of {d} dependent {d:.0} MiB copies\n", .{ idle_sleep_ms / 1000, ramp_dep, mib(big_bytes) });
     std.Io.sleep(io, .fromMilliseconds(idle_sleep_ms), .awake) catch {};
-    const idle_ns = try sampleBatch(io, &cmds, staging, &copy_pipes, &copy_binds, ramp_push_bytes, groups, ramp_dep, timeout);
+    const idle_ns = try sampleBatch(io, &cmds, staging, ramp_unit, big_bytes, ramp_dep, timeout);
     std.debug.print("IDLE after {d} s: {d:.1} us {d:.2} GB/s ({d} dependent {d:.0} MiB copies per batch)\n", .{ idle_sleep_ms / 1000, us(idle_ns), effectiveGbps(ramp_bytes, idle_ns), ramp_dep, mib(big_bytes) });
 
-    std.debug.print("RESULT bw-ceiling on \"{s}\": ramp=1 sweep-copy={d}/{d} sweep-read={d}/{d} sweep-write={d}/{d} idle=1 ok\n", .{
-        name, enabledCases(&plan, .copy), copy_sizes.len, enabledCases(&plan, .read), read_sizes.len, enabledCases(&plan, .write), write_sizes.len,
+    var enabled: usize = 0;
+    for (plan.stream) |on| enabled += @intFromBool(on);
+    std.debug.print("RESULT bw-ceiling on \"{s}\": ramp=1 shader-copy-small={s} stream sizes {d}/{d} for shader-copy, read, write and driver-copy; idle=1 ok\n", .{
+        name, if (plan.small) "on" else "off", enabled, stream_sizes.len,
     });
     return 0;
-}
-
-fn enabledCases(plan: *const SweepPlan, comptime which: enum { copy, read, write }) usize {
-    var n: usize = 0;
-    for (@field(plan, @tagName(which))) |on| n += @intFromBool(on);
-    return n;
 }
 
 fn zeroBuf(cmds: *vk.Commands, buf: vk.Buffer, timeout: u64) !void {
@@ -575,13 +602,24 @@ test "fillPseudo is deterministic and seed-sensitive and xorWords folds" {
 test "planSweep enables sizes within the binding limits and sizes the allocation" {
     const full = planSweep(1 << 30, 4 << 40);
     try testing.expectEqual(@as(u64, 1 << 30), full.len);
-    for (full.copy) |on| try testing.expect(on);
-    for (full.read) |on| try testing.expect(on);
-    for (full.write) |on| try testing.expect(on);
+    try testing.expect(full.small);
+    for (full.stream) |on| try testing.expect(on);
     const mid = planSweep(300 << 20, 4 << 40);
     try testing.expectEqual(@as(u64, 300 << 20), mid.len);
-    try testing.expect(mid.copy[3] and mid.read[0] and mid.write[0]); // 256 MiB fits
-    try testing.expect(!mid.copy[4] and !mid.read[1] and !mid.write[1]); // 512 MiB and 1 GiB do not
+    try testing.expect(mid.small);
+    try testing.expect(mid.stream[0] and mid.stream[1]); // 64 and 256 MiB fit
+    try testing.expect(!mid.stream[2] and !mid.stream[3]); // 512 MiB and 1 GiB do not
     const tiny = planSweep(64 << 20, 64 << 20);
     try testing.expect(tiny.len < big_bytes); // the caller must refuse: the ramp cannot run
+    try testing.expect(!tiny.stream[2] and !tiny.stream[3]);
+}
+
+test "sampleCount shrinks with batch cost inside [15, 63], always odd" {
+    try testing.expectEqual(@as(usize, 63), sampleCount(0));
+    try testing.expectEqual(@as(usize, 63), sampleCount(64 << 20));
+    try testing.expectEqual(@as(usize, 63), sampleCount(1 << 30));
+    try testing.expectEqual(@as(usize, 55), sampleCount(2 << 30)); // 55.87 floor, odd
+    try testing.expectEqual(@as(usize, 27), sampleCount(4 << 30)); // 27.9 floor, odd
+    try testing.expectEqual(@as(usize, 15), sampleCount(8 << 30)); // 13.9 floors to the 15 minimum
+    try testing.expectEqual(@as(usize, 15), sampleCount(32 << 30));
 }
