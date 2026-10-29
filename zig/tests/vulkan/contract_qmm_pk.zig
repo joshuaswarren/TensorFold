@@ -48,7 +48,7 @@ fn laneElements(k: usize) usize {
 /// about 2.5e-6 where the serial bound's gamma(2050) is about 1.2e-4, so the compensated kernel
 /// states the tighter bound, and gate 4 still proves fp32 sums exact.
 pub fn depth(s: c.Shape) usize {
-    return laneElements(s.k) + 10;
+    return laneElements(s.k) + 17;
 }
 
 /// The projection widths the forward pass calls, as (n, k): the attention k/v 512, the o
@@ -448,9 +448,9 @@ test "the stated depth comes from the lane's strided packs and the six tree leve
     try testing.expectEqual(@as(usize, 8), laneElements(128));
     try testing.expectEqual(@as(usize, 32), laneElements(2048));
     try testing.expectEqual(@as(usize, 96), laneElements(6144));
-    try testing.expectEqual(@as(usize, 18), depth(.{ .rows = 1, .n = 1, .k = 64 }));
-    try testing.expectEqual(@as(usize, 42), depth(.{ .rows = 1, .n = 16, .k = 2048 }));
-    try testing.expectEqual(@as(usize, 106), depth(.{ .rows = 1, .n = 2048, .k = 6144 }));
+    try testing.expectEqual(@as(usize, 25), depth(.{ .rows = 1, .n = 1, .k = 64 }));
+    try testing.expectEqual(@as(usize, 49), depth(.{ .rows = 1, .n = 16, .k = 2048 }));
+    try testing.expectEqual(@as(usize, 113), depth(.{ .rows = 1, .n = 2048, .k = 6144 }));
     // rows repeat the per-output chain and add nothing to it: the bound at a full prefill chunk
     // is the bound at one row of the same width
     try testing.expectEqual(depth(.{ .rows = 1, .n = 6144, .k = 2048 }), depth(.{ .rows = max_chunk_rows, .n = 6144, .k = 2048 }));
@@ -628,21 +628,23 @@ test "the fixture keeps the qmm storage discipline: raw u16 poison, guards align
     try testing.expectEqual(@as(u32, 64), local_size_x);
 }
 
-test "the shipped pk kernel keeps its per-element TwoSum, class fix and six tree levels" {
-    // A source-level pin: a later edit of qmm_q4_pk.comp must not silently drop the
-    // compensated per-element sum, the non-finite class fix at the high+low combine,
-    // the six tree levels (strides 32, 16, 8, 4, 2, 1), the ascending 8-element pack
-    // order or the one-64-lane-workgroup-per-output shape.
+test "the shipped pk kernel keeps its pack-level compensation, class fix and six tree levels" {
+    // A source-level pin: a later edit of qmm_q4_pk.comp must not silently drop the plain in-pack
+    // adds with their precise order, the ONE Neumaier fold per pack, the non-finite class fix at the
+    // high+low combine, the six tree levels (strides 32, 16, 8, 4, 2, 1) or the one-64-lane shape.
+    // The accumulators are precise: with plain accumulators the device compiler built a pipelined
+    // variant of this kernel so that real activations differed from the reference body.
     const src = pk_src.qmm_q4_pk;
-    try testing.expect(std.mem.indexOf(u8, src, "comp += (partial - t) + term;") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "comp += (term - t) + partial;") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "precise float psum = 0.0;") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "psum += bf16_load(input_x.values[x_base + k_base + e]) *") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "comp += (partial - t) + psum;") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "comp += (psum - t) + partial;") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "precise float partial = 0.0;") != null);
+    try testing.expect(std.mem.indexOf(u8, src, "precise float comp = 0.0;") != null);
     try testing.expect(std.mem.indexOf(u8, src, "isnan(tree[0]) || isinf(tree[0])") != null);
     try testing.expect(std.mem.indexOf(u8, src, "stride = 32u; stride >= 1u; stride >>= 1u") != null);
     try testing.expect(std.mem.indexOf(u8, src, "for (uint e = 0u; e < 8u; ++e)") != null);
     try testing.expect(std.mem.indexOf(u8, src, "layout(local_size_x = 64) in;") != null);
-    // The accumulators are precise: on the device compiler the pipelined body with plain accumulators
-    // differed from the old kernel on real activations (1 of 6144 outputs, one bf16 ulp, on all three chips);
-    // precise accumulators match it. A later edit must not drop the qualifier.
-    try testing.expect(std.mem.indexOf(u8, src, "precise float partial = 0.0;") != null);
-    try testing.expect(std.mem.indexOf(u8, src, "precise float comp = 0.0;") != null);
+    // and not the per-element chain of the previous kernel
+    try testing.expect(std.mem.indexOf(u8, src, "comp += (partial - t) + term;") == null);
 }
