@@ -88,12 +88,17 @@ pub const Commands = struct {
             .commandBufferCount = 1,
             .pCommandBuffers = &self.cmd,
         };
+        const timing = dispatch.timing;
+        const submit_started = if (timing) |t| t.nowNs() else 0;
         const queued = api.vkQueueSubmit(self.dev.queue, 1, &info, self.fence);
+        if (timing) |t| t.addPhase(.submit, t.nowNs() - submit_started);
         submitted(queued) catch |e| {
             std.log.err("vulkan: vkQueueSubmit returned {d}", .{queued});
             return e;
         };
+        const fence_started = if (timing) |t| t.nowNs() else 0;
         const waited_on = api.vkWaitForFences(self.dev.handle, 1, &self.fence, 1, timeout_ns);
+        if (timing) |t| t.addPhase(.fence_wait, t.nowNs() - fence_started);
         waited(waited_on) catch |e| {
             std.log.err("vulkan: vkWaitForFences returned {d} within {d} ns of a submission", .{ waited_on, timeout_ns });
             return e;
@@ -141,13 +146,19 @@ pub const Commands = struct {
     /// call site).
     pub fn endBatch(self: *Commands, timeout_ns: u64) dispatch.Error!void {
         if (!self.session) return error.Invalid;
+        if (dispatch.timing) |t| try t.tailStamp(self.cmd);
         self.session = false;
         dispatch.batchEnd();
         defer self.lifecycle.finish();
+        const timing = dispatch.timing;
+        const flush_started = if (timing) |t| t.nowNs() else 0;
         try self.batch_staging.flush(); // host writes visible to the copy engine before the submit
+        if (timing) |t| t.addPhase(.flush, t.nowNs() - flush_started);
         try self.submitAndWait(timeout_ns);
-        if (dispatch.timing) |t| try t.collect(); // after the fence: stamps are final, fold the deltas
+        if (timing) |t| try t.collect(); // after the fence: stamps are final, fold the deltas
+        const invalidate_started = if (timing) |t| t.nowNs() else 0;
         try self.batch_staging.invalidate(); // device writes visible to the host, after the fence
+        if (timing) |t| t.addPhase(.invalidate, t.nowNs() - invalidate_started);
     }
 
     /// Abandons an open batch after a pre-submit recording error: nothing

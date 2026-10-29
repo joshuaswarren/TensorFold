@@ -68,6 +68,70 @@ pub const Tally = struct {
     }
 };
 
+pub const Phase = enum { record, flush, submit, fence_wait, invalidate, readdown, head_gpu, tail_gpu };
+
+pub const Phases = struct {
+    ns: [8]u64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+
+    pub fn add(self: *Phases, phase: Phase, elapsed_ns: u64) void {
+        self.ns[@intFromEnum(phase)] += elapsed_ns;
+    }
+
+    pub fn perTokenUs(self: *const Phases, phase: Phase, tokens: u64) f64 {
+        if (tokens == 0) return 0;
+        return @as(f64, @floatFromInt(self.ns[@intFromEnum(phase)])) / @as(f64, @floatFromInt(tokens)) / 1000.0;
+    }
+};
+
+pub fn formatPhases(buf: []u8, run: []const u8, phases: Phases, tokens: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "KTIME phases run={s} per_token_us record={d:.2} flush={d:.2} submit={d:.2} fence_wait={d:.2} invalidate={d:.2} readdown={d:.2} tail_gpu={d:.2} head_gpu={d:.2}", .{
+        run,
+        phases.perTokenUs(.record, tokens),
+        phases.perTokenUs(.flush, tokens),
+        phases.perTokenUs(.submit, tokens),
+        phases.perTokenUs(.fence_wait, tokens),
+        phases.perTokenUs(.invalidate, tokens),
+        phases.perTokenUs(.readdown, tokens),
+        phases.perTokenUs(.tail_gpu, tokens),
+        phases.perTokenUs(.head_gpu, tokens),
+    }) catch "";
+}
+
+/// Monotonic host time; called only when the timing instrument is enabled.
+pub fn hostClockNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "phase accumulator sums phases and computes per-token microseconds" {
+    var p: Phases = .{};
+    p.add(.record, 1_000);
+    p.add(.record, 3_000);
+    p.add(.flush, 500);
+    try std.testing.expectEqual(@as(u64, 4_000), p.ns[0]);
+    try std.testing.expectEqual(@as(f64, 2.0), p.perTokenUs(.record, 2));
+    try std.testing.expectEqual(@as(f64, 0.25), p.perTokenUs(.flush, 2));
+    try std.testing.expectEqual(@as(f64, 0.0), p.perTokenUs(.record, 0));
+}
+
+test "phase line formatter emits the exact KTIME phases fields" {
+    var p: Phases = .{};
+    p.add(.record, 2_000_000);
+    p.add(.flush, 1_000_000);
+    p.add(.submit, 1_000_000);
+    p.add(.fence_wait, 1_000_000);
+    p.add(.invalidate, 1_000_000);
+    p.add(.readdown, 1_000_000);
+    p.add(.tail_gpu, 1_000_000);
+    p.add(.head_gpu, 1_000_000);
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "KTIME phases run=run_a per_token_us record=2000.00 flush=1000.00 submit=1000.00 fence_wait=1000.00 invalidate=1000.00 readdown=1000.00 tail_gpu=1000.00 head_gpu=1000.00",
+        formatPhases(&buf, "run_a", p, 1),
+    );
+}
+
 /// Ticks are only valid in the family's low `valid_bits`; the delta wraps with the masked period.
 pub fn timestampMask(valid_bits: u32) u64 {
     if (valid_bits == 0 or valid_bits >= 64) return ~@as(u64, 0);
@@ -95,8 +159,23 @@ pub const Timing = struct {
     entries: [timing_capacity]Stamp = undefined,
     n: u32 = 0,
     valid_mask: u64 = ~@as(u64, 0),
+    io: ?std.Io = null,
     period: f32 = 1,
     tally: Tally = .{},
+    phases: Phases = .{},
+
+    pub fn resetWindow(self: *Timing) void {
+        self.tally = .{};
+        self.phases = .{};
+    }
+
+    pub fn addPhase(self: *Timing, phase: Phase, ns: u64) void {
+        self.phases.add(phase, ns);
+    }
+    pub fn nowNs(self: *const Timing) u64 {
+        if (self.io) |io| return @intCast(std.Io.Clock.awake.now(io).nanoseconds);
+        return hostClockNs();
+    }
 
     pub fn create(gpa: std.mem.Allocator, dev: *const Device) (runtime.Error || error{ OutOfMemory, TimestampUnsupported })!*Timing {
         var fams: [32]c.VkQueueFamilyProperties = undefined;
@@ -158,6 +237,11 @@ pub const Timing = struct {
         self.n = index + 1;
     }
 
+    /// The batch's final command follows the last dispatch and download copies.
+    pub fn tailStamp(self: *Timing, cmd: c.VkCommandBuffer) Error!void {
+        try self.write(cmd, self.n, .{});
+    }
+
     /// After the batch's fence: fetch the stamps, convert the deltas to ns
     /// and fold them into the tally. Delta i names the dispatch of entry i.
     pub fn collect(self: *Timing) Error!void {
@@ -173,12 +257,19 @@ pub const Timing = struct {
             c.VK_QUERY_RESULT_64_BIT | c.VK_QUERY_RESULT_WAIT_BIT,
         ));
         for (self.entries[1..self.n], self.stamps[1..self.n], 0..) |e, cur, i| {
-            const ns: u64 = @intFromFloat(@as(f64, @floatFromInt(stampDelta(self.stamps[i], cur, self.valid_mask))) * @as(f64, self.period));
+            const ns = self.ticksToNs(stampDelta(self.stamps[i], cur, self.valid_mask));
+            if (e.spirv_ptr == 0) continue;
             self.tally.add(.{ .spirv = e.spirv_ptr, .push_hash = e.push_hash, .push_words = e.push_words, .groups = e.groups }, e.spirv_len, ns) catch |err| {
                 std.log.err("vulkan: timing tally overflowed {d} distinct kernels at stamp {d}; refusing", .{ tally_cap, i + 1 });
                 return err;
             };
         }
+        if (self.n >= 2) self.phases.add(.head_gpu, self.ticksToNs(stampDelta(self.stamps[0], self.stamps[1], self.valid_mask)));
+        if (self.n >= 3) self.phases.add(.tail_gpu, self.ticksToNs(stampDelta(self.stamps[self.n - 2], self.stamps[self.n - 1], self.valid_mask)));
+    }
+
+    fn ticksToNs(self: *const Timing, ticks: u64) u64 {
+        return @intFromFloat(@as(f64, @floatFromInt(ticks)) * @as(f64, self.period));
     }
 };
 
@@ -662,6 +753,7 @@ test "timing refuses a queue family without usable timestamps" {
     try checkTimestampSupport(64, 1.0);
     try checkTimestampSupport(36, 0.5);
 }
+
 
 test "the batched bank cursor resets per epoch and refuses past the bounded cap" {
     batch_epoch += 1; // beginBatch bumps: the previous batch's fence has been waited

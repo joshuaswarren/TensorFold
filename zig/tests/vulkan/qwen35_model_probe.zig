@@ -319,6 +319,8 @@ fn ktimeReport(a: std.mem.Allocator, kt: *q35v.vk.dispatch.Timing, run: []const 
         });
     }
     std.debug.print("KTIME total {s} gpu_ns_per_token={d} wall_ns_per_token={d}\n", .{ run, kt.tally.total_ns / per_token, wall_ns / per_token });
+    var phases_buf: [256]u8 = undefined;
+    std.debug.print("{s}\n", .{q35v.vk.dispatch.formatPhases(&phases_buf, run, kt.phases, per_token)});
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -439,6 +441,7 @@ pub fn main(init: std.process.Init) !u8 {
             break :blk null;
         };
     };
+    if (kt) |t| t.io = io;
     defer if (kt) |t| t.destroy(a);
 
     if (opts.vendor) |want| if (engine.vendorId() != want) {
@@ -625,7 +628,7 @@ fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const
     // TF_VK_KTIME's window: exactly the steady tokens. The prefill and the
     // warm-up draw above ran uninstrumented; the tally restarts per window.
     if (kt) |t| {
-        t.tally = .{};
+        t.resetWindow();
         q35v.vk.dispatch.timing = t;
     }
     defer if (kt != null) {

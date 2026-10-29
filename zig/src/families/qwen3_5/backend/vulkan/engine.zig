@@ -287,6 +287,8 @@ pub const Engine = struct {
         try logitsReady(false, e.state.visible());
         if (receipt_out) |o| if (o.len != e.logits.byteLen()) return error.Invalid;
         e.poisoned = true;
+        const phase_timing = vk.dispatch.timing;
+        const record_started = if (phase_timing) |t| t.nowNs() else 0;
         try e.cmds.beginBatch(e.staging);
         errdefer e.cmds.abortBatch();
         try vk.orExit(vk.upload(e.cmds, e.ids.buffer.*, e.ids.byte_offset, e.staging, std.mem.sliceAsBytes(&[1]u32{token}), e.timeout_ns));
@@ -297,13 +299,20 @@ pub const Engine = struct {
             try vk.commands.batchDownload(e.cmds, e.logits.buffer.*, e.logits.byte_offset, e.logits.byteLen())
         else
             0;
+        if (phase_timing) |t| t.addPhase(.record, t.nowNs() - record_started);
         try vk.orExit(e.cmds.endBatch(e.timeout_ns)); // flush, one submit, fence, invalidate
         var res: vk.greedy.Result = undefined;
+        const result_read_started = if (phase_timing) |t| t.nowNs() else 0;
         try e.cmds.readDown(result_at, std.mem.asBytes(&res));
+        if (phase_timing) |t| t.addPhase(.readdown, t.nowNs() - result_read_started);
         // the committed visible count advances only after completion
         try vk.orExit(e.state.append(1));
         const chosen = vk.orExit(e.greedy.decodeResult(res)) catch |err| return err;
-        if (receipt_out) |o| try e.cmds.readDown(receipt_at, o);
+        if (receipt_out) |o| {
+            const receipt_read_started = if (phase_timing) |t| t.nowNs() else 0;
+            try e.cmds.readDown(receipt_at, o);
+            if (phase_timing) |t| t.addPhase(.readdown, t.nowNs() - receipt_read_started);
+        }
         e.poisoned = false;
         return chosen;
     }
