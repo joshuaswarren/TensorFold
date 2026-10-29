@@ -486,7 +486,7 @@ test "pk compensation: the guarded and frozen forms agree bit for bit while the 
         try testing.expect(std.math.isFinite(frozen));
         try testing.expectEqual(@as(u32, @bitCast(frozen)), @as(u32, @bitCast(guarded)));
     }
-    var poison = [_]f32{0} ** 256;
+    var poison: [256]f32 = @splat(0);
     poison[3] = std.math.inf(f32);
     try testing.expect(@as(u32, @bitCast(compensatedSum(false, &poison))) != @as(u32, @bitCast(compensatedSum(true, &poison))));
 }
