@@ -375,7 +375,9 @@ pub fn main(init: std.process.Init) !u8 {
     const plan = qf.planCases(pr.limits.maxStorageBufferRange);
     if (!plan.head_fits) std.debug.print("SKIP served head n=248320 k=2048: packed Q4 weights exceed maxStorageBufferRange={d}; using largest listed fallback n={d} k={d}\n", .{ pr.limits.maxStorageBufferRange, plan.shapes[2][0], plan.shapes[2][1] });
     var completed: usize = 0;
-    for (plan.shapes) |shape| {
+    // DIAGNOSTIC shape list: the decode token's own shapes (n, k), the head last (it may not fit a small device)
+    const token_shapes = [_][2]usize{ .{ 2048, 6144 }, .{ 6144, 2048 }, .{ 2048, 2048 }, .{ 4096, 2048 }, .{ 512, 2048 }, plan.shapes[2] };
+    for (token_shapes) |shape| {
         std.debug.print("MILESTONE case n={d} k={d} weight-bytes-per-dispatch={d}\n", .{ shape[0], shape[1], qf.weightBytesFor(shape[0], shape[1]) });
         if (!try runShape(io, a, &dev, &cmds, staging, &pipes, shape[0], shape[1], timeout, opts.add_floor_us)) return 1;
         completed += 1;
