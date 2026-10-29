@@ -112,6 +112,20 @@ pub fn parseArgs(args: []const []const u8) ?Options {
     return o;
 }
 
+/// An env switch is on only for the exact value "1".
+pub fn envOne(v: ?[*:0]const u8) bool {
+    const s = v orelse return false;
+    return std.mem.eql(u8, std.mem.span(s), "1");
+}
+
+/// The RESULT line's repeats field; a null logits comparison is named, never faked.
+pub fn repeatsField(buf: []u8, ids_equal: bool, logits_equal: ?bool) []const u8 {
+    return std.fmt.bufPrint(buf, "ids={s},logits={s}", .{
+        if (ids_equal) "true" else "false",
+        if (logits_equal) |e| if (e) "true" else "false" else "skipped (TF_PROBE_NO_RECEIPT)",
+    }) catch "ids=?,logits=?";
+}
+
 /// Canonical prefill chunking: how many 32-row chunks `rows` spans; pure and
 /// host-tested. The chunk size is the engine's constant — not configurable.
 pub fn chunkCount(rows: usize) usize {
@@ -334,6 +348,8 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print(usage, .{});
         return 2;
     };
+    const no_receipt = envOne(std.c.getenv("TF_PROBE_NO_RECEIPT"));
+    if (no_receipt) std.debug.print("MILESTONE probe no-receipt steady tokens\n", .{});
     const a = init.gpa;
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
@@ -463,21 +479,23 @@ pub fn main(init: std.process.Init) !u8 {
     const samples_b = try a.alloc(SteadySample, expected.len - 1);
     defer a.free(samples_b);
 
-    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_a, rows_a, row_len, samples_a, io, a, "run_a", kt) catch |e| {
+    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_a, rows_a, row_len, samples_a, io, a, "run_a", kt, no_receipt) catch |e| {
         std.debug.print("FAIL run1: {s}\n", .{@errorName(e)});
         return 1;
     };
     std.debug.print("MILESTONE run1-done elapsed_ms={d}\n", .{clock.ms()});
     try engine.reset();
-    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_b, rows_b, row_len, samples_b, io, a, "run_b", kt) catch |e| {
+    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_b, rows_b, row_len, samples_b, io, a, "run_b", kt, no_receipt) catch |e| {
         std.debug.print("FAIL run2: {s}\n", .{@errorName(e)});
         return 1;
     };
     std.debug.print("MILESTONE run2-done elapsed_ms={d}\n", .{clock.ms()});
 
-    // within-Vulkan determinism: fresh cache, real reset, identical bytes
+    // within-Vulkan determinism: fresh cache, real reset, identical bytes.
+    // Without the receipt rows no logits comparison exists: null, never a
+    // fake equal over unread memory.
     const ids_equal = std.mem.eql(u32, ids_a, ids_b);
-    const logits_equal = std.mem.eql(u8, rows_a, rows_b);
+    const logits_equal: ?bool = if (no_receipt) null else std.mem.eql(u8, rows_a, rows_b);
     // the pass criterion: the exact oracle ids, both runs, no epsilon
     const match_a = std.mem.eql(u32, ids_a, expected);
     const match_b = std.mem.eql(u32, ids_b, expected);
@@ -486,14 +504,15 @@ pub fn main(init: std.process.Init) !u8 {
     var mismatches: ?u64 = null;
     const oracle_logits_path = try std.fmt.allocPrint(a, "{s}/logits_bf16.bin", .{opts.positional[2]});
     defer a.free(oracle_logits_path);
-    if (cwd.readFileAlloc(io, oracle_logits_path, a, .limited(rows_a.len + (1 << 20)))) |oracle_bytes| {
+    if (!no_receipt) if (cwd.readFileAlloc(io, oracle_logits_path, a, .limited(rows_a.len + (1 << 20)))) |oracle_bytes| {
         defer a.free(oracle_bytes);
         mismatches = countElementMismatches(oracle_bytes, rows_a);
         if (mismatches == null) std.debug.print("NOTE oracle logits {d} bytes vs run {d}; diagnostic skipped\n", .{ oracle_bytes.len, rows_a.len });
     } else |_| std.debug.print("NOTE oracle logits file unreadable; diagnostic skipped\n", .{});
 
-    // receipts: the full BF16 logit rows of run A, then the result record
-    out.writeFile(io, .{ .sub_path = "logits_bf16.bin", .data = rows_a }) catch |e| {
+    // receipts: the full BF16 logit rows of run A (skipped entirely when the
+    // steady tokens never read a row), then the result record
+    if (!no_receipt) out.writeFile(io, .{ .sub_path = "logits_bf16.bin", .data = rows_a }) catch |e| {
         std.debug.print("FAIL receipt: cannot write logits_bf16.bin: {s}\n", .{@errorName(e)});
         return 1;
     };
@@ -519,7 +538,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     const ids_hash = try sha256HexA(diag, std.mem.sliceAsBytes(ids_a));
     writeResult(a, io, out, .{
-        .status = if (match_a and match_b and ids_equal and logits_equal) "ok" else "mismatch",
+        .status = if (match_a and match_b and ids_equal and (logits_equal orelse true)) "ok" else "mismatch",
         .steps = expected.len,
         .execution_mode = if (opts.teacher_forced) teacher_forced_mode else free_running_mode,
         .prefill_schedule = if (opts.sequential_prefill) "rowwise" else "chunk32",
@@ -533,9 +552,13 @@ pub fn main(init: std.process.Init) !u8 {
         .prompt_u32le_sha256 = prompt_hash,
         .generated_ids = ids_a,
         .generated_ids_hash = ids_hash,
-        .logits_bytes = rows_a.len,
-        .logits_bf16_sha256 = try sha256HexA(diag, rows_a),
-        .repeat_checks = .{ .generated_ids_equal = ids_equal, .logits_bytes_equal = logits_equal },
+        .logits_bytes = if (no_receipt) 0 else rows_a.len,
+        .logits_bf16_sha256 = if (no_receipt) null else try sha256HexA(diag, rows_a),
+        .repeat_checks = .{
+            .generated_ids_equal = ids_equal,
+            .logits_bytes_equal = logits_equal,
+            .logits_note = if (no_receipt) "skipped (TF_PROBE_NO_RECEIPT)" else null,
+        },
         .oracle_match = .{ .ids_run_a = match_a, .ids_run_b = match_b },
         .oracle = .{
             .generated_ids_hash = oracle.generated_ids_hash,
@@ -550,9 +573,10 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
 
-    std.debug.print("RESULT qwen35-model elapsed_ms={d}: ids_match_a={} ids_match_b={} repeats(ids={},logits={}) " ++
+    var repeats_buf: [96]u8 = undefined;
+    std.debug.print("RESULT qwen35-model elapsed_ms={d}: ids_match_a={} ids_match_b={} repeats({s}) " ++
         "oracle_logits_mismatches={s} expected_hash={s} got_hash={s}\n", .{
-        clock.ms(),                                                                           match_a,                   match_b,  ids_equal, logits_equal,
+        clock.ms(),                                                                           match_a,                   match_b,  repeatsField(&repeats_buf, ids_equal, logits_equal),
         if (mismatches) |n| (std.fmt.allocPrint(diag, "{d}", .{n}) catch "?") else "skipped", oracle.generated_ids_hash, ids_hash,
     });
     // mode labels ride only the non-default modes so the anchor default's
@@ -560,7 +584,7 @@ pub fn main(init: std.process.Init) !u8 {
     // never claimed as a free-running chain proof
     if (opts.teacher_forced) std.debug.print("RESULT execution_mode=teacher-forced: oracle ids fed as previous tokens; per-step agreement, not a free-running chain proof\n", .{});
     if (opts.sequential_prefill) std.debug.print("RESULT prefill_schedule=rowwise: one Engine.prefill call per prompt token\n", .{});
-    return if (match_a and match_b and ids_equal and logits_equal) 0 else 1;
+    return if (match_a and match_b and ids_equal and (logits_equal orelse true)) 0 else 1;
 }
 
 /// One greedy run over the fresh state: whole-prompt prefill (the engine
@@ -586,13 +610,13 @@ pub const SteadySample = struct {
     wall_ns: u64,
 };
 
-fn steadyToken(io: std.Io, e: *Engine, s: u64, token: u32, row: []u8) !SteadySample {
+fn steadyToken(io: std.Io, e: *Engine, s: u64, token: u32, row: ?[]u8) !SteadySample {
     const position = e.visible();
     const t0 = std.Io.Clock.awake.now(io);
     const id = if (comptime @hasDecl(Engine, "decodeDraw")) try e.decodeDraw(token, row) else immediate: {
         try e.decode(token);
         const drawn = try e.draw();
-        try e.logitsBytes(row);
+        try e.logitsBytes(row orelse return error.Invalid);
         break :immediate drawn;
     };
     const t1 = std.Io.Clock.awake.now(io);
@@ -616,7 +640,7 @@ fn steadyToken(io: std.Io, e: *Engine, s: u64, token: u32, row: []u8) !SteadySam
 /// anchor) feeds each draw back; the teacher-forced mode feeds the oracle's
 /// own id for the step just scored as the next input - a labelled per-step
 /// check, never a free-running chain proof.
-fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const u32, expected: []const u32, ids_out: []u32, rows_out: []u8, row_len: usize, samples_out: []SteadySample, io: std.Io, a: std.mem.Allocator, run: []const u8, kt: ?*q35v.vk.dispatch.Timing) !void {
+fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const u32, expected: []const u32, ids_out: []u32, rows_out: []u8, row_len: usize, samples_out: []SteadySample, io: std.Io, a: std.mem.Allocator, run: []const u8, kt: ?*q35v.vk.dispatch.Timing, no_receipt: bool) !void {
     if (samples_out.len != ids_out.len - 1) return error.Invalid;
     if (sequential) {
         for (prompt) |tok| try e.prefill(&.{tok});
@@ -624,7 +648,7 @@ fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const
         try e.prefill(prompt);
     }
     ids_out[0] = try e.draw();
-    try e.logitsBytes(rows_out[0..row_len]);
+    if (!no_receipt) try e.logitsBytes(rows_out[0..row_len]);
     // TF_VK_KTIME's window: exactly the steady tokens. The prefill and the
     // warm-up draw above ran uninstrumented; the tally restarts per window.
     if (kt) |t| {
@@ -636,13 +660,14 @@ fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const
     };
     for (1..ids_out.len) |step| {
         const feed: u32 = if (teacher_forced) expected[step - 1] else ids_out[step - 1];
-        samples_out[step - 1] = try steadyToken(io, e, step, feed, rows_out[step * row_len ..][0..row_len]);
+        const row: ?[]u8 = if (no_receipt) null else rows_out[step * row_len ..][0..row_len];
+        samples_out[step - 1] = try steadyToken(io, e, step, feed, row);
         ids_out[step] = samples_out[step - 1].id;
     }
     if (kt) |t| ktimeReport(a, t, run, samples_out);
 }
 
-const RepeatChecks = struct { runs: u64 = 2, generated_ids_equal: bool, logits_bytes_equal: bool };
+const RepeatChecks = struct { runs: u64 = 2, generated_ids_equal: bool, logits_bytes_equal: ?bool, logits_note: ?[]const u8 = null };
 const OracleMatch = struct { ids_run_a: bool, ids_run_b: bool };
 const OracleEcho = struct {
     generated_ids_hash: []const u8,
@@ -668,7 +693,7 @@ const Receipt = struct {
     generated_ids: []const u32,
     generated_ids_hash: []const u8,
     logits_bytes: usize,
-    logits_bf16_sha256: []const u8,
+    logits_bf16_sha256: ?[]const u8,
     repeat_checks: RepeatChecks,
     oracle_match: OracleMatch,
     oracle: OracleEcho,
@@ -757,6 +782,22 @@ test "buildResult escapes oracle strings and round-trips through the JSON parser
     try testing.expectEqualStrings("rowwise", root.get("prefill_schedule").?.string);
     try testing.expect(root.get("repeat_checks").?.object.get("generated_ids_equal").? == .bool);
     try testing.expect(root.get("oracle_logits_element_mismatches").? == .null);
+}
+
+test "envOne accepts only the exact on value" {
+    try testing.expect(!envOne(null));
+    try testing.expect(envOne("1"));
+    try testing.expect(!envOne("0"));
+    try testing.expect(!envOne(""));
+    try testing.expect(!envOne("on"));
+}
+
+test "repeatsField names the skipped logits instead of faking an equality" {
+    var buf: [128]u8 = undefined;
+    try testing.expectEqualStrings("ids=true,logits=true", repeatsField(&buf, true, true));
+    try testing.expectEqualStrings("ids=true,logits=false", repeatsField(&buf, true, false));
+    try testing.expectEqualStrings("ids=false,logits=skipped (TF_PROBE_NO_RECEIPT)", repeatsField(&buf, false, null));
+    try testing.expectEqualStrings("ids=true,logits=skipped (TF_PROBE_NO_RECEIPT)", repeatsField(&buf, true, null));
 }
 
 test "parseArgs takes the two flags and exactly four paths" {
