@@ -503,7 +503,7 @@ fn qmmPkGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: 
         };
         try o.qmm_bf16.bind(&.{ x_view.bind(), w_view.bind(), s_view.bind(), b_view.bind(), serial_view.bind() });
         try vk.orExit(o.qmm_bf16.run(cmds, std.mem.asBytes(&p), vk.ops.dispatchGroups(p.count, o.qmm_bf16.local[0]), timeout));
-        try vk.orExit(vk.ops_q4.project(o, cmds, pk_view, x_view, w_view, s_view, b_view, case.shape.k, scratch, timeout));
+        try vk.orExit(vk.ops_q4.projectParallelK(o, cmds, pk_view, x_view, w_view, s_view, b_view, case.shape.k, scratch, timeout));
         const serial_bits = try a.alloc(u16, f.out.len);
         defer a.free(serial_bits);
         try fetch(cmds, staging, serial_buf.buf, std.mem.sliceAsBytes(serial_bits), timeout);
@@ -560,7 +560,7 @@ fn qmmPkCoverageGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device
         const s_view = try vk.tensor.View.init(&s_buf, .bf16, f.case.at.scales * 2, f.q.scales.len);
         const b_view = try vk.tensor.View.init(&b_buf, .bf16, f.case.at.biases * 2, f.q.biases.len);
         const out_view = try vk.tensor.View.init(&out.buf, .bf16, f.case.at.out * 2, f.want.len);
-        try vk.orExit(vk.ops_q4.project(o, cmds, out_view, x_view, w_view, s_view, b_view, case.shape.k, scratch, timeout));
+        try vk.orExit(vk.ops_q4.projectParallelK(o, cmds, out_view, x_view, w_view, s_view, b_view, case.shape.k, scratch, timeout));
         const bits = try a.alloc(u16, f.out.len);
         defer a.free(bits);
         try fetch(cmds, staging, out.buf, std.mem.sliceAsBytes(bits), timeout);
@@ -616,7 +616,7 @@ fn qmmPkCoverageGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device
     const s_view = try vk.tensor.View.init(&s_buf, .bf16, 0, n * groups);
     const b_view = try vk.tensor.View.init(&b_buf, .bf16, 0, n * groups);
     const out_view = try vk.tensor.View.init(&out_buf, .bf16, 0, n);
-    try vk.orExit(vk.ops_q4.project(o, cmds, out_view, x_view, w_view, s_view, b_view, k, scratch, timeout));
+    try vk.orExit(vk.ops_q4.projectParallelK(o, cmds, out_view, x_view, w_view, s_view, b_view, k, scratch, timeout));
     try fetch(cmds, staging, out_buf, std.mem.sliceAsBytes(out_host), timeout);
     for (out_host[n..]) |g| if (g != fx.poison16) {
         std.debug.print("FAIL pk coverage m1 n248320 k2048: guard tail clobbered\n", .{});

@@ -39,6 +39,14 @@ pub fn chunkRows(l: Limits, k: u64, n: u64) Error!u64 {
 /// build is fixed at 2 (strided lanes, compensated); nothing selects it at run time.
 pub var pk_variant: u32 = 2;
 
+/// Which kernel serves a projection: the compensated parallel-K kernel for the one-row decode
+/// projections it was built for, the serial qmm for a prefill chunk's rows. Pure and host-tested.
+pub const Route = enum { parallel_k, serial };
+
+pub fn route(rows: u64) Route {
+    return if (rows == 1) .parallel_k else .serial;
+}
+
 const Geometry = struct { m: u64, n: u64 };
 
 /// Workgroups for one qmm_q4_pk dispatch: one 64-lane workgroup per output, capped at the
@@ -82,23 +90,39 @@ fn q4Push(m: u64, n: u64, k: u64) Error!params.Params {
 }
 
 /// Q4 affine projection out[m, n] = x[m, k] . dequant(w, scales, biases)[n, k], group 64, transposed.
-/// One qmm_q4_pk dispatch (one 64-lane workgroup per output, parallel over K) when the w view fits
-/// maxStorageBufferRange; otherwise n-row chunks write packed blocks to `scratch` and a copy_general
-/// scatter places each block's columns. Every range and shape is validated before the first dispatch;
-/// x and out must each fit one binding.
+/// The one-row decode projections take the qmm_q4_pk kernel (one 64-lane workgroup per output,
+/// parallel over K); a prefill chunk's rows take the serial qmm (one thread per output), the
+/// kernel they ran on before the parallel-K kernel landed. Either way: one dispatch when the w
+/// view fits maxStorageBufferRange; otherwise n-row chunks write packed blocks to `scratch` and
+/// a copy_general scatter places each block's columns. Every range and shape is validated before
+/// the first dispatch; x and out must each fit one binding.
 pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: View, biases: View, k: u64, scratch: *Arena, timeout_ns: u64) Error!void {
+    return projectAs(o, cmds, out, x, w, scales, biases, k, scratch, timeout_ns, null);
+}
+
+/// The parallel-K kernel at any row count: the engine's one-row routing, and the stage 1 probe's
+/// coverage of the kernel itself. project() routes by row count instead (see route).
+pub fn projectParallelK(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: View, biases: View, k: u64, scratch: *Arena, timeout_ns: u64) Error!void {
+    return projectAs(o, cmds, out, x, w, scales, biases, k, scratch, timeout_ns, true);
+}
+
+fn projectAs(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: View, biases: View, k: u64, scratch: *Arena, timeout_ns: u64, force_pk: ?bool) Error!void {
     const g = try projectGeometry(out, x, w, scales, biases, k);
     const limits = o.dev.properties.limits;
     const lim = Limits{ .max_range = limits.maxStorageBufferRange, .alignment = limits.minStorageBufferOffsetAlignment };
     if (x.byteLen() > lim.max_range or out.byteLen() > lim.max_range) return error.TooLarge;
+    const use_pk = force_pk orelse (route(g.m) == .parallel_k);
     const rows = try chunkRows(lim, k, g.n);
     if (rows == 0) {
-        const pipe = &o.qmm_q4_pk;
+        const pipe = if (use_pk) &o.qmm_q4_pk else &o.qmm_bf16;
         try pipe.bind(&.{ x.bind(), w.bind(), scales.bind(), biases.bind(), out.bind() });
         var p = try q4Push(g.m, g.n, k);
-        p.flags = pk_variant;
-        const groups = try pkGroups(p.count, limits.maxComputeWorkGroupCount[0]);
-        try pipe.run(cmds, std.mem.asBytes(&p), .{ groups, 1, 1 }, timeout_ns);
+        const groups: [3]u32 = if (use_pk)
+            .{ try pkGroups(p.count, limits.maxComputeWorkGroupCount[0]), 1, 1 }
+        else
+            ops_mod.dispatchGroups(p.count, pipe.local[0]);
+        if (use_pk) p.flags = pk_variant;
+        try pipe.run(cmds, std.mem.asBytes(&p), groups, timeout_ns);
         return;
     }
     const block = try scratch.alloc(.bf16, g.m * rows);
@@ -113,12 +137,15 @@ pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: Vi
         const s_chunk = try scales.slice(first * row_groups, chunk * row_groups);
         const b_chunk = try biases.slice(first * row_groups, chunk * row_groups);
         const block_chunk = try block.slice(0, g.m * chunk);
-        const pipe = &o.qmm_q4_pk;
+        const pipe = if (use_pk) &o.qmm_q4_pk else &o.qmm_bf16;
         try pipe.bind(&.{ x.bind(), w_chunk.bind(), s_chunk.bind(), b_chunk.bind(), block_chunk.bind() });
         var p = try q4Push(g.m, chunk, k);
-        p.flags = pk_variant;
-        const groups = try pkGroups(p.count, limits.maxComputeWorkGroupCount[0]);
-        try pipe.run(cmds, std.mem.asBytes(&p), .{ groups, 1, 1 }, timeout_ns);
+        const groups: [3]u32 = if (use_pk)
+            .{ try pkGroups(p.count, limits.maxComputeWorkGroupCount[0]), 1, 1 }
+        else
+            ops_mod.dispatchGroups(p.count, pipe.local[0]);
+        if (use_pk) p.flags = pk_variant;
+        try pipe.run(cmds, std.mem.asBytes(&p), groups, timeout_ns);
         // Scatter the packed block into the full row-major output; raw u16 columns keep every RNE byte.
         const scatter = &o.copy_u16;
         try scatter.bind(&.{ block_chunk.bind(), o.dummyBinding(), out.bind(), o.dummyBinding() });
@@ -273,4 +300,9 @@ test "pkGroups plans one workgroup per output and clamps at the device limit" {
     try testing.expectEqual(@as(u32, 1), try pkGroups(1 << 20, 1));
     try testing.expectError(error.Invalid, pkGroups(0, roomy));
     try testing.expectError(error.TooLarge, pkGroups(1 << 32, roomy));
+}
+
+test "the routing: one row to the parallel-K kernel, a prefill chunk's rows to the serial qmm" {
+    try testing.expectEqual(Route.parallel_k, route(1)); // the decode projections, the head included
+    for ([_]u64{ 2, 3, 31, 32 }) |rows| try testing.expectEqual(Route.serial, route(rows));
 }
