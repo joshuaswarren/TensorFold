@@ -259,6 +259,7 @@ fn bundle() engine_mod.ShaderBundle {
             .copy_u32 = &q35s.copy_u32,
             .copy_u16 = &q35s.copy_u16,
             .qmm_q4_sg = &q35s.qmm_q4_sg,
+            .qmm_q4_sg_swiglu = &q35s.qmm_q4_sg_swiglu,
         },
         .norm = .{ .norm_bf16 = &q35s.norm_bf16, .add_bf16 = &q35s.add_bf16, .add_preserve_bf16 = &q35s.add_preserve_bf16, .swiglu_bf16 = &q35s.swiglu_bf16 },
         .attention = .{ .rope_bf16 = &q35s.rope_bf16, .sdpa_rows_bf16 = &q35s.sdpa_rows_bf16, .gate_bf16 = &q35s.gate_bf16 },
@@ -383,6 +384,7 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("MILESTONE engine-ready elapsed_ms={d} capacity={d} model_context={d} logits_bytes={d}\n", .{ clock.ms(), engine.capacity(), engine.modelContext(), engine.logitsLen() });
     std.debug.print("MILESTONE barrier-elision {s}\n", .{if (q35v.vk.dispatch.elide_barriers) "on" else "off (TF_VK_NOBAR=0)"});
     std.debug.print("MILESTONE group-fusion {s}\n", .{if (engine.model.fuse_switch) "on" else "off (TF_VK_FUSE=0)"});
+    std.debug.print("MILESTONE swiglu-epilogue {s}\n", .{if (engine.ops.fuse_swiglu) "on" else "off (TF_VK_FUSE_SWIGLU=0)"});
     switch (engine.ops.qmm_path) {
         .sg => std.debug.print("MILESTONE qmm-path sg\n", .{}),
         .old_env => std.debug.print("MILESTONE qmm-path old (TF_VK_QMM=old)\n", .{}),

@@ -204,21 +204,39 @@ pub const Core = struct {
         errdefer c.scratch.reset(mark) catch {};
         // The decode row: gate and up read one x and become one dispatch;
         // swiglu reads the two members as views of the shared output block.
+        // Candidate C, when switched on and the device admits the epilogue:
+        // the merged projection and the swiglu are one dispatch that writes
+        // only the activations.
         var gate: View = undefined;
         var up: View = undefined;
+        var act: View = undefined;
+        var one_dispatch = false;
         if (m.gate_up) |g| if (rows == 1) {
-            const block = try c.scratch.alloc(.bf16, g.fused.n);
-            try c.project(block, x, g.fused);
-            gate = try block.slice(g.starts[0], pinned.intermediate);
-            up = try block.slice(g.starts[1], pinned.intermediate);
+            if (c.acc.ops.fuse_swiglu and c.acc.ops.qmm_q4_sg_swiglu != null) {
+                act = try c.scratch.alloc(.bf16, pinned.intermediate);
+                if (vk.ops_q4.projectSwiglu(c.acc.ops, c.cmds, act, x, g.fused.w, g.fused.scales, g.fused.biases, g.fused.k, c.timeout_ns)) {
+                    one_dispatch = true;
+                } else |err| switch (err) {
+                    error.Invalid, error.TooLarge => {}, // fall back to B's two dispatches
+                    else => return err,
+                }
+            }
+            if (!one_dispatch) {
+                const block = try c.scratch.alloc(.bf16, g.fused.n);
+                try c.project(block, x, g.fused);
+                gate = try block.slice(g.starts[0], pinned.intermediate);
+                up = try block.slice(g.starts[1], pinned.intermediate);
+            }
         } else {
             gate = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
             try c.project(gate, x, m.gate);
             up = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
             try c.project(up, x, m.up);
         };
-        const act = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
-        try vk.orExit(c.acc.norm.swiglu(c.cmds, act, gate, up, c.timeout_ns));
+        if (!one_dispatch) {
+            act = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
+            try vk.orExit(c.acc.norm.swiglu(c.cmds, act, gate, up, c.timeout_ns));
+        }
         try c.project(r_out, act, m.down);
         c.scratch.reset(mark) catch {};
     }
