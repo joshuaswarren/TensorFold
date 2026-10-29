@@ -430,3 +430,63 @@ test "q4 fixture: a row's pk tree output alone is bit-identical to its output in
         for (0..n) |j| try testing.expectEqual(pkOutput(alone, 0, j), pkOutput(batch, 0, j));
     }
 }
+
+/// The kernel's compensated lane sums and TwoSum tree, with the error term either always taken
+/// (the frozen form) or skipped once the running sum is not finite (the guarded form).
+fn compensatedSum(comptime guarded: bool, terms: []const f32) f32 {
+    var tree: [64]f32 = @splat(0);
+    var los: [64]f32 = @splat(0);
+    for (0..64) |lane| {
+        var partial: f32 = 0;
+        var comp: f32 = 0;
+        var i: usize = lane;
+        while (i < terms.len) : (i += 64) {
+            const t = partial + terms[i];
+            if (!guarded or std.math.isFinite(t)) {
+                if (@abs(partial) >= @abs(terms[i])) {
+                    comp += (partial - t) + terms[i];
+                } else {
+                    comp += (terms[i] - t) + partial;
+                }
+            }
+            partial = t;
+        }
+        tree[lane] = partial;
+        los[lane] = comp;
+    }
+    var stride: usize = 32;
+    while (stride > 0) : (stride /= 2) {
+        for (0..stride) |i| {
+            const a = tree[i];
+            const b = tree[i + stride];
+            const sum = a + b;
+            if (!guarded or std.math.isFinite(sum)) {
+                const bb = sum - a;
+                los[i] = los[i] + los[i + stride] + ((a - (sum - bb)) + (b - bb));
+            }
+            tree[i] = sum;
+        }
+    }
+    return tree[0] + los[0];
+}
+
+test "pk compensation: the guarded and frozen forms agree bit for bit while the sums stay finite" {
+    // On finite inputs a running sum turns non-finite only by overflowing past f32's max, and
+    // an f32 sum that has gone infinite never comes back, so an output that is finite never
+    // took the guard's skip: the two forms must store the same bits. The negative control
+    // feeds one infinity and shows the emulation can tell the forms apart.
+    var prng = std.Random.DefaultPrng.init(0xbeef5);
+    const rng = prng.random();
+    for (0..24) |round| {
+        const terms = try testing.allocator.alloc(f32, 2048);
+        defer testing.allocator.free(terms);
+        for (terms) |*v| v.* = (rng.float(f32) * 2 - 1) * std.math.pow(f32, 2, @floatFromInt(@as(i32, @intCast(round % 9)) - 4));
+        const frozen = compensatedSum(false, terms);
+        const guarded = compensatedSum(true, terms);
+        try testing.expect(std.math.isFinite(frozen));
+        try testing.expectEqual(@as(u32, @bitCast(frozen)), @as(u32, @bitCast(guarded)));
+    }
+    var poison = [_]f32{0} ** 256;
+    poison[3] = std.math.inf(f32);
+    try testing.expect(@as(u32, @bitCast(compensatedSum(false, &poison))) != @as(u32, @bitCast(compensatedSum(true, &poison))));
+}
