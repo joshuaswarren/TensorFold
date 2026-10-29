@@ -52,6 +52,13 @@ pub fn useSubgroupQmv(rows: u64, k: u64, n: u64, caps: SubgroupCaps) bool {
     return rows == 1 and k % 512 == 0 and n % 8 == 0 and sgDeviceOk(caps.subgroup_size, caps.subgroup_ops);
 }
 
+/// The decode dispatch's whole SG decision minus the pipeline lookup: the batch is one row, the
+/// shape fits the kernel's contract, the device subgroup admits it, and the engine built the
+/// pipeline. The kernel computes x row 0 only, so any m past 1 keeps the old kernel. Pure and host-tested.
+pub fn qmmDecodeSgAdmits(m: u64, k: u64, n: u64, caps: SubgroupCaps, have_pipeline: bool) bool {
+    return have_pipeline and useSubgroupQmv(m, k, n, caps);
+}
+
 /// The decode kernel the engine opened with: sg when init built the SG pipeline, else why it did not.
 pub const QmmPath = enum { sg, old_env, old_device };
 
@@ -104,7 +111,7 @@ pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: Vi
     if (rows == 0) {
         // Decode's single-row dispatch takes the probe's SG master kernel when the engine built
         // it and the shape fits its contract; the old kernel otherwise, byte-for-byte as before.
-        if (o.qmmDecodeSg(k, g.n)) |sg| {
+        if (o.qmmDecodeSg(g.m, k, g.n)) |sg| {
             try sg.bind(&.{ x.bind(), w.bind(), scales.bind(), biases.bind(), out.bind() });
             var p = try q4Push(g.m, g.n, k);
             p.flags = pk_variant;
@@ -292,6 +299,21 @@ test "useSubgroupQmv admits exactly the decode shapes the SG kernel serves on a 
     try testing.expect(!useSubgroupQmv(1, 2048, 2048, .{ .subgroup_size = 16, .subgroup_ops = ok.subgroup_ops }));
     try testing.expect(!useSubgroupQmv(1, 2048, 2048, .{ .subgroup_size = 64, .subgroup_ops = ok.subgroup_ops }));
     try testing.expect(!useSubgroupQmv(1, 2048, 2048, .{ .subgroup_size = 32, .subgroup_ops = 1 })); // basic only
+}
+
+test "qmmDecodeSgAdmits refuses every multi-row batch even with the pipeline built" {
+    const ok: SubgroupCaps = .{ .subgroup_size = 32, .subgroup_ops = 1 << 2 }; // VK_SUBGROUP_FEATURE_ARITHMETIC_BIT
+    // batched prefill reaches project's single-binding branch with several rows; the kernel
+    // computes row 0 only, so any m past 1 must keep the old kernel
+    try testing.expect(!qmmDecodeSgAdmits(2, 2048, 2048, ok, true));
+    try testing.expect(!qmmDecodeSgAdmits(16, 6144, 2048, ok, true));
+    try testing.expect(!qmmDecodeSgAdmits(319, 2048, 2048, ok, true));
+    // one row with the pipeline built and the shape fine is the decode dispatch
+    try testing.expect(qmmDecodeSgAdmits(1, 2048, 2048, ok, true));
+    // a built pipeline cannot rescue a shape or device the kernel does not serve
+    try testing.expect(!qmmDecodeSgAdmits(1, 2000, 2048, ok, true));
+    try testing.expect(!qmmDecodeSgAdmits(1, 2048, 2048, .{ .subgroup_size = 64, .subgroup_ops = ok.subgroup_ops }, true));
+    try testing.expect(!qmmDecodeSgAdmits(1, 2048, 2048, ok, false));
 }
 
 test "pkGroups plans one workgroup per output and clamps at the device limit" {
