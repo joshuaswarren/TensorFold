@@ -123,7 +123,7 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
     const shape: c.Shape = .{ .rows = 1, .n = n, .k = k };
     const spec = checkSpec();
     for (0..n) |column| {
-        const ref = qf.referenceOne(weights, scales, biases, k, column);
+        const ref = qf.referenceOne(weights, scales, biases, x, k, column);
         want[column] = ref[0];
         magnitude[column] = ref[1];
         allowances[column] = c.bound(spec, shape, ref[0], ref[1]);
