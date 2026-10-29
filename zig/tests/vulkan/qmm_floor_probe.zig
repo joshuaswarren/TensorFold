@@ -11,10 +11,11 @@ const shaders = @import("qmm_pk_shaders");
 const c = contract.spec;
 const dispatch = vk.dispatch;
 
-const usage = "usage: tf-qmm-floor [--vendor ID] [--timeout-ms MS] | --help\n" ++
+const usage = "usage: tf-qmm-floor [--vendor ID] [--timeout-ms MS] [--add-floor-us US] | --help\n" ++
     "  --help            show this text and exit without opening a loader or device\n" ++
     "  --vendor ID       refuse a device whose Vulkan vendorID differs (decimal or 0x hex; no default)\n" ++
-    "  --timeout-ms MS   bound on every fence wait, 1 to 600000 (default 10000); a timeout ends the process\n";
+    "  --timeout-ms MS   bound on every fence wait, 1 to 600000 (default 10000); a timeout ends the process\n" ++
+    "  --add-floor-us US this chip's own measured per-dispatch floor from tf-dispatch-floor; only then is a ratio printed\n";
 
 const warmups = 3;
 const sample_count = 63;
@@ -22,9 +23,9 @@ const staging_bytes = 1 << 20;
 const cases = [_][2]usize{ .{ 6144, 2048 }, .{ 2048, 2048 }, .{ 248320, 2048 } };
 const fallback_shapes = [_][2]usize{ .{ 4096, 2048 }, .{ 2048, 6144 }, .{ 512, 2048 } };
 const dispatch_counts = [_]usize{ 0, 1, 16, 64 };
-const add_floor_us = 13.95;
+var add_floor_us: ?f64 = null; // set once in main from --add-floor-us; no built-in default, a floor belongs to one chip
 
-pub const Options = struct { vendor: ?u32 = null, timeout_ms: u64 = 10_000 };
+pub const Options = struct { vendor: ?u32 = null, timeout_ms: u64 = 10_000, add_floor_us: ?f64 = null };
 
 pub fn parseArgs(args: []const []const u8) ?Options {
     var o: Options = .{};
@@ -39,6 +40,12 @@ pub fn parseArgs(args: []const []const u8) ?Options {
             if (i + 1 >= args.len) return null;
             o.timeout_ms = std.fmt.parseInt(u64, args[i + 1], 10) catch return null;
             if (o.timeout_ms == 0 or o.timeout_ms > 600_000) return null;
+            i += 2;
+        } else if (std.mem.eql(u8, arg, "--add-floor-us")) {
+            if (i + 1 >= args.len) return null;
+            const v = std.fmt.parseFloat(f64, args[i + 1]) catch return null;
+            if (!std.math.isFinite(v) or v <= 0) return null;
+            o.add_floor_us = v;
             i += 2;
         } else return null;
     }
@@ -263,7 +270,8 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
     const gbps = effectiveGbps(bytes, @intFromFloat(@max(p50_64, 1.0)));
     const min_gbps = effectiveGbps(bytes, @intFromFloat(@max(min_64, 1.0)));
     std.debug.print("    p50 slope (64-0)/64={d:.3} us/dispatch; p50 slope (16-0)/16={d:.3} us/dispatch; min slope (64-0)/64={d:.3} us/dispatch\n", .{ p50_64 / 1000.0, p50_16 / 1000.0, min_64 / 1000.0 });
-    std.debug.print("    weight bytes/dispatch={d} (packed={d}, scales={d}, biases={d}); effective bandwidth p50={d:.2} GB/s min={d:.2} GB/s; p50/add-floor={d:.2}x (13.95 us)\n", .{ bytes, weight_bytes, param_bytes, param_bytes, gbps, min_gbps, (p50_64 / 1000.0) / add_floor_us });
+    std.debug.print("    weight bytes/dispatch={d} (packed={d}, scales={d}, biases={d}); effective bandwidth p50={d:.2} GB/s min={d:.2} GB/s\n", .{ bytes, weight_bytes, param_bytes, param_bytes, gbps, min_gbps });
+    if (add_floor_us) |f| std.debug.print("    p50/add-floor={d:.2}x (add floor {d:.3} us given on the command line)\n", .{ (p50_64 / 1000.0) / f, f });
     return true;
 }
 
@@ -276,6 +284,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     };
     const opts = parseArgs(args[1..]) orelse { std.debug.print("{s}", .{usage}); return 2; };
+    add_floor_us = opts.add_floor_us;
     const timeout = opts.timeout_ms * std.time.ns_per_ms;
     var rt = try vk.Runtime.open();
     defer rt.close();
@@ -329,6 +338,16 @@ test "argument parser validates vendor and timeout options" {
     try std.testing.expect(parseArgs(&.{ "--timeout-ms", "600001" }) == null);
     try std.testing.expect(parseArgs(&.{"--wat"}) == null);
     try std.testing.expect(parseArgs(&.{ "/m", "/i" }) == null);
+}
+
+test "the add floor comes only from the command line and must be a positive finite number" {
+    try std.testing.expectEqual(@as(?f64, null), parseArgs(&.{}).?.add_floor_us);
+    try std.testing.expectEqual(@as(?f64, 5.127), parseArgs(&.{ "--add-floor-us", "5.127" }).?.add_floor_us);
+    try std.testing.expect(parseArgs(&.{ "--add-floor-us", "0" }) == null);
+    try std.testing.expect(parseArgs(&.{ "--add-floor-us", "-1" }) == null);
+    try std.testing.expect(parseArgs(&.{ "--add-floor-us", "nan" }) == null);
+    try std.testing.expect(parseArgs(&.{ "--add-floor-us", "inf" }) == null);
+    try std.testing.expect(parseArgs(&.{"--add-floor-us"}) == null);
 }
 
 test "stats use nearest-rank and slopes subtract the empty-batch floor" {
