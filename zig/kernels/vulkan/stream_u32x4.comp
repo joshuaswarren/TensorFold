@@ -1,0 +1,69 @@
+#version 460
+
+// Private bandwidth-ceiling probe image (tf-bw-ceiling): uvec4 streams, 16 B
+// per invocation, grid-stride over push-constant-bounded words. Integer-only
+// by design — no float arithmetic anywhere, so no denormal or NaN behaviour
+// can differ between device and host.
+//   -DSTREAM_COPY   dst[i] = src[i]                       (read + write)
+//   -DSTREAM_READ   xor-reduce src into one word per workgroup (read-only;
+//                   the per-group store keeps the compiler from dropping loads)
+//   -DSTREAM_WRITE  dst[i] = pattern(i)                   (write-only)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer StreamIn {
+  uvec4 values[];
+} stream_in;
+
+#if defined(STREAM_READ)
+layout(set = 0, binding = 1, std430) writeonly buffer StreamOut {
+  uint words[];
+} stream_out;
+#else
+layout(set = 0, binding = 1, std430) writeonly buffer StreamOut {
+  uvec4 values[];
+} stream_out;
+#endif
+
+layout(push_constant) uniform Params {
+  uint count_words;  // u32 words this dispatch covers; a multiple of 4
+} params;
+
+#if !defined(STREAM_COPY) && !defined(STREAM_READ) && !defined(STREAM_WRITE)
+#error "define STREAM_COPY, STREAM_READ or STREAM_WRITE"
+#endif
+
+shared uint lane_xor[256];
+
+// The host mirror of this function is bw_ceiling_probe.zig writePattern; a
+// change here and there must land in the same commit.
+uvec4 pattern(uint i) {
+  return uvec4(i, ~i, i ^ 0xA5A5A5A5u, i * 7u + 3u);
+}
+
+void main() {
+  const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+  const uint vec_count = params.count_words / 4u;
+#if defined(STREAM_COPY)
+  for (uint i = gl_GlobalInvocationID.x; i < vec_count; i += stride) {
+    stream_out.values[i] = stream_in.values[i];
+  }
+#elif defined(STREAM_WRITE)
+  for (uint i = gl_GlobalInvocationID.x; i < vec_count; i += stride) {
+    stream_out.values[i] = pattern(i);
+  }
+#else
+  uint acc = 0u;
+  for (uint i = gl_GlobalInvocationID.x; i < vec_count; i += stride) {
+    uvec4 v = stream_in.values[i];
+    acc ^= v.x ^ v.y ^ v.z ^ v.w;
+  }
+  lane_xor[gl_LocalInvocationID.x] = acc;
+  barrier();
+  for (uint span = gl_WorkGroupSize.x / 2u; span >= 1u; span >>= 1) {
+    if (gl_LocalInvocationID.x < span) lane_xor[gl_LocalInvocationID.x] ^= lane_xor[gl_LocalInvocationID.x + span];
+    barrier();
+  }
+  if (gl_LocalInvocationID.x == 0u) stream_out.words[gl_WorkGroupID.x] = lane_xor[0];
+#endif
+}

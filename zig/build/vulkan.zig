@@ -181,6 +181,48 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     }) });
     host.dependOn(&b.addRunArtifact(qmm_floor_host_tests).step);
 
+    // The bandwidth-ceiling probe: three stream_u32x4 variants (copy,
+    // xor-reduce, pattern write) measuring achievable streaming bandwidth and
+    // its dependence on GPU power state. Private probe; not a PR artifact.
+    const bw_images = [_]struct { name: []const u8, define: []const u8 }{
+        .{ .name = "stream_copy", .define = "-DSTREAM_COPY" },
+        .{ .name = "stream_read", .define = "-DSTREAM_READ" },
+        .{ .name = "stream_write", .define = "-DSTREAM_WRITE" },
+    };
+    const bw_files = b.addWriteFiles();
+    var bw_embed: std.ArrayListUnmanaged(u8) = .empty;
+    for (bw_images) |img| {
+        const cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp" });
+        cmd.addArg(img.define);
+        cmd.addArg("-o");
+        const spv = cmd.addOutputFileArg(b.fmt("{s}.spv", .{img.name}));
+        cmd.addFileArg(b.path("zig/kernels/vulkan/stream_u32x4.comp"));
+        _ = bw_files.addCopyFile(spv, b.fmt("{s}.spv", .{img.name}));
+        bw_embed.appendSlice(b.allocator, b.fmt("pub const {s} align(4) = @embedFile(\"{s}.spv\").*;\n", .{ img.name, img.name })) catch @panic("OOM");
+    }
+    const bw_shaders = b.createModule(.{ .root_source_file = bw_files.add("bw_shaders.zig", bw_embed.items) });
+    const bw_probe = b.addExecutable(.{ .name = "tf-bw-ceiling", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/bw_ceiling_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "vulkan", .module = vulkan },
+            .{ .name = "bw_shaders", .module = bw_shaders },
+        },
+    }) });
+    b.step("bw-ceiling-build", "Build zig-out/bin/tf-bw-ceiling and its SPIR-V without running GPU work").dependOn(&b.addInstallArtifact(bw_probe, .{}).step);
+    const bw_run = b.addRunArtifact(bw_probe);
+    bw_run.addPassthruArgs();
+    b.step("bw-ceiling-run", "Run the bandwidth-ceiling probe on the chosen device (args after --)").dependOn(&bw_run.step);
+    const bw_host_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/bw_ceiling_probe.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+        .imports = &.{.{ .name = "vulkan", .module = module(b, b.graph.host, .debug, o) }},
+    }) });
+    host.dependOn(&b.addRunArtifact(bw_host_tests).step);
+
 
     // Stage 1: the operator variants as SPIR-V assets, and the GPU probe from the fixture owner's root.
     const stage1_files = b.addWriteFiles();
