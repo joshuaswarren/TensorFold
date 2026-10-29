@@ -47,7 +47,35 @@ pub const Quant = struct {
     k: u64,
 };
 
-pub const DenseMlp = struct { gate: Quant, up: Quant, down: Quant };
+pub const DenseMlp = struct {
+    gate: Quant,
+    up: Quant,
+    down: Quant,
+    /// gate and up concatenated for the one-row decode pass.
+    gate_up: ?Group = null,
+};
+
+/// One fused decode group: the members' weight rows concatenated into three
+/// shared buffers (the member `Quant`s are views into them), so the decode
+/// path can run the group as one projection. `starts` are the members' first
+/// output rows in the fused output (element offsets for a one-row batch).
+pub const Group = struct {
+    fused: Quant,
+    starts: [vk.fuse.max_members]u64 = undefined,
+    n_members: u32 = 0,
+
+    /// Member i as a standalone Quant over its slice of the shared buffers.
+    pub fn member(g: *const Group, i: u32, rows: usize) Error!Quant {
+        const k = g.fused.k;
+        return .{
+            .w = try g.fused.w.slice(g.starts[i], rows * k / 8),
+            .scales = try g.fused.scales.slice(g.starts[i], rows * k / 64),
+            .biases = try g.fused.biases.slice(g.starts[i], rows * k / 64),
+            .n = rows,
+            .k = k,
+        };
+    }
+};
 
 /// A full-attention layer: Q4 projections and raw BF16 norms. `q` holds the
 /// interleaved query and output-gate rows (4096 rows for 8 query heads of
@@ -62,6 +90,9 @@ pub const FullLayer = struct {
     q_norm: View,
     k_norm: View,
     mlp: DenseMlp,
+    /// q, k and v of one layer concatenated for the one-row decode pass; the
+    /// member Quant views above point into the same buffers.
+    qkv: ?Group = null,
 };
 
 /// A linear (GatedDeltaNet) layer: everything as the checkpoint stores it.
@@ -82,6 +113,8 @@ pub const LinearLayer = struct {
     a_log: View,
     dt_bias: View,
     mlp: DenseMlp,
+    /// qkv, z, a and b concatenated for the one-row decode pass.
+    qkvzab: ?Group = null,
 };
 
 pub const Layer = union(enum) { full: FullLayer, linear: LinearLayer };
@@ -152,6 +185,8 @@ const Builder = struct {
     timeout_ns: u64,
     table: *const Table,
     keep: std.ArrayList(*Buffer) = .empty,
+    /// TF_VK_FUSE: concatenate the independent decode groups at load time.
+    fuse_groups: bool = false,
 
     fn deinit(b: *Builder) void {
         for (b.keep.items) |ptr| {
@@ -187,17 +222,8 @@ const Builder = struct {
         return t;
     }
 
-    /// A device buffer holding `t`'s bytes exactly, streamed through the
-    /// staging buffer; the returned view is typed and word-padded by `View`.
-    ///
-    /// Ownership transfers exactly once: until the slot is registered in
-    /// `keep`, this function alone cleans up (slot plus the Vk allocation) on
-    /// every failure; after registration only `Builder.deinit` frees it, so a
-    /// failed upload never double-frees or leaves a dangling slot.
-    fn tensor(b: *Builder, t: Tensor) !View {
-        const kind = kindOf(t.dtype) orelse return error.UnsupportedModel;
-        const elements: u64 = @intCast(t.numel());
-        const bytes: u64 = @intCast(t.bytes.len);
+    /// A heap-owned registered device buffer of `bytes`, not yet written.
+    fn device(b: *Builder, bytes: u64) !*Buffer {
         const ptr = try b.gpa.create(Buffer);
         ptr.* = Buffer.init(b.dev, .device, bytes) catch |e| {
             b.gpa.destroy(ptr);
@@ -209,6 +235,21 @@ const Builder = struct {
             b.gpa.destroy(ptr);
             return e;
         };
+        return ptr;
+    }
+
+    /// A device buffer holding `t`'s bytes exactly, streamed through the
+    /// staging buffer; the returned view is typed and word-padded by `View`.
+    ///
+    /// Ownership transfers exactly once: until the slot is registered in
+    /// `keep`, this function alone cleans up (slot plus the Vk allocation) on
+    /// every failure; after registration only `Builder.deinit` frees it, so a
+    /// failed upload never double-frees or leaves a dangling slot.
+    fn tensor(b: *Builder, t: Tensor) !View {
+        const kind = kindOf(t.dtype) orelse return error.UnsupportedModel;
+        const elements: u64 = @intCast(t.numel());
+        const bytes: u64 = @intCast(t.bytes.len);
+        const ptr = try b.device(bytes);
         // registered: in-flight failures exit the process here (orExit),
         // never unwinding into the frees below this load's scope
         try vk.orExit(vk.upload(b.cmds, ptr.*, 0, b.staging, t.bytes, b.timeout_ns));
@@ -232,6 +273,56 @@ const Builder = struct {
         return .{ .w = w, .scales = scales, .biases = biases, .n = n, .k = k };
     }
 
+    /// The members of one decode group as rows of three shared buffers, with
+    /// the pad rows the alignment plan asks for zeroed. Each member keeps a
+    /// full `Quant` (views into the shared buffers), so the prefill path and
+    /// the separate-dispatch fallback read the exact same bytes. The fused
+    /// whole rides alongside for the one-row pass. A group past the device's
+    /// range limits refuses here: the caller loads the members separately.
+    fn groupQuant(b: *Builder, spec: []const struct { name: []const u8, rows: usize }, k: usize) !Group {
+        const lim: vk.ops_q4.Limits = .{
+            .max_range = b.dev.properties.limits.maxStorageBufferRange,
+            .alignment = b.dev.properties.limits.minStorageBufferOffsetAlignment,
+        };
+        var rows: [vk.fuse.max_members]u64 = undefined;
+        for (spec, 0..) |m, i| rows[i] = m.rows;
+        const plan = try vk.fuse.planGroup(@intCast(k), rows[0..spec.len], lim);
+        const w_buf = try b.device(plan.w_bytes);
+        const s_buf = try b.device(plan.params_bytes);
+        const b_buf = try b.device(plan.params_bytes);
+        // the pad rows read as zero weights, zero scales, zero biases
+        try vk.orExit(vk.zero(b.cmds, w_buf.*, 0, plan.w_bytes, b.timeout_ns));
+        try vk.orExit(vk.zero(b.cmds, s_buf.*, 0, plan.params_bytes, b.timeout_ns));
+        try vk.orExit(vk.zero(b.cmds, b_buf.*, 0, plan.params_bytes, b.timeout_ns));
+        var g: Group = .{ .fused = undefined, .n_members = @intCast(spec.len) };
+        for (spec, 0..) |m, i| {
+            var kb: [192]u8 = undefined;
+            const w_name = try key(&kb, "{s}.weight", .{m.name});
+            const t_w = try b.named(w_name);
+            try expectTensor(w_name, t_w, .u32, &.{ m.rows, k / 8 });
+            try vk.orExit(vk.upload(b.cmds, w_buf.*, plan.members[i].start * (k / 2), b.staging, t_w.bytes, b.timeout_ns));
+            var kbs: [192]u8 = undefined;
+            const s_name = try key(&kbs, "{s}.scales", .{m.name});
+            const t_s = try b.named(s_name);
+            try expectTensor(s_name, t_s, .bf16, &.{ m.rows, k / 64 });
+            try vk.orExit(vk.upload(b.cmds, s_buf.*, plan.members[i].start * (k / 64) * 2, b.staging, t_s.bytes, b.timeout_ns));
+            var kbb: [192]u8 = undefined;
+            const b_name = try key(&kbb, "{s}.biases", .{m.name});
+            const t_b = try b.named(b_name);
+            try expectTensor(b_name, t_b, .bf16, &.{ m.rows, k / 64 });
+            try vk.orExit(vk.upload(b.cmds, b_buf.*, plan.members[i].start * (k / 64) * 2, b.staging, t_b.bytes, b.timeout_ns));
+            g.starts[i] = plan.members[i].start;
+        }
+        g.fused = .{
+            .w = try View.init(w_buf, .u32, 0, plan.total_rows * k / 8),
+            .scales = try View.init(s_buf, .bf16, 0, plan.total_rows * k / 64),
+            .biases = try View.init(b_buf, .bf16, 0, plan.total_rows * k / 64),
+            .n = plan.total_rows,
+            .k = k,
+        };
+        return g;
+    }
+
     /// A raw BF16 norm gain, passed through byte for byte (the Metal oracle's
     /// semantics: the kernel multiplies the gain directly, no `1 + w`).
     fn norm(b: *Builder, name: []const u8, elements: usize) !View {
@@ -240,10 +331,28 @@ const Builder = struct {
 
     fn mlp(b: *Builder, base: []const u8) !DenseMlp {
         var buf: [192]u8 = undefined;
+        var buf2: [192]u8 = undefined;
+        var buf3: [192]u8 = undefined;
+        const gate_name = try key(&buf, "{s}mlp.gate_proj", .{base});
+        const up_name = try key(&buf2, "{s}mlp.up_proj", .{base});
+        const down_name = try key(&buf3, "{s}mlp.down_proj", .{base});
+        if (b.fuse_groups) {
+            if (b.groupQuant(&.{ .{ .name = gate_name, .rows = pinned.intermediate }, .{ .name = up_name, .rows = pinned.intermediate } }, pinned.hidden)) |g| {
+                return .{
+                    .gate = try g.member(0, pinned.intermediate),
+                    .up = try g.member(1, pinned.intermediate),
+                    .down = try b.quant(down_name, pinned.hidden, pinned.intermediate),
+                    .gate_up = g,
+                };
+            } else |err| switch (err) {
+                error.TooLarge => {}, // the merged weight does not fit the device: separate members
+                else => return err,
+            }
+        }
         return .{
-            .gate = try b.quant(try key(&buf, "{s}mlp.gate_proj", .{base}), pinned.intermediate, pinned.hidden),
-            .up = try b.quant(try key(&buf, "{s}mlp.up_proj", .{base}), pinned.intermediate, pinned.hidden),
-            .down = try b.quant(try key(&buf, "{s}mlp.down_proj", .{base}), pinned.hidden, pinned.intermediate),
+            .gate = try b.quant(gate_name, pinned.intermediate, pinned.hidden),
+            .up = try b.quant(up_name, pinned.intermediate, pinned.hidden),
+            .down = try b.quant(down_name, pinned.hidden, pinned.intermediate),
         };
     }
 
@@ -255,33 +364,82 @@ const Builder = struct {
         const m = try b.mlp(base);
         if (pinned.linear(index)) {
             const lin = try key(&buf, "{s}linear_attn.", .{base});
-            return .{ .linear = .{
+            var l: LinearLayer = .{
                 .input_norm = input_norm,
                 .post_norm = post_norm,
-                .qkv = try b.quant(try key(&buf, "{s}in_proj_qkv", .{lin}), 3 * pinned.linear_heads * pinned.linear_dim, pinned.hidden),
-                .z = try b.quant(try key(&buf, "{s}in_proj_z", .{lin}), pinned.linear_heads * pinned.linear_dim, pinned.hidden),
-                .a = try b.quant(try key(&buf, "{s}in_proj_a", .{lin}), pinned.linear_heads, pinned.hidden),
-                .b = try b.quant(try key(&buf, "{s}in_proj_b", .{lin}), pinned.linear_heads, pinned.hidden),
+                .qkv = undefined,
+                .z = undefined,
+                .a = undefined,
+                .b = undefined,
                 .out = try b.quant(try key(&buf, "{s}out_proj", .{lin}), pinned.hidden, pinned.linear_heads * pinned.linear_dim),
                 .gnorm = try b.norm(try key(&buf, "{s}norm.weight", .{lin}), pinned.linear_dim),
                 .conv = try b.raw(try key(&buf, "{s}conv1d.weight", .{lin}), .bf16, &.{ pinned.conv_dim, pinned.conv_taps, 1 }),
                 .a_log = try b.raw(try key(&buf, "{s}A_log", .{lin}), .f32, &.{pinned.linear_heads}),
                 .dt_bias = try b.raw(try key(&buf, "{s}dt_bias", .{lin}), .bf16, &.{pinned.linear_heads}),
                 .mlp = m,
-            } };
+            };
+            var done = false;
+            if (b.fuse_groups) {
+                if (b.groupQuant(&.{
+                    .{ .name = try key(&buf, "{s}in_proj_qkv", .{lin}), .rows = 3 * pinned.linear_heads * pinned.linear_dim },
+                    .{ .name = try key(&buf, "{s}in_proj_z", .{lin}), .rows = pinned.linear_heads * pinned.linear_dim },
+                    .{ .name = try key(&buf, "{s}in_proj_a", .{lin}), .rows = pinned.linear_heads },
+                    .{ .name = try key(&buf, "{s}in_proj_b", .{lin}), .rows = pinned.linear_heads },
+                }, pinned.hidden)) |g| {
+                    l.qkv = try g.member(0, 3 * pinned.linear_heads * pinned.linear_dim);
+                    l.z = try g.member(1, pinned.linear_heads * pinned.linear_dim);
+                    l.a = try g.member(2, pinned.linear_heads);
+                    l.b = try g.member(3, pinned.linear_heads);
+                    l.qkvzab = g;
+                    done = true;
+                } else |err| switch (err) {
+                    error.TooLarge => {}, // the merged weight does not fit the device: separate members
+                    else => return err,
+                }
+            }
+            if (!done) {
+                l.qkv = try b.quant(try key(&buf, "{s}in_proj_qkv", .{lin}), 3 * pinned.linear_heads * pinned.linear_dim, pinned.hidden);
+                l.z = try b.quant(try key(&buf, "{s}in_proj_z", .{lin}), pinned.linear_heads * pinned.linear_dim, pinned.hidden);
+                l.a = try b.quant(try key(&buf, "{s}in_proj_a", .{lin}), pinned.linear_heads, pinned.hidden);
+                l.b = try b.quant(try key(&buf, "{s}in_proj_b", .{lin}), pinned.linear_heads, pinned.hidden);
+            }
+            return .{ .linear = l };
         }
         const attn = try key(&buf, "{s}self_attn.", .{base});
-        return .{ .full = .{
+        var f: FullLayer = .{
             .input_norm = input_norm,
             .post_norm = post_norm,
-            .q = try b.quant(try key(&buf, "{s}q_proj", .{attn}), 2 * pinned.query_heads * pinned.head_dim, pinned.hidden),
-            .k = try b.quant(try key(&buf, "{s}k_proj", .{attn}), pinned.kv_heads * pinned.head_dim, pinned.hidden),
-            .v = try b.quant(try key(&buf, "{s}v_proj", .{attn}), pinned.kv_heads * pinned.head_dim, pinned.hidden),
+            .q = undefined,
+            .k = undefined,
+            .v = undefined,
             .o = try b.quant(try key(&buf, "{s}o_proj", .{attn}), pinned.hidden, pinned.query_heads * pinned.head_dim),
             .q_norm = try b.norm(try key(&buf, "{s}q_norm.weight", .{attn}), pinned.head_dim),
             .k_norm = try b.norm(try key(&buf, "{s}k_norm.weight", .{attn}), pinned.head_dim),
             .mlp = m,
-        } };
+        };
+        var done = false;
+        if (b.fuse_groups) {
+            if (b.groupQuant(&.{
+                .{ .name = try key(&buf, "{s}q_proj", .{attn}), .rows = 2 * pinned.query_heads * pinned.head_dim },
+                .{ .name = try key(&buf, "{s}k_proj", .{attn}), .rows = pinned.kv_heads * pinned.head_dim },
+                .{ .name = try key(&buf, "{s}v_proj", .{attn}), .rows = pinned.kv_heads * pinned.head_dim },
+            }, pinned.hidden)) |g| {
+                f.q = try g.member(0, 2 * pinned.query_heads * pinned.head_dim);
+                f.k = try g.member(1, pinned.kv_heads * pinned.head_dim);
+                f.v = try g.member(2, pinned.kv_heads * pinned.head_dim);
+                f.qkv = g;
+                done = true;
+            } else |err| switch (err) {
+                error.TooLarge => {},
+                else => return err,
+            }
+        }
+        if (!done) {
+            f.q = try b.quant(try key(&buf, "{s}q_proj", .{attn}), 2 * pinned.query_heads * pinned.head_dim, pinned.hidden);
+            f.k = try b.quant(try key(&buf, "{s}k_proj", .{attn}), pinned.kv_heads * pinned.head_dim, pinned.hidden);
+            f.v = try b.quant(try key(&buf, "{s}v_proj", .{attn}), pinned.kv_heads * pinned.head_dim, pinned.hidden);
+        }
+        return .{ .full = f };
     }
 };
 
@@ -302,6 +460,8 @@ pub const Model = struct {
     /// assumed tie.
     head: ?Quant,
     layers: []Layer,
+    /// TF_VK_FUSE's load-time decision: the groups are laid out fused.
+    fuse_switch: bool,
 
     /// Loads the checkpoint directory `dir` onto `dev` through `cmds`.
     /// `staging` is the caller's staging buffer (any nonempty size; transfers
@@ -337,6 +497,9 @@ pub const Model = struct {
             .staging = staging,
             .timeout_ns = timeout_ns,
             .table = &ck.main,
+            // TF_VK_FUSE, read once: the concatenation decision is made here,
+            // when the weights are laid out. 0 loads exactly as today.
+            .fuse_groups = vk.fuse.fuseFromEnv(std.c.getenv("TF_VK_FUSE")),
         };
         defer b.deinit();
 
@@ -371,6 +534,7 @@ pub const Model = struct {
             .final_norm = final_norm,
             .head = head,
             .layers = owned_layers,
+            .fuse_switch = b.fuse_groups,
         };
     }
 
