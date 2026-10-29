@@ -171,6 +171,29 @@ pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: Vi
     }
 }
 
+/// Candidate C: the merged gate|up projection and the ASH swiglu in ONE
+/// dispatch of the -DFUSED_SWIGLU kernel: slots 0-1 compute gate rows
+/// 4w..4w+3, slots 2-3 the matching up rows of the merged weight, and the
+/// epilogue writes only the `act` activations (gate_rows elements). Refuses
+/// when the SG decode gate does not admit the merged shape; the caller then
+/// runs candidate B's path. The merged weight must already be laid out.
+pub fn projectSwiglu(o: *Ops, cmds: *Commands, act: tensor.View, x: tensor.View, fused_w: tensor.View, fused_scales: tensor.View, fused_biases: tensor.View, k: u64, timeout_ns: u64) Error!void {
+    const pipe = if (o.qmm_q4_sg_swiglu) |*sw| sw else return error.Invalid;
+    const g = try projectGeometry(act, x, fused_w, fused_scales, fused_biases, k);
+    const limits = o.dev.properties.limits;
+    const lim = Limits{ .max_range = limits.maxStorageBufferRange, .alignment = limits.minStorageBufferOffsetAlignment };
+    if (x.byteLen() > lim.max_range or act.byteLen() > lim.max_range) return error.TooLarge;
+    const rows = try chunkRows(lim, k, g.n);
+    if (rows != 0) return error.TooLarge; // the epilogue's one-workgroup mapping needs the whole weight
+    const gate_rows = g.n / 2;
+    if (act.elements != gate_rows) return error.Invalid; // the epilogue writes exactly the activations
+    if (!o.fuse_swiglu) return error.Invalid;
+    try pipe.bind(&.{ x.bind(), fused_w.bind(), fused_scales.bind(), fused_biases.bind(), act.bind() });
+    var p = try q4Push(g.m, g.n, k);
+    p.flags = pk_variant;
+    try pipe.run(cmds, std.mem.asBytes(&p), .{ try ops_mod.cast32(gate_rows / 4), 1, 1 }, timeout_ns);
+}
+
 /// Host-side token validation: every id must index a table row; call before the ids are uploaded.
 /// Device-side out-of-range ids gather to zero (the shader's documented read), never a wrong row.
 pub fn checkIds(ids: []const u32, rows: u64) Error!void {
