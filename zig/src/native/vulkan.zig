@@ -89,6 +89,7 @@ fn bundle() fam.engine.ShaderBundle {
             .cast_f32_bf16 = &sh.cast_f32_bf16,
             .copy_u32 = &sh.copy_u32,
             .copy_u16 = &sh.copy_u16,
+            .qmm_q4_sg = &sh.qmm_q4_sg,
         },
         .norm = .{
             .norm_bf16 = &sh.norm_bf16,

@@ -508,16 +508,11 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     inline for (variants, 0..) |variant, i| {
         _ = contract_files.addCopyFile(controls[i], variant[0] ++ ".spv");
     }
-<<<<<<< HEAD
-    const contract_shaders = b.createModule(.{ .root_source_file = contract_files.add("vulkan_contract_shaders.zig", "pub const qmm_bf16 align(4) = @embedFile(\"qmm_bf16.spv\").*;\n" ++
-=======
     _ = contract_files.addCopyFile(qmm_q4_pk, "qmm_q4_pk.spv");
     inline for (pk_variants, 0..) |variant, i| {
         _ = contract_files.addCopyFile(pk_controls[i], variant[0] ++ ".spv");
     }
-    const contract_shaders = b.createModule(.{ .root_source_file = contract_files.add("vulkan_contract_shaders.zig",
-        "pub const qmm_bf16 align(4) = @embedFile(\"qmm_bf16.spv\").*;\n" ++
->>>>>>> e7ac90cd (contract(vulkan): register the parallel-K projection over the engine's real calls)
+    const contract_shaders = b.createModule(.{ .root_source_file = contract_files.add("vulkan_contract_shaders.zig", "pub const qmm_bf16 align(4) = @embedFile(\"qmm_bf16.spv\").*;\n" ++
         "pub const qmm_fmax align(4) = @embedFile(\"qmm_fmax.spv\").*;\n" ++
         "pub const atomic_sum align(4) = @embedFile(\"atomic_sum.spv\").*;\n" ++
         "pub const scribble_sum align(4) = @embedFile(\"scribble_sum.spv\").*;\n" ++
@@ -693,7 +688,12 @@ pub fn serverModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
 }
 
 /// Every image the bundle embeds: the real stage arrays, concatenated; names are what the adapter's bundle() reads.
-const server_shader_images = shader_variants ++ stage2_variants ++ stage3_variants ++ stage4_variants[0 .. stage4_variants.len - 1] ++ stage5_variants;
+/// The decode SG qmv (unit 12) appended last so the bundle before it stays byte-identical; one module added at the end.
+const sg_decode_variants = [_]ShaderVariant{
+    .{ .name = "qmm_q4_sg", .src = "zig/kernels/vulkan/qmm_q4_sg.comp", .defines = &.{} },
+};
+
+const server_shader_images = shader_variants ++ stage2_variants ++ stage3_variants ++ stage4_variants[0 .. stage4_variants.len - 1] ++ stage5_variants ++ sg_decode_variants;
 
 /// The house core module the family loader's config/shard imports resolve through, built exactly as cuda.zig builds it.
 fn coreModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) *std.Build.Module {
