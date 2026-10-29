@@ -94,7 +94,7 @@ fn runCase(io: std.Io, cmds: *vk.Commands, staging: vk.Buffer, pipe: *dispatch.P
     out.* = qf.statsOf(&samples, &scratch).?; // fixed sizes: cannot fail
 }
 
-fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Commands, staging: vk.Buffer, pipes: []const *dispatch.Pipeline, n: usize, k: usize, timeout: u64, add_floor_us: ?f64) !bool {
+fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Commands, staging: vk.Buffer, pipes: []const *dispatch.Pipeline, n: usize, k: usize, timeout: u64, add_floor_us: ?f64, special: bool) !bool {
     const words_count = n * k / 8;
     const param_count = n * (k / 64);
     const x_bytes = k * @sizeOf(u16);
@@ -120,6 +120,17 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
     const allowances = try a.alloc(f64, n);
     defer a.free(allowances);
     qf.fillInputs(weights, scales, biases, x, 0x716d6d00 ^ @as(u64, n));
+    if (special) {
+        x[0] = 0x7FC0; // NaN
+        x[1] = 0x7F80; // +inf
+        x[2] = 0xFF80; // -inf
+        x[3] = 0x0000; // zero
+        scales[0] = 0x7F7F; // max-magnitude scale
+        scales[1] = 0x0000; // zero scale
+        biases[0] = 0xFF7F; // max-magnitude negative bias
+        @memset(weights[0..16], 0); // zero nibble rows
+        @memset(weights[100..116], 0xFFFF_FFFF); // all-15 nibbles
+    }
     const shape: c.Shape = .{ .rows = 1, .n = n, .k = k };
     const spec = checkSpec();
     for (0..n) |column| {
@@ -162,17 +173,19 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
     try vk.orExit(vk.download(cmds, out_buf, 0, staging, std.mem.sliceAsBytes(ref_out), timeout));
     var worst: f64 = 0;
     var failed: ?usize = null;
-    for (ref_out, 0..) |bits, column| {
-        const got = c.fromBf16(bits);
-        const ratio = if (got == want[column]) 0 else @abs(got - want[column]) / allowances[column];
-        worst = @max(worst, ratio);
-        if (!(ratio <= 1) and failed == null) failed = column;
+    if (!special) {
+        for (ref_out, 0..) |bits, column| {
+            const got = c.fromBf16(bits);
+            const ratio = if (got == want[column]) 0 else @abs(got - want[column]) / allowances[column];
+            worst = @max(worst, ratio);
+            if (!(ratio <= 1) and failed == null) failed = column;
+        }
+        if (failed) |column| {
+            std.debug.print("FAIL check: qmm_q4_pk R=1 n={d} k={d} output={d} got={e:.6} want={e:.6} bound-ratio={d:.3}\n", .{ n, k, column, c.fromBf16(ref_out[column]), want[column], worst });
+            return false;
+        }
     }
-    if (failed) |column| {
-        std.debug.print("FAIL check: qmm_q4_pk R=1 n={d} k={d} output={d} got={e:.6} want={e:.6} bound-ratio={d:.3}\n", .{ n, k, column, c.fromBf16(ref_out[column]), want[column], worst });
-        return false;
-    }
-    std.debug.print("MILESTONE checks-passed R=1 n={d} k={d} outputs={d} worst={d:.3} of pk-contract bound\n", .{ n, k, n, worst });
+    std.debug.print("MILESTONE checks-passed R=1 n={d} k={d} outputs={d} worst={d:.3} of pk-contract bound{s}\n", .{ n, k, n, worst, if (special) " (bound check skipped: special inputs)" else "" });
 
     // ---- bit-exact gate: every R variant's full output equals R=1's, word for word
     for (variants[1..], 1..) |r, vi| {
@@ -228,6 +241,16 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
     const timeout = opts.timeout_ms * std.time.ns_per_ms;
+    // PREFLIGHT ONLY, NOT A RESULT: this throwaway build admits a CPU (lavapipe)
+    // device under BW_PREFLIGHT_CPU, divides the served shape sizes by
+    // BW_PREFLIGHT_SCALE, and plants non-finite/extreme inputs under
+    // BW_PREFLIGHT_SPECIAL. None of the knobs exists in the real branch.
+    var scale: u64 = 1;
+    if (std.c.getenv("BW_PREFLIGHT_SCALE")) |v| scale = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 1;
+    if (scale == 0) scale = 1;
+    const preflight_cpu = std.c.getenv("BW_PREFLIGHT_CPU") != null;
+    const special = std.c.getenv("BW_PREFLIGHT_SPECIAL") != null;
+    std.debug.print("PREFLIGHT ONLY, NOT A RESULT: cpu-allowed={} scale={d} special={}\n", .{ preflight_cpu, scale, special });
     var rt = try vk.Runtime.open();
     defer rt.close();
     var dev = try vk.Device.open(&rt, .{});
@@ -235,7 +258,7 @@ pub fn main(init: std.process.Init) !u8 {
     const pr = dev.properties;
     const name = std.mem.sliceTo(&pr.deviceName, 0);
     std.debug.print("MILESTONE device-found name=\"{s}\" vendor=0x{x:0>4} device=0x{x:0>4} timeout={d}ms\n", .{ name, pr.vendorID, pr.deviceID, opts.timeout_ms });
-    if (pr.deviceType == vk.c.VK_PHYSICAL_DEVICE_TYPE_CPU) {
+    if (pr.deviceType == vk.c.VK_PHYSICAL_DEVICE_TYPE_CPU and !preflight_cpu) {
         std.debug.print("FAIL device: a CPU (software) Vulkan device is never a GPU result\n", .{});
         return 1;
     }
@@ -269,8 +292,9 @@ pub fn main(init: std.process.Init) !u8 {
     if (!plan.head_fits) std.debug.print("SKIP served head n=248320 k=2048: packed Q4 weights exceed maxStorageBufferRange={d}; using largest listed fallback n={d} k={d}\n", .{ pr.limits.maxStorageBufferRange, plan.shapes[2][0], plan.shapes[2][1] });
     var completed: usize = 0;
     for (plan.shapes) |shape| {
-        std.debug.print("MILESTONE case n={d} k={d} weight-bytes-per-dispatch={d}\n", .{ shape[0], shape[1], qf.weightBytesFor(shape[0], shape[1]) });
-        if (!try runShape(io, a, &dev, &cmds, staging, &pipes, shape[0], shape[1], timeout, opts.add_floor_us)) return 1;
+        const n_scaled = shape[0] / scale;
+        std.debug.print("MILESTONE case n={d} k={d} weight-bytes-per-dispatch={d}\n", .{ n_scaled, shape[1], qf.weightBytesFor(n_scaled, shape[1]) });
+        if (!try runShape(io, a, &dev, &cmds, staging, &pipes, n_scaled, shape[1], timeout, opts.add_floor_us, special)) return 1;
         completed += 1;
     }
     std.debug.print("RESULT qmm-multi on \"{s}\": cases={d} ok\n", .{ name, completed });
