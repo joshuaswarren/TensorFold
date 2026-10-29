@@ -192,6 +192,43 @@ pub fn sampleCount(batch_bytes: u64) usize {
     return @intCast(@min(63, @max(15, budget | 1)));
 }
 
+/// The binding pair for the probe's {binding 0 in, binding 1 out} layout,
+/// lengths taken from the buffers. Pure and host-tested: the first device run
+/// wired the self-checks to the sweep's big pair and burned a device slot on
+/// a guaranteed FAIL; the checks must bind the check buffers.
+fn bindPair(a: *const vk.Buffer, b: *const vk.Buffer) [2]dispatch.Binding {
+    return .{ .{ .buffer = a, .len = a.len }, .{ .buffer = b, .len = b.len } };
+}
+
+/// The first differing byte of two same-length byte slices, with the u32
+/// words got/want assembled little-endian at that offset (clamped at the end
+/// of the slice). Null when equal. Pure and host-tested: every FAIL check
+/// line carries it so a device failure names the byte.
+fn firstDiff(a: []const u8, b: []const u8) ?struct { offset: usize, got: u32, want: u32 } {
+    if (a.len != b.len) return .{ .offset = 0, .got = wordAt(a, 0), .want = wordAt(b, 0) };
+    for (a, b, 0..) |x, y, i| if (x != y) return .{ .offset = i, .got = wordAt(a, i), .want = wordAt(b, i) };
+    return null;
+}
+
+fn wordAt(bytes: []const u8, at: usize) u32 {
+    var w: u32 = 0;
+    for (0..4) |k| {
+        const idx = @min(at + k, bytes.len - 1);
+        w |= @as(u32, bytes[idx]) << @intCast(8 * k);
+    }
+    return w;
+}
+
+/// The FAIL line for a byte-exact check: names the first differing byte and
+/// the u32 words got/want there, so a device failure names the byte.
+fn printCheckFail(comptime what: []const u8, got: []const u8, want: []const u8) void {
+    if (firstDiff(got, want)) |d| {
+        std.debug.print("FAIL check: " ++ what ++ "; first differing byte at {d}: got=0x{x:0>8} want=0x{x:0>8}\n", .{ d.offset, d.got, d.want });
+    } else {
+        std.debug.print("FAIL check: " ++ what ++ "; byte slices compare equal (aggregate mismatch)\n", .{});
+    }
+}
+
 fn us(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1000.0;
 }
@@ -294,7 +331,8 @@ fn runSweep(
         const bytes_moved = bytes_moved_of * size;
         std.debug.print("MILESTONE sweep {s} {d:.0} MiB: N=0 floor then dependent N=1/4/{d}, {d:.0} MiB moved per dispatch\n", .{ label, mib(size), chosen[chosen.len - 1], mib(bytes_moved) });
         var u = unit;
-        if (u == .shader) u.shader.push = std.mem.asBytes(&Push{ .count_words = @intCast(size / 4) })[0..@sizeOf(Push)];
+        const push = Push{ .count_words = @intCast(size / 4) };
+        if (u == .shader) u.shader.push = std.mem.asBytes(&push)[0..@sizeOf(Push)];
         var s0: Stats = undefined;
         try runCase(io, cmds, staging, u, size, 0, sample_count, timeout, &s0);
         printStats(0, s0);
@@ -450,8 +488,12 @@ pub fn main(init: std.process.Init) !u8 {
     const write_unit: Unit = .{ .shader = .{ .pipes = &write_pipes, .binds = &write_binds, .push = &[_]u8{}, .groups = groups } };
     const driver_unit: Unit = .{ .driver = .{ .src = src, .dst = dst } };
 
-    // ---- (0) byte-exact self-check on a 1 MiB buffer, before any timing
+    // ---- (0) byte-exact self-check on a 1 MiB buffer, before any timing.
+    // The checks bind the CHECK buffers (bindPair), never the sweep pair —
+    // wiring them to the big src/dst burned a device slot on fb60a8f1.
     const check_words: u32 = check_bytes / 4;
+    const check_in_out = bindPair(&check_src, &check_dst); // copy and write
+    const check_read = bindPair(&check_src, &red);
     const small = try a.alloc(u32, check_words);
     defer a.free(small);
     const want_bytes = try a.alloc(u8, check_bytes);
@@ -466,23 +508,24 @@ pub fn main(init: std.process.Init) !u8 {
     const check_push = Push{ .count_words = check_words };
     const check_push_bytes = std.mem.asBytes(&check_push)[0..@sizeOf(Push)];
     try vk.orExit(zeroBuf(&cmds, check_dst, timeout));
-    try copy_pipe.bind(&copy_binds);
+    try copy_pipe.bind(&check_in_out);
     try vk.orExit(copy_pipe.run(&cmds, check_push_bytes, groups, timeout));
     try vk.orExit(vk.download(&cmds, check_dst, 0, staging, got_bytes, timeout));
     if (!std.mem.eql(u8, got_bytes, std.mem.sliceAsBytes(small))) {
-        std.debug.print("FAIL check: STREAM_COPY output differs from its source on the {d} KiB check buffer\n", .{check_bytes >> 10});
+        printCheckFail("STREAM_COPY output differs from its source on the {d} KiB check buffer", got_bytes, std.mem.sliceAsBytes(small));
         return 1;
     }
 
-    try read_pipe.bind(&read_binds);
+    try vk.orExit(zeroBuf(&cmds, red, timeout)); // the read check sees only what STREAM_READ writes
+    try read_pipe.bind(&check_read);
     try vk.orExit(read_pipe.run(&cmds, check_push_bytes, groups, timeout));
     try vk.orExit(vk.download(&cmds, red, 0, staging, std.mem.sliceAsBytes(red_got), timeout));
     if (xorWords(red_got) != xorWords(small)) {
-        std.debug.print("FAIL check: STREAM_READ xor does not match the host fold on the {d} KiB check buffer\n", .{check_bytes >> 10});
+        printCheckFail("STREAM_READ xor does not match the host fold on the {d} KiB check buffer", std.mem.sliceAsBytes(red_got), std.mem.sliceAsBytes(small));
         return 1;
     }
 
-    try write_pipe.bind(&write_binds);
+    try write_pipe.bind(&check_in_out);
     try vk.orExit(write_pipe.run(&cmds, check_push_bytes, groups, timeout));
     try vk.orExit(vk.download(&cmds, check_dst, 0, staging, got_bytes, timeout));
     {
@@ -493,7 +536,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     if (!std.mem.eql(u8, got_bytes, want_bytes)) {
-        std.debug.print("FAIL check: STREAM_WRITE output differs from the host pattern on the {d} KiB check buffer\n", .{check_bytes >> 10});
+        printCheckFail("STREAM_WRITE output differs from the host pattern on the {d} KiB check buffer", got_bytes, want_bytes);
         return 1;
     }
     std.debug.print("MILESTONE checks-passed copy/read/write byte-exact on {d} KiB; timing begins\n", .{check_bytes >> 10});
@@ -501,7 +544,8 @@ pub fn main(init: std.process.Init) !u8 {
     // ---- (1) cold-to-warm ramp: the first timed GPU work after the checks
     const ramp_bytes = ramp_dep * 2 * big;
     var ramp_unit = copy_unit;
-    ramp_unit.shader.push = std.mem.asBytes(&Push{ .count_words = @intCast(big / 4) })[0..@sizeOf(Push)];
+    const ramp_push = Push{ .count_words = @intCast(big / 4) };
+    ramp_unit.shader.push = std.mem.asBytes(&ramp_push)[0..@sizeOf(Push)];
     std.debug.print("MILESTONE ramp-start: {d} batches x {d} dependent {d:.0} MiB copies ({d:.2} GiB per batch), cold-to-warm\n", .{ ramp_batches, ramp_dep, mib(big), mib(ramp_bytes) / 1024.0 });
     var ramp_ns: [ramp_batches]u64 = undefined;
     for (0..ramp_batches) |b| {
@@ -627,6 +671,36 @@ test "planSweep enables sizes within the binding limits and sizes the allocation
     const tiny = planSweep(64 << 20, 64 << 20);
     try testing.expect(tiny.len < big_bytes); // the caller must refuse: the ramp cannot run
     try testing.expect(!tiny.stream[2] and !tiny.stream[3]);
+}
+
+test "check bindings reference the check buffers, never the sweep pair" {
+    var check_src: vk.Buffer = undefined;
+    var check_dst: vk.Buffer = undefined;
+    var red: vk.Buffer = undefined;
+    var big_src: vk.Buffer = undefined;
+    var big_dst: vk.Buffer = undefined;
+    const in_out = bindPair(&check_src, &check_dst); // the copy and write checks
+    try testing.expectEqual(&check_src, in_out[0].buffer);
+    try testing.expectEqual(&check_dst, in_out[1].buffer);
+    const read = bindPair(&check_src, &red); // the read check: xor words land in red
+    try testing.expectEqual(&check_src, read[0].buffer);
+    try testing.expectEqual(&red, read[1].buffer);
+    const sweep = bindPair(&big_src, &big_dst);
+    try testing.expect(sweep[0].buffer != in_out[0].buffer);
+    try testing.expect(sweep[1].buffer != in_out[1].buffer);
+}
+
+test "firstDiff names the first differing byte with got/want words" {
+    try testing.expect(firstDiff(&.{ 1, 2, 3 }, &.{ 1, 2, 3 }) == null);
+    try testing.expect(firstDiff(&.{}, &.{}) == null);
+    const d = firstDiff(&.{ 0xaa, 0xbb, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 }, &.{ 0xaa, 0xbb, 0x04, 0x02, 0x03, 0x04, 0x05, 0x06 }).?;
+    try testing.expectEqual(@as(usize, 2), d.offset);
+    try testing.expectEqual(@as(u32, 0x0403_0201), d.got); // little-endian word at offset 2
+    try testing.expectEqual(@as(u32, 0x0403_0204), d.want);
+    const tail = firstDiff(&.{ 0, 0, 0, 0, 9 }, &.{ 0, 0, 0, 0, 7 }).?; // near the end: the word clamps
+    try testing.expectEqual(@as(usize, 4), tail.offset);
+    try testing.expectEqual(@as(u32, 0x0909_0909), tail.got);
+    try testing.expectEqual(@as(u32, 0x0707_0707), tail.want);
 }
 
 test "sampleCount shrinks with batch cost inside [15, 63], always odd" {
