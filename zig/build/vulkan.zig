@@ -145,6 +145,45 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     run.addPassthruArgs();
     b.step("vulkan-probe", "Run the Vulkan qmm probe on the chosen GPU (args after --)").dependOn(&run.step);
 
+    // The dispatch-floor probe: the per-dispatch cost floor of a decode-token
+    // batch. Two SPIR-V images: binary_vec.comp's default bf16 add (stage 2's
+    // add_bf16 form, no defines) and copy_general.comp -DUSE_U16 (bit-exact
+    // bf16-width copy), same glslang wiring as the stage builds.
+    const floor_files = b.addWriteFiles();
+    const floor_add_cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-o" });
+    const floor_add = floor_add_cmd.addOutputFileArg("floor_add_bf16.spv");
+    floor_add_cmd.addFileArg(b.path("zig/kernels/vulkan/binary_vec.comp"));
+    const floor_copy_cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-DUSE_U16", "-o" });
+    const floor_copy = floor_copy_cmd.addOutputFileArg("floor_copy_u16.spv");
+    floor_copy_cmd.addFileArg(b.path("zig/kernels/vulkan/copy_general.comp"));
+    _ = floor_files.addCopyFile(floor_add, "floor_add_bf16.spv");
+    _ = floor_files.addCopyFile(floor_copy, "floor_copy_u16.spv");
+    const floor_shaders = b.createModule(.{ .root_source_file = floor_files.add("floor_shaders.zig",
+        "pub const add_bf16 align(4) = @embedFile(\"floor_add_bf16.spv\").*;\n" ++
+        "pub const copy_u16 align(4) = @embedFile(\"floor_copy_u16.spv\").*;\n") });
+    const floor_probe = b.addExecutable(.{ .name = "tf-dispatch-floor", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/dispatch_floor_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "vulkan", .module = vulkan },
+            .{ .name = "floor_shaders", .module = floor_shaders },
+        },
+    }) });
+    b.step("dispatch-floor-build", "Build zig-out/bin/tf-dispatch-floor and its SPIR-V without running GPU work").dependOn(&b.addInstallArtifact(floor_probe, .{}).step);
+    const floor_run = b.addRunArtifact(floor_probe);
+    floor_run.addPassthruArgs();
+    b.step("dispatch-floor-run", "Run the dispatch-floor probe on the chosen device (args after --)").dependOn(&floor_run.step);
+    // The probe's pure host half rides vulkan-host-test: parser, statistics, slopes, no GPU work.
+    const floor_host_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/dispatch_floor_probe.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+        .imports = &.{.{ .name = "vulkan", .module = module(b, b.graph.host, .debug, o) }},
+    }) });
+    host.dependOn(&b.addRunArtifact(floor_host_tests).step);
+
 
     // Stage 1: the operator variants as SPIR-V assets, and the GPU probe from the fixture owner's root.
     const stage1_files = b.addWriteFiles();
