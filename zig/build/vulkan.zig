@@ -233,6 +233,63 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     } });
     host.dependOn(&b.addRunArtifact(ablate_host_tests).step);
 
+    // The candidate probe: C1 (pipelined loads, must be bit-identical to A0),
+    // C2 (pack-level compensation, gated on the recomputed pack-comp depth)
+    // and C3 (C1 on top of C2), against A0 plus the A1/A3 reference rows.
+    const cand_files = b.addWriteFiles();
+    _ = cand_files.addCopyFile(qmm_floor_spv, "qmm_q4_pk.spv");
+    var cand_embed: std.ArrayListUnmanaged(u8) = .empty;
+    cand_embed.appendSlice(b.allocator, "pub const qmm_q4_pk align(4) = @embedFile(\"qmm_q4_pk.spv\").*;\n") catch @panic("OOM");
+    inline for (.{ "c1", "c2", "c3" }) |cv| {
+        const cand_cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-o" });
+        const cand_spv = cand_cmd.addOutputFileArg(b.fmt("qmm_cand_{s}.spv", .{cv}));
+        cand_cmd.addFileArg(b.path(b.fmt("zig/kernels/vulkan/qmm_cand_{s}.comp", .{cv})));
+        _ = cand_files.addCopyFile(cand_spv, b.fmt("qmm_cand_{s}.spv", .{cv}));
+        cand_embed.appendSlice(b.allocator, b.fmt("pub const qmm_cand_{s} align(4) = @embedFile(\"qmm_cand_{s}.spv\").*;\n", .{ cv, cv })) catch @panic("OOM");
+    }
+    // the A1/A3 reference rows ride the ablation images this branch already compiles
+    inline for (.{ "a1", "a3" }) |av| {
+        const cand_ref_cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-o" });
+        const cand_ref_spv = cand_ref_cmd.addOutputFileArg(b.fmt("qmm_ablate_{s}.spv", .{av}));
+        cand_ref_cmd.addFileArg(b.path(b.fmt("zig/kernels/vulkan/qmm_ablate_{s}.comp", .{av})));
+        _ = cand_files.addCopyFile(cand_ref_spv, b.fmt("qmm_ablate_{s}.spv", .{av}));
+        cand_embed.appendSlice(b.allocator, b.fmt("pub const qmm_ablate_{s} align(4) = @embedFile(\"qmm_ablate_{s}.spv\").*;\n", .{ av, av })) catch @panic("OOM");
+    }
+    const cand_shaders = b.createModule(.{ .root_source_file = cand_files.add("qmm_cand_shaders.zig", cand_embed.items) });
+    // one contract instance shared by the probe and the qf helpers: a file may live in one module only
+    const cand_contract = @import("kernel_contract.zig").module(b, target, .debug);
+    const cand_qf = b.createModule(.{ .root_source_file = b.path("zig/tests/vulkan/qmm_floor_probe.zig"), .imports = &.{.{ .name = "contract", .module = cand_contract }} });
+    const cand_probe = b.addExecutable(.{ .name = "tf-qmm-cand", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/qmm_cand_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "vulkan", .module = vulkan },
+            .{ .name = "contract", .module = cand_contract },
+            .{ .name = "qf", .module = cand_qf },
+            .{ .name = "cand_shaders", .module = cand_shaders },
+        },
+    }) });
+    b.step("qmm-cand-build", "Build zig-out/bin/tf-qmm-cand and its SPIR-V without running GPU work").dependOn(&b.addInstallArtifact(cand_probe, .{}).step);
+    const cand_run = b.addRunArtifact(cand_probe);
+    cand_run.addPassthruArgs();
+    b.step("qmm-cand-run", "Run the qmm candidate probe on the chosen device (args after --)").dependOn(&cand_run.step);
+    const cand_host_tests = b.addTest(.{ .root_module = blk: {
+        const cand_host_contract = @import("kernel_contract.zig").module(b, b.graph.host, .debug);
+        break :blk b.createModule(.{
+            .root_source_file = b.path("zig/tests/vulkan/qmm_cand_probe.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+            .imports = &.{
+                .{ .name = "vulkan", .module = module(b, b.graph.host, .debug, o) },
+                .{ .name = "contract", .module = cand_host_contract },
+                .{ .name = "qf", .module = b.createModule(.{ .root_source_file = b.path("zig/tests/vulkan/qmm_floor_probe.zig"), .imports = &.{.{ .name = "contract", .module = cand_host_contract }} }) },
+            },
+        });
+    } });
+    host.dependOn(&b.addRunArtifact(cand_host_tests).step);
+
     // The multi-output re-batching probe: qmm_q4_pk_r.comp at R=2/4/8 carries R
     // outputs through the same per-output arithmetic with shared barriers;
     // tf-qmm-multi proves each variant bit-exact against R=1 before timing it.
