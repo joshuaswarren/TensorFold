@@ -99,31 +99,35 @@ pub fn nibbleAt(words: []const u32, element: usize) u32 {
     return (words[element / 8] >> @intCast((element % 8) * 4)) & 0xf;
 }
 
-/// Fill packed Q4 words and normal-range bf16 scales/biases; x is the required row of ones.
+/// Fill packed Q4 words, normal-range bf16 scales/biases and a signed random activation row (standard normal, bf16;
+/// a row of ones hid every difference that involves x).
 pub fn fillInputs(words: []u32, scales: []u16, biases: []u16, x: []u16, seed: u64) void {
     var prng = std.Random.DefaultPrng.init(seed);
     const rng = prng.random();
     for (words) |*word| word.* = rng.int(u32);
     for (scales) |*s| s.* = bf16RneBits(rng.float(f32) * 0.02 + 0.001);
     for (biases) |*b| b.* = bf16RneBits((rng.float(f32) - 0.66) * 0.15);
-    @memset(x, 0x3f80);
+    for (x) |*v| {
+        var f = rng.floatNorm(f32);
+        if (@abs(f) < 0.01) f = if (f < 0) -0.01 else 0.01; // keep every value a normal bf16
+        v.* = bf16RneBits(f);
+    }
 }
 
-/// The pk contract's dequantized f64 reference and term magnitude for x=1.
-pub fn referenceOne(words: []const u32, scales: []const u16, biases: []const u16, k: usize, column: usize) [2]f64 {
+/// The pk contract's dequantized f64 reference and term magnitude for the activation row x.
+pub fn referenceOne(words: []const u32, scales: []const u16, biases: []const u16, x: []const u16, k: usize, column: usize) [2]f64 {
     const groups = k / 64;
     var want: f64 = 0;
     var magnitude: f64 = 0;
     for (0..groups) |group| {
         const scale = bf16ToF64(scales[column * groups + group]);
         const bias = bf16ToF64(biases[column * groups + group]);
-        var sum_q: f64 = 0;
         for (0..64) |offset| {
             const q: f64 = @floatFromInt(nibbleAt(words, column * k + group * 64 + offset));
-            want += scale * q + bias;
-            sum_q += q;
+            const xv = bf16ToF64(x[group * 64 + offset]);
+            want += xv * (scale * q + bias);
+            magnitude += @abs(xv) * (@abs(scale) * q + @abs(bias));
         }
-        magnitude += @abs(scale) * sum_q + @abs(bias) * 64;
     }
     return .{ want, magnitude };
 }
@@ -376,13 +380,22 @@ test "stats use nearest-rank and slopes subtract the empty-batch floor" {
     try std.testing.expectEqual(@as(f64, 8), effectiveGbps(8, 1));
 }
 
-test "input encoding uses packed Q4 and normal bf16 values with a unit activation" {
+test "input encoding uses packed Q4, normal bf16 weights and a signed random activation row" {
     var words: [32]u32 = undefined;
     var scales: [16]u16 = undefined;
     var biases: [16]u16 = undefined;
     var x: [64]u16 = undefined;
     fillInputs(&words, &scales, &biases, &x, 0x716d6d00);
-    for (x) |v| try std.testing.expectEqual(@as(u16, 0x3f80), v);
+    // not a row of ones: every value a normal bf16, signs and magnitudes vary (the row of ones hid every x-dependent difference)
+    var distinct: usize = 0;
+    var negatives: usize = 0;
+    for (x, 0..) |v, i| {
+        try std.testing.expect(v & 0x7f80 != 0);
+        if (i > 0 and v != x[0]) distinct += 1;
+        if (v & 0x8000 != 0) negatives += 1;
+    }
+    try std.testing.expect(distinct > 32);
+    try std.testing.expect(negatives > 8 and negatives < 56);
     for (scales ++ biases) |v| try std.testing.expect(v & 0x7f80 != 0);
     for (0..256) |i| try std.testing.expect(nibbleAt(&words, i) <= 15);
     try std.testing.expectEqual(@as(u16, 0x3f80), bf16RneBits(1));
@@ -407,7 +420,7 @@ test "the f64 reference matches the contract affine helper and uses the pk bound
     var magnitude: [3]f64 = undefined;
     try affine.reference(&expected, &magnitude);
     for (0..3) |column| {
-        const ref = referenceOne(&words, &scales, &biases, 128, column);
+        const ref = referenceOne(&words, &scales, &biases, &x, 128, column);
         try std.testing.expectEqual(expected[column], ref[0]);
         try std.testing.expectEqual(magnitude[column], ref[1]);
         const allowance = c.bound(checkSpec(), shape, ref[0], ref[1]);

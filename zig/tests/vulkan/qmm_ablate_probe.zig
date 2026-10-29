@@ -166,7 +166,7 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
     const spec_b1 = ablateSpec("qmm-ablate B1 128-lane compensated", &depth128);
     const spec_b2 = ablateSpec("qmm-ablate B2 256-lane compensated", &depth256);
     for (0..n) |column| {
-        const ref = qf.referenceOne(weights, scales, biases, k, column);
+        const ref = qf.referenceOne(weights, scales, biases, x, k, column);
         want[column] = ref[0];
         magnitude[column] = ref[1];
         allowances[column] = c.bound(spec_a0, shape, ref[0], ref[1]);

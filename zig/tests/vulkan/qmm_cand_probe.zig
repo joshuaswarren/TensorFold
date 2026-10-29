@@ -167,7 +167,7 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
     const spec_a0 = qf.pkSpec();
     const spec_pack = candSpec("qmm-cand pack-compensated");
     for (0..n) |column| {
-        const ref = qf.referenceOne(weights, scales, biases, k, column);
+        const ref = qf.referenceOne(weights, scales, biases, x, k, column);
         want[column] = ref[0];
         magnitude[column] = ref[1];
         allowances[column] = c.bound(spec_a0, shape, ref[0], ref[1]);
