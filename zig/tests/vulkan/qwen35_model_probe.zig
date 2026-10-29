@@ -30,7 +30,7 @@
 //! cross-backend byte identity is not required and not claimed.
 //!
 //! Shader images come from the build-generated "qwen35_shaders" module: the
-//! stage-variant decl names of every field of engine.ShaderBundle (8 stage-1
+//! stage-variant decl names of every field of engine.ShaderBundle (9 stage-1
 //! op variants, 4 norm/MLP, 3 attention, 7 GDN, 3 greedy). The build wires
 //! the module and the executable; this file owns no lab paths, ids or
 //! checkpoint hashes.
@@ -243,13 +243,14 @@ fn readOracleMeta(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, oracle_dir:
 }
 
 /// The exact production bundle: the build-generated qwen35_shaders SPIR-V
-/// image for every field of engine.ShaderBundle (8 stage-1 ops, 4 norm/MLP,
+/// image for every field of engine.ShaderBundle (9 stage-1 ops, 4 norm/MLP,
 /// 3 attention, 7 GDN, 3 greedy), shared by the probe run and the opt-in
 /// load test so both exercise the shader set the server serves with.
 fn bundle() engine_mod.ShaderBundle {
     return .{
         .ops = .{
             .qmm_bf16 = &q35s.qmm_bf16,
+            .qmm_q4_pk = &q35s.qmm_q4_pk,
             .dequant_bf16 = &q35s.dequant_bf16,
             .gather_u32 = &q35s.gather_u32,
             .gather_u16 = &q35s.gather_u16,
