@@ -257,15 +257,18 @@ pub fn main(init: std.process.Init) !u8 {
     var dummy = try vk.Buffer.init(&dev, .device, 256); // copy's never-read bindings 1 and 3
     defer dummy.deinit();
 
-    // Host inputs: exact-integer bf16 adds (the RNE round is exact below 256),
+    // Host inputs: exact-integer bf16 adds (every bf16 here is a normal number and the RNE round is exact below 256),
     // pseudo-random bytes for the copy.
     var add_a: [add_elements]u16 = undefined;
     var add_b: [add_elements]u16 = undefined;
     var add_want: [add_elements]u16 = undefined;
     for (&add_a, &add_b, &add_want, 0..) |*x, *y, *w, i| {
-        x.* = @intCast(i % 61);
-        y.* = @intCast((i * 7) % 23 + 1);
-        w.* = bf16RneBits(@as(f32, @floatFromInt(x.*)) + @as(f32, @floatFromInt(y.*)));
+        const xv: f32 = @floatFromInt(i % 61);
+        const yv: f32 = @floatFromInt((i * 7) % 23 + 1);
+        // bf16 BITS of the integers; raw 0..60 would be bf16 subnormals, which the device flushes.
+        x.* = bf16RneBits(xv);
+        y.* = bf16RneBits(yv);
+        w.* = bf16RneBits(xv + yv);
     }
     const copy_want = try a.alloc(u8, copy_bytes);
     defer a.free(copy_want);
@@ -413,4 +416,15 @@ test "effectiveGbps is bytes per nanosecond and bf16RneBits matches the shader f
     try testing.expectEqual(@as(u16, 0x4241), bf16RneBits(48.25)); // representable: identity
     try testing.expectEqual(@as(u16, 0x4240), bf16RneBits(48.125)); // tie: even kept mantissa rounds down
     try testing.expectEqual(@as(u16, 0x4242), bf16RneBits(48.375)); // tie: odd kept mantissa rounds up
+}
+
+test "the add inputs are normal bf16 values, not raw small integers" {
+    // The first probe wrote i % 61 as raw bits (bf16 subnormals) and failed its own check on a device that flushes denormals.
+    var i: u32 = 1;
+    while (i < 61) : (i += 1) {
+        const bits = bf16RneBits(@floatFromInt(i));
+        try std.testing.expect((bits & 0x7f80) != 0); // exponent nonzero: normal
+        const back: f32 = @bitCast(@as(u32, bits) << 16);
+        try std.testing.expectEqual(@as(f32, @floatFromInt(i)), back);
+    }
 }
