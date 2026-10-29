@@ -88,6 +88,7 @@ fn probe(a: std.mem.Allocator, clock: Elapsed, vendor: ?u32, timeout: u64) !bool
     defer staging.deinit();
     const sh = vk.ops.Shaders{
         .qmm_bf16 = &shaders.qmm_bf16,
+        .qmm_q4_pk = &shaders.qmm_q4_pk,
         .dequant_bf16 = &shaders.dequant_bf16,
         .gather_u32 = &shaders.gather_u32,
         .gather_u16 = &shaders.gather_u16,
@@ -125,6 +126,10 @@ fn probe(a: std.mem.Allocator, clock: Elapsed, vendor: ?u32, timeout: u64) !bool
         total += 1;
         passed += @intFromBool(try projectGate(a, clock, &dev, &cmds, staging, &o, &scratch, case, 0x57a6 + n, timeout));
     }
+    total += 1;
+    passed += @intFromBool(try qmmPkGate(a, clock, &dev, &cmds, staging, &o, &scratch, timeout));
+    total += 1;
+    passed += @intFromBool(try qmmPkCoverageGate(a, clock, &dev, &cmds, staging, &o, &scratch, timeout));
     std.debug.print("RESULT stage1 elapsed_ms={d} on \"{s}\": passed={d} total={d}\n", .{ clock.ms(), name, passed, total });
     return passed == total;
 }
@@ -456,8 +461,202 @@ fn projectGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds
     return true;
 }
 
-const Poisoned16 = struct { buf: vk.Buffer };
+/// Production shapes on random Q4 data: project() (the qmm_q4_pk parallel-K kernel) and a
+/// direct serial qmm_bf16 dispatch over the SAME bindings, each checked against the fixture's
+/// independent f64 reference under the unchanged contract budget. One up-projection decode
+/// shape and one down-projection 32-row prefill shape.
+fn qmmPkGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, o: *vk.ops.Ops, scratch: *vk.arena.Arena, timeout: u64) !bool {
+    const shapes = [_]fx.Case{
+        .{ .name = "pk vs serial up decode m1 n6144 k2048", .shape = .{ .rows = 1, .n = 6144, .k = 2048 } },
+        .{ .name = "pk vs serial down prefill m32 n2048 k6144", .shape = .{ .rows = 32, .n = 2048, .k = 6144 } },
+    };
+    for (shapes) |case| {
+        const f = try fx.Fixture.init(a, case, 0x70a1);
+        defer f.deinit();
+        var x_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(f.x), timeout);
+        defer x_buf.deinit();
+        var w_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(f.w), timeout);
+        defer w_buf.deinit();
+        var s_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(f.scales), timeout);
+        defer s_buf.deinit();
+        var b_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(f.biases), timeout);
+        defer b_buf.deinit();
+        var serial_buf = try poisoned16Buf(a, dev, cmds, staging, f.out.len, timeout);
+        defer serial_buf.deinit();
+        var pk_buf = try poisoned16Buf(a, dev, cmds, staging, f.out.len, timeout);
+        defer pk_buf.deinit();
+        const x_view = try vk.tensor.View.init(&x_buf, .bf16, f.case.at.x * 2, f.q.x.len);
+        const w_view = try vk.tensor.View.init(&w_buf, .u32, f.case.at.w * 4, f.w.len - f.case.at.w - fx.tail);
+        const s_view = try vk.tensor.View.init(&s_buf, .bf16, f.case.at.scales * 2, f.q.scales.len);
+        const b_view = try vk.tensor.View.init(&b_buf, .bf16, f.case.at.biases * 2, f.q.biases.len);
+        const serial_view = try vk.tensor.View.init(&serial_buf.buf, .bf16, f.case.at.out * 2, f.want.len);
+        const pk_view = try vk.tensor.View.init(&pk_buf.buf, .bf16, f.case.at.out * 2, f.want.len);
+        // Serial: the qmm_bf16 pipeline exactly as project() drove it before the parallel-K kernel.
+        var p: vk.params.Params = .{
+            .count = try vk.ops.cast32(case.shape.rows * case.shape.n),
+            .operation = 4,
+            .reduce_size = 64,
+            .matrix_m = try vk.ops.cast32(case.shape.rows),
+            .matrix_n = try vk.ops.cast32(case.shape.n),
+            .matrix_k = try vk.ops.cast32(case.shape.k),
+            .shape = .{ 1, 0, 0, 0 },
+        };
+        try o.qmm_bf16.bind(&.{ x_view.bind(), w_view.bind(), s_view.bind(), b_view.bind(), serial_view.bind() });
+        try vk.orExit(o.qmm_bf16.run(cmds, std.mem.asBytes(&p), vk.ops.dispatchGroups(p.count, o.qmm_bf16.local[0]), timeout));
+        try vk.orExit(vk.ops_q4.project(o, cmds, pk_view, x_view, w_view, s_view, b_view, case.shape.k, scratch, timeout));
+        const serial_bits = try a.alloc(u16, f.out.len);
+        defer a.free(serial_bits);
+        try fetch(cmds, staging, serial_buf.buf, std.mem.sliceAsBytes(serial_bits), timeout);
+        const rs = f.check(serial_bits) catch |e| {
+            const m = f.measure(serial_bits);
+            std.debug.print("FAIL {s}: serial qmm {s}; worst {d:.3} of bound at row {d} col {d}\n", .{ case.name, @errorName(e), m.worst, m.row, m.col });
+            return false;
+        };
+        const pk_bits = try a.alloc(u16, f.out.len);
+        defer a.free(pk_bits);
+        try fetch(cmds, staging, pk_buf.buf, std.mem.sliceAsBytes(pk_bits), timeout);
+        const rp = f.check(pk_bits) catch |e| {
+            const m = f.measure(pk_bits);
+            std.debug.print("FAIL {s}: parallel-K {s}; worst {d:.3} of bound at row {d} col {d}\n", .{ case.name, @errorName(e), m.worst, m.row, m.col });
+            return false;
+        };
+        std.debug.print("MILESTONE qmm-pk elapsed_ms={d} case=\"{s}\": serial worst {d:.4}, parallel-K worst {d:.4} of the unchanged bound\n", .{ clock.ms(), case.name, rs.worst, rp.worst });
+    }
+    return true;
+}
 
+/// N coverage for the parallel-K kernel: one workgroup with idle tail lanes, an in-group
+/// output tail, M 1 and 32, K 2048 and 6144, a multi-workgroup N, and the head's 248320 —
+/// every fixture-checked case through project() so the real routing, chunking and scatter
+/// run. The head is streamed (packed from per-column code streams, no codes array) and its
+/// f64 reference lands on a spread sample of columns; every column is still computed.
+fn qmmPkCoverageGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, probe_staging: vk.Buffer, o: *vk.ops.Ops, scratch: *vk.arena.Arena, timeout: u64) !bool {
+    _ = probe_staging; // the head's 254 MB of weights through the probe's 64 KiB staging would
+    // be thousands of fence-bounded chunks; this gate streams through its own 8 MiB buffer.
+    var staging = try vk.Buffer.init(dev, .staging, 8 << 20);
+    defer staging.deinit();
+    const cases = [_]fx.Case{
+        .{ .name = "pk coverage m1 n16 k2048", .shape = .{ .rows = 1, .n = 16, .k = 2048 } },
+        .{ .name = "pk coverage m3 n16 k2048", .shape = .{ .rows = 3, .n = 16, .k = 2048 } },
+        .{ .name = "pk coverage m32 n16 k6144", .shape = .{ .rows = 32, .n = 16, .k = 6144 } },
+        .{ .name = "pk coverage m1 n65536 k2048", .shape = .{ .rows = 1, .n = 65536, .k = 2048 } },
+        .{ .name = "pk coverage m32 n2048 k2048", .shape = .{ .rows = 32, .n = 2048, .k = 2048 } },
+    };
+    for (cases) |case| {
+        const f = try fx.Fixture.init(a, case, 0x6ea7);
+        defer f.deinit();
+        var x_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(f.x), timeout);
+        defer x_buf.deinit();
+        var w_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(f.w), timeout);
+        defer w_buf.deinit();
+        var s_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(f.scales), timeout);
+        defer s_buf.deinit();
+        var b_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(f.biases), timeout);
+        defer b_buf.deinit();
+        var out = try poisoned16Buf(a, dev, cmds, staging, f.out.len, timeout);
+        defer out.buf.deinit();
+        const x_view = try vk.tensor.View.init(&x_buf, .bf16, f.case.at.x * 2, f.q.x.len);
+        const w_view = try vk.tensor.View.init(&w_buf, .u32, f.case.at.w * 4, f.w.len - f.case.at.w - fx.tail);
+        const s_view = try vk.tensor.View.init(&s_buf, .bf16, f.case.at.scales * 2, f.q.scales.len);
+        const b_view = try vk.tensor.View.init(&b_buf, .bf16, f.case.at.biases * 2, f.q.biases.len);
+        const out_view = try vk.tensor.View.init(&out.buf, .bf16, f.case.at.out * 2, f.want.len);
+        try vk.orExit(vk.ops_q4.project(o, cmds, out_view, x_view, w_view, s_view, b_view, case.shape.k, scratch, timeout));
+        const bits = try a.alloc(u16, f.out.len);
+        defer a.free(bits);
+        try fetch(cmds, staging, out.buf, std.mem.sliceAsBytes(bits), timeout);
+        const r = f.check(bits) catch |e| {
+            const m = f.measure(bits);
+            std.debug.print("FAIL {s}: {s}; worst {d:.3} of bound at row {d} col {d}\n", .{ case.name, @errorName(e), m.worst, m.row, m.col });
+            return false;
+        };
+        std.debug.print("MILESTONE qmm-pk-coverage elapsed_ms={d} case=\"{s}\" worst={d:.4} of bound\n", .{ clock.ms(), case.name, r.worst });
+    }
+    // The head, m1 n248320 k2048: streamed weights, the f64 reference on a spread sample.
+    const k: usize = 2048;
+    const n: usize = 248320;
+    const packs = k / 8;
+    const groups = k / 64;
+    var prng = std.Random.DefaultPrng.init(0x11ce);
+    const rng = prng.random();
+    const x_bits = try a.alloc(u16, k);
+    defer a.free(x_bits);
+    for (x_bits, 0..) |*v, i| v.* = if (i % 29 == 0) 0 else cx.toBf16(rng.float(f32) * 4 - 2);
+    const s_bits = try a.alloc(u16, n * groups);
+    defer a.free(s_bits);
+    const b_bits = try a.alloc(u16, n * groups);
+    defer a.free(b_bits);
+    for (s_bits) |*v| v.* = cx.toBf16(rng.float(f32) * 0.02 + 0.001);
+    for (b_bits) |*v| v.* = cx.toBf16((rng.float(f32) - 0.66) * 0.15);
+    const w_bits = try a.alloc(u32, n * packs);
+    defer a.free(w_bits);
+    for (0..n) |j| {
+        var cprng = std.Random.DefaultPrng.init(0x51ce ^ @as(u64, j));
+        const crng = cprng.random();
+        for (w_bits[j * packs ..][0..packs]) |*word| {
+            var acc: u32 = 0;
+            for (0..8) |e| acc |= crng.uintLessThan(u32, 16) << @as(u5, @intCast(4 * e));
+            word.* = acc;
+        }
+    }
+    const out_host = try a.alloc(u16, n + fx.tail);
+    defer a.free(out_host);
+    @memset(out_host, fx.poison16);
+    var x_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(x_bits), timeout);
+    defer x_buf.deinit();
+    var w_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(w_bits), timeout);
+    defer w_buf.deinit();
+    var s_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(s_bits), timeout);
+    defer s_buf.deinit();
+    var b_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(b_bits), timeout);
+    defer b_buf.deinit();
+    var out_buf = try uploaded(a, dev, cmds, staging, std.mem.sliceAsBytes(out_host), timeout);
+    defer out_buf.deinit();
+    const x_view = try vk.tensor.View.init(&x_buf, .bf16, 0, k);
+    const w_view = try vk.tensor.View.init(&w_buf, .u32, 0, n * packs);
+    const s_view = try vk.tensor.View.init(&s_buf, .bf16, 0, n * groups);
+    const b_view = try vk.tensor.View.init(&b_buf, .bf16, 0, n * groups);
+    const out_view = try vk.tensor.View.init(&out_buf, .bf16, 0, n);
+    try vk.orExit(vk.ops_q4.project(o, cmds, out_view, x_view, w_view, s_view, b_view, k, scratch, timeout));
+    try fetch(cmds, staging, out_buf, std.mem.sliceAsBytes(out_host), timeout);
+    for (out_host[n..]) |g| if (g != fx.poison16) {
+        std.debug.print("FAIL pk coverage m1 n248320 k2048: guard tail clobbered\n", .{});
+        return false;
+    };
+    var worst: f64 = 0;
+    const samples = 64;
+    for (0..samples) |t| {
+        const j = t * (n / samples);
+        var want: f64 = 0;
+        var mag: f64 = 0;
+        for (w_bits[j * packs ..][0..packs], 0..) |word, p| {
+            const s: f64 = cx.fromBf16(s_bits[j * groups + p / 8]);
+            const b: f64 = cx.fromBf16(b_bits[j * groups + p / 8]);
+            for (0..8) |e| {
+                const qv: f64 = @floatFromInt((word >> @as(u5, @intCast(4 * e))) & 0xF);
+                const term = @as(f64, cx.fromBf16(x_bits[p * 8 + e])) * (s * qv + b);
+                want += term;
+                mag += @abs(term);
+            }
+        }
+        const got: f64 = cx.fromBf16(out_host[j]);
+        const bound = cx.bound(fx.spec, .{ .rows = 1, .n = n, .k = k }, want, mag);
+        const dist = @abs(got - want);
+        if (!std.math.isFinite(bound) or bound <= 0 or !(dist <= bound)) {
+            std.debug.print("FAIL pk coverage m1 n248320 k2048: column {d} out of bound: got {e} want {e} bound {e}\n", .{ j, got, want, bound });
+            return false;
+        }
+        worst = @max(worst, dist / bound);
+    }
+    std.debug.print("MILESTONE qmm-pk-coverage elapsed_ms={d} case=\"pk coverage m1 n248320 k2048\" worst={d:.4} of bound over {d} sampled columns\n", .{ clock.ms(), worst, samples });
+    return true;
+}
+
+const Poisoned16 = struct {
+    buf: vk.Buffer,
+    fn deinit(self: *Poisoned16) void {
+        self.buf.deinit();
+    }
+};
 fn poisoned16Buf(a: std.mem.Allocator, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, elems: usize, timeout: u64) !Poisoned16 {
     var out: Poisoned16 = .{ .buf = try vk.Buffer.init(dev, .device, (elems + fx.tail) * 2) };
     errdefer out.buf.deinit();
