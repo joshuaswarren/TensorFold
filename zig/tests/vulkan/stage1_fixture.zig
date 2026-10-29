@@ -257,6 +257,37 @@ pub const Fixture = struct {
     }
 };
 
+/// The qmm_q4_pk kernel's exact host association for output (r, j): lane l sums the row's
+/// packs l, l+64, ... in f32 (ascending element order within a pack, the qmm.comp expression),
+/// then the shared-memory tree folds the 64 partials at strides 32, 16, 8, 4, 2, 1; returns
+/// the bf16 bits lane 0 stores. Reads the fixture's uploaded bindings at their offsets, so a
+/// row's value depends only on that row's x and its column's w, never on the batch's m.
+pub fn pkOutput(f: Fixture, r: usize, j: usize) u16 {
+    const s = f.case.shape;
+    var tree: [64]f32 = @splat(0);
+    for (0..64) |lane| {
+        var partial: f32 = 0;
+        var pack: usize = lane;
+        while (pack < s.k / 8) : (pack += 64) {
+            const g = pack / 8;
+            const scale: f32 = c.fromBf16(f.scales[f.case.at.scales + j * (s.k / 64) + g]);
+            const bias: f32 = c.fromBf16(f.biases[f.case.at.biases + j * (s.k / 64) + g]);
+            const word = f.w[f.case.at.w + j * (s.k / 8) + pack];
+            for (0..8) |e| {
+                const q: f32 = @floatFromInt((word >> @as(u5, @intCast(4 * e))) & 0xF);
+                const x: f32 = c.fromBf16(f.x[f.case.at.x + r * s.k + pack * 8 + e]);
+                partial += x * (scale * q + bias);
+            }
+        }
+        tree[lane] = partial;
+    }
+    var stride: usize = 32;
+    while (stride > 0) : (stride /= 2) for (0..stride) |i| {
+        tree[i] += tree[i + stride];
+    };
+    return c.toBf16(tree[0]);
+}
+
 fn poisoned16(a: std.mem.Allocator, base: usize, len: usize) ![]u16 {
     const buf = try a.alloc(u16, base + len + tail);
     @memset(buf, poison16);
@@ -358,5 +389,44 @@ test "q4 fixture: reference-rounded outputs meet the contract bound, including t
         for (f.want, 0..) |w, i| got[f.case.at.out + i] = c.toBf16(@floatCast(w));
         const r = try f.check(got);
         try testing.expect(r.worst <= 1);
+    }
+}
+
+test "q4 fixture: the pk tree reference meets the contract bound on every case" {
+    for (cases, 0..) |case, seed| {
+        var f = try Fixture.init(testing.allocator, case, 0x57a6 + seed);
+        defer f.deinit();
+        const got = try testing.allocator.dupe(u16, f.out);
+        defer testing.allocator.free(got);
+        for (0..f.case.shape.rows) |r| for (0..f.case.shape.n) |j| {
+            got[f.case.at.out + r * f.case.shape.n + j] = pkOutput(f, r, j);
+        };
+        const rep = try f.check(got);
+        try testing.expect(rep.worst <= 1);
+    }
+}
+
+test "q4 fixture: the pk tree reference meets the contract bound at production K 2048 and 6144" {
+    for ([_]usize{ 2048, 6144 }) |k| for ([_]usize{ 1, 32 }) |rows| {
+        var f = try Fixture.init(testing.allocator, .{ .name = "pk production", .shape = .{ .rows = rows, .n = 6, .k = k } }, 0xbeef);
+        defer f.deinit();
+        const got = try testing.allocator.dupe(u16, f.out);
+        defer testing.allocator.free(got);
+        for (0..rows) |r| for (0..6) |j| {
+            got[r * 6 + j] = pkOutput(f, r, j);
+        };
+        const rep = try f.check(got);
+        try testing.expect(rep.worst <= 1);
+    };
+}
+
+test "q4 fixture: a row's pk tree output alone is bit-identical to its output in a batch" {
+    for ([_]usize{ 2048, 6144 }) |k| {
+        const n = 6;
+        var alone = try Fixture.init(testing.allocator, .{ .name = "alone", .shape = .{ .rows = 1, .n = n, .k = k } }, 0x9e37);
+        defer alone.deinit();
+        var batch = try Fixture.init(testing.allocator, .{ .name = "batch", .shape = .{ .rows = 32, .n = n, .k = k } }, 0x9e37);
+        defer batch.deinit();
+        for (0..n) |j| try testing.expectEqual(pkOutput(alone, 0, j), pkOutput(batch, 0, j));
     }
 }
