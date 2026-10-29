@@ -53,6 +53,14 @@ pub fn packDepth(s: c.Shape) usize {
 
 pub const WordDiff = struct { index: usize, got: u16, want: u16 };
 
+/// bf16 NaN: exponent all ones, mantissa nonzero. Pure and host-tested: C1's
+/// bit-exact gate treats NaN-vs-NaN payload differences separately, because
+/// the sign of an invalid-op NaN (inf + -inf, 0 * inf) is not pinned by the
+/// source's `precise` order.
+pub fn isNan16(bits: u16) bool {
+    return (bits & 0x7f80) == 0x7f80 and (bits & 0x7f) != 0;
+}
+
 /// The first differing output word of two same-length bf16-word slices, with
 /// both words. Null when equal. Pure and host-tested: C1's bit-exact gate's
 /// FAIL line names the index and both words.
@@ -217,11 +225,30 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
         try vk.orExit(pipes[gate.vi].run(cmds, push_bytes, groups_vec, timeout));
         try vk.orExit(vk.download(cmds, out16_buf, 0, staging, std.mem.sliceAsBytes(c_out), timeout));
         if (gate.vi == 1) {
-            if (firstDiff16(c_out, ref_out)) |d| {
+            // Bit-exact vs A0, NaN payloads treated separately: the sign of an
+            // invalid-op NaN (inf + -inf, 0 * inf) is not pinned by the
+            // source's precise order, so a NaN-vs-NaN payload difference is
+            // counted and reported, while any finite-word difference is fatal.
+            var nan_diff: usize = 0;
+            var fatal: ?WordDiff = null;
+            var base: usize = 0;
+            while (firstDiff16(c_out[base..], ref_out[base..])) |d| {
+                const idx = base + d.index;
+                if (isNan16(d.got) and isNan16(d.want)) {
+                    nan_diff += 1;
+                    base = idx + 1;
+                } else {
+                    fatal = .{ .index = idx, .got = d.got, .want = d.want };
+                    break;
+                }
+            }
+            if (fatal) |d| {
                 std.debug.print("FAIL check: {s} output differs from A0 at index {d}: got=0x{x:0>4} want=0x{x:0>4}\n", .{ gate.label, d.index, d.got, d.want });
                 return false;
             }
-            std.debug.print("MILESTONE bit-exact {s} vs A0: {d} outputs equal\n", .{ gate.label, n });
+            var nan_buf: [64]u8 = undefined;
+            const nan_note = if (nan_diff > 0) std.fmt.bufPrint(&nan_buf, "; {d} NaN payload signs differ (not pinned by precise; all finite outputs identical)", .{nan_diff}) catch "" else "";
+            std.debug.print("MILESTONE bit-exact {s} vs A0: {d} outputs equal{s}\n", .{ gate.label, n, nan_note });
         } else {
             var worst: f64 = 0;
             var failed: ?usize = null;
@@ -358,6 +385,17 @@ test "packCompDepth counts 8 roundings a pack plus tree, final and slack" {
     try testing.expectEqual(@as(usize, 113), try packCompDepth(64, 6144));
     // the named spec depth agrees with the shape-typed contract function
     try testing.expectEqual(@as(usize, 49), packDepth(.{ .rows = 1, .n = 8, .k = 2048 }));
+}
+
+test "isNan16 classifies bf16 NaNs only" {
+    try testing.expect(!isNan16(0x0000)); // +0
+    try testing.expect(!isNan16(0x8000)); // -0
+    try testing.expect(!isNan16(0x3f80)); // 1.0
+    try testing.expect(!isNan16(0x7f80)); // +inf
+    try testing.expect(!isNan16(0xff80)); // -inf
+    try testing.expect(isNan16(0x7fc0)); // quiet NaN
+    try testing.expect(isNan16(0xffc0)); // NaN, sign set
+    try testing.expect(isNan16(0x7f81)); // signalling NaN
 }
 
 test "firstDiff16 names the first differing word or null when equal" {
