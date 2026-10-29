@@ -184,6 +184,9 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     // The bandwidth-ceiling probe: three stream_u32x4 variants (copy,
     // xor-reduce, pattern write) measuring achievable streaming bandwidth and
     // its dependence on GPU power state. Private probe; not a PR artifact.
+    const bw_opts = b.addOptions();
+    bw_opts.addOption([]const u8, "glslang", glslang);
+    bw_opts.addOption([]const u8, "comp", "zig/kernels/vulkan/stream_u32x4.comp");
     const bw_images = [_]struct { name: []const u8, define: []const u8 }{
         .{ .name = "stream_copy", .define = "-DSTREAM_COPY" },
         .{ .name = "stream_read", .define = "-DSTREAM_READ" },
@@ -210,6 +213,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .imports = &.{
             .{ .name = "vulkan", .module = vulkan },
             .{ .name = "bw_shaders", .module = bw_shaders },
+            .{ .name = "bw_build_opts", .module = bw_opts.createModule() },
         },
     }) });
     b.step("bw-ceiling-build", "Build zig-out/bin/tf-bw-ceiling and its SPIR-V without running GPU work").dependOn(&b.addInstallArtifact(bw_probe, .{}).step);
@@ -220,9 +224,16 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .root_source_file = b.path("zig/tests/vulkan/bw_ceiling_probe.zig"),
         .target = b.graph.host,
         .optimize = .debug,
-        .imports = &.{.{ .name = "vulkan", .module = module(b, b.graph.host, .debug, o) }},
+        .imports = &.{
+            .{ .name = "vulkan", .module = module(b, b.graph.host, .debug, o) },
+            .{ .name = "bw_build_opts", .module = bw_opts.createModule() },
+        },
     }) });
-    host.dependOn(&b.addRunArtifact(bw_host_tests).step);
+    // The probe's guard test spawns glslang at run time; this input makes any
+    // stream_u32x4.comp edit rerun it instead of replaying a cached pass.
+    const bw_host_tests_run = b.addRunArtifact(bw_host_tests);
+    bw_host_tests_run.addFileInput(b.path("zig/kernels/vulkan/stream_u32x4.comp"));
+    host.dependOn(&bw_host_tests_run.step);
 
 
     // Stage 1: the operator variants as SPIR-V assets, and the GPU probe from the fixture owner's root.

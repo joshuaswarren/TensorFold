@@ -74,6 +74,9 @@ void main() {
     uvec4 v = stream_in.values[i];
     acc ^= v.x ^ v.y ^ v.z ^ v.w;
   }
+#endif
+#if defined(STREAM_READ) || defined(STREAM_READ_WIDE)
+  // the per-group store keeps the compiler from dropping the loads of BOTH read variants
   lane_xor[gl_LocalInvocationID.x] = acc;
   barrier();
   for (uint span = gl_WorkGroupSize.x / 2u; span >= 1u; span >>= 1) {

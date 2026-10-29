@@ -45,6 +45,7 @@
 const std = @import("std");
 const vk = @import("vulkan");
 const shaders = @import("bw_shaders");
+const bw_opts = @import("bw_build_opts");
 const c = vk.c;
 const dispatch = vk.dispatch;
 
@@ -710,6 +711,34 @@ test "firstDiff names the first differing byte with got/want words" {
 /// here and there must land in the same commit.
 pub fn wideVecIndex(lane: u32, step: u32, stride: u32) u32 {
     return (lane + step * stride) * 4;
+}
+
+/// The per-group store that keeps the compiler from dropping the read loads.
+/// Both read variants must preprocess to exactly one store line; copy and write to zero.
+const read_store_needle = "stream_out.words[gl_WorkGroupID.x]";
+
+test "each stream variant preprocesses with the read store iff it is a read variant" {
+    // Guards against an arm restructure silently compiling a read variant
+    // without its reduce/store tail (which drops the loads and yields 0).
+    const cases = [_]struct { define: []const u8, read: bool }{
+        .{ .define = "STREAM_COPY", .read = false },
+        .{ .define = "STREAM_READ", .read = true },
+        .{ .define = "STREAM_READ_WIDE", .read = true },
+        .{ .define = "STREAM_WRITE", .read = false },
+    };
+    const a = std.testing.allocator;
+    inline for (cases) |v| {
+        const argv = [_][]const u8{
+            bw_opts.glslang,          "-E", "-S", "comp",
+            "-D" ++ v.define,         bw_opts.comp,
+        };
+        const run = try std.process.run(a, std.testing.io, .{ .argv = &argv, .stdout_limit = .limited(1 << 20), .stderr_limit = .limited(1 << 20) });
+        defer a.free(run.stdout);
+        defer a.free(run.stderr);
+        try testing.expectEqual(@as(u8, 0), run.term.exited);
+        const store_lines = std.mem.count(u8, run.stdout, read_store_needle);
+        try testing.expectEqual(@as(usize, if (v.read) 1 else 0), store_lines);
+    }
 }
 
 test "wide read covers each uvec4 quad exactly once" {
