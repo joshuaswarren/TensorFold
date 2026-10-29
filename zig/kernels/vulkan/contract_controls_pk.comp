@@ -136,13 +136,10 @@ void main() {
 #else
         if (compensated) {
           precise float t = partial + term;
-          // the shipped kernel's guard: a non-finite sum keeps its class and skips the error term
-          if (!isnan(t) && !isinf(t)) {
-            if (abs(partial) >= abs(term)) {
-              comp += (partial - t) + term;
-            } else {
-              comp += (term - t) + partial;
-            }
+          if (abs(partial) >= abs(term)) {
+            comp += (partial - t) + term;
+          } else {
+            comp += (term - t) + partial;
           }
           partial = t;
         } else {
@@ -165,13 +162,10 @@ void main() {
           precise float a = tree[lane];
           precise float b2 = tree[lane + stride];
           precise float sum = a + b2;
-          // the shipped kernel's guard: a non-finite node keeps its class and skips the error
-          if (!isnan(sum) && !isinf(sum)) {
-            precise float bb = sum - a;
-            precise float err = (a - (sum - bb)) + (b2 - bb);
-            tree_lo[lane] = tree_lo[lane] + tree_lo[lane + stride] + err;
-          }
+          precise float bb = sum - a;
+          precise float err = (a - (sum - bb)) + (b2 - bb);
           tree[lane] = sum;
+          tree_lo[lane] = tree_lo[lane] + tree_lo[lane + stride] + err;
         } else {
           tree[lane] += tree[lane + stride];
         }
@@ -179,7 +173,13 @@ void main() {
       barrier();
     }
     if (lane == 0u) {
-      float total_sum = compensated ? tree[0] + tree_lo[0] : tree[0];
+      // the shipped kernel's class fix, once per output at the high+low combine: a non-finite
+      // high keeps its class, a finite high always has a finite chain beneath it, so the else
+      // operand is exactly the frozen expression
+      float total_sum = tree[0];
+      if (compensated) {
+        total_sum = (isnan(tree[0]) || isinf(tree[0])) ? tree[0] : tree[0] + tree_lo[0];
+      }
       output_data.values[index] = bf16_store(total_sum);
     }
     barrier(); // orders this iteration's reads before the next grid-stride iteration's writes

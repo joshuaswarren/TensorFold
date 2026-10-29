@@ -431,9 +431,10 @@ test "q4 fixture: a row's pk tree output alone is bit-identical to its output in
     }
 }
 
-/// The kernel's compensated lane sums and TwoSum tree, with the error term either always taken
-/// (the frozen form) or skipped once the running sum is not finite (the guarded form).
-fn compensatedSum(comptime guarded: bool, terms: []const f32) f32 {
+/// The kernel's compensated lane sums and TwoSum tree: the frozen unguarded error updates
+/// exactly as shipped, with (when `end_guard`) the class fix applied once at the high+low
+/// combine, exactly as the kernel now applies it at its store.
+fn compensatedSum(comptime end_guard: bool, terms: []const f32) f32 {
     var tree: [64]f32 = @splat(0);
     var los: [64]f32 = @splat(0);
     for (0..64) |lane| {
@@ -442,12 +443,10 @@ fn compensatedSum(comptime guarded: bool, terms: []const f32) f32 {
         var i: usize = lane;
         while (i < terms.len) : (i += 64) {
             const t = partial + terms[i];
-            if (!guarded or std.math.isFinite(t)) {
-                if (@abs(partial) >= @abs(terms[i])) {
-                    comp += (partial - t) + terms[i];
-                } else {
-                    comp += (terms[i] - t) + partial;
-                }
+            if (@abs(partial) >= @abs(terms[i])) {
+                comp += (partial - t) + terms[i];
+            } else {
+                comp += (terms[i] - t) + partial;
             }
             partial = t;
         }
@@ -460,21 +459,23 @@ fn compensatedSum(comptime guarded: bool, terms: []const f32) f32 {
             const a = tree[i];
             const b = tree[i + stride];
             const sum = a + b;
-            if (!guarded or std.math.isFinite(sum)) {
-                const bb = sum - a;
-                los[i] = los[i] + los[i + stride] + ((a - (sum - bb)) + (b - bb));
-            }
+            const bb = sum - a;
+            los[i] = los[i] + los[i + stride] + ((a - (sum - bb)) + (b - bb));
             tree[i] = sum;
         }
     }
-    return tree[0] + los[0];
+    const high = tree[0];
+    if (end_guard and (std.math.isNan(high) or std.math.isInf(high))) return high;
+    return high + los[0];
 }
 
-test "pk compensation: the guarded and frozen forms agree bit for bit while the sums stay finite" {
-    // On finite inputs a running sum turns non-finite only by overflowing past f32's max, and
-    // an f32 sum that has gone infinite never comes back, so an output that is finite never
-    // took the guard's skip: the two forms must store the same bits. The negative control
-    // feeds one infinity and shows the emulation can tell the forms apart.
+test "pk compensation: the end guard leaves finite sums bit-identical to the frozen form" {
+    // The select's else operand is the frozen expression, and a finite high implies a finite
+    // chain all the way down (non-finiteness only ever climbs the high tree), so every finite
+    // output executes exactly the arithmetic the kernel shipped with. The overflow round shows
+    // the one intended difference: finite inputs whose running sum passes f32's max give
+    // infinity under the end guard where the frozen form NaN'd, matching the plain serial
+    // chain's overflow class.
     var prng = std.Random.DefaultPrng.init(0xbeef5);
     const rng = prng.random();
     for (0..24) |round| {
@@ -486,7 +487,47 @@ test "pk compensation: the guarded and frozen forms agree bit for bit while the 
         try testing.expect(std.math.isFinite(frozen));
         try testing.expectEqual(@as(u32, @bitCast(frozen)), @as(u32, @bitCast(guarded)));
     }
-    var poison: [256]f32 = @splat(0);
-    poison[3] = std.math.inf(f32);
-    try testing.expect(@as(u32, @bitCast(compensatedSum(false, &poison))) != @as(u32, @bitCast(compensatedSum(true, &poison))));
+    var overflow: [2048]f32 = @splat(0);
+    for (&overflow) |*v| v.* = 0x1p125; // a lane's 32 running sums pass f32's max within the chain
+    try testing.expect(std.math.isNan(compensatedSum(false, &overflow)));
+    try testing.expect(std.math.isInf(compensatedSum(true, &overflow)));
+}
+
+test "pk compensation: the end guard keeps the float64 class at every non-finite plant" {
+    // One +inf, one -inf, two opposite infinities sharing a lane, two in different lanes, and a
+    // NaN: the emulated output's class equals the float64 reference's in each case, where the
+    // frozen form gave NaN for a single infinity. The reference's class is order-independent
+    // here: one infinity wins every sum it enters, and an infinity meeting its opposite is NaN
+    // in any order.
+    const Plant = struct { at: usize, put: f32 };
+    const plants = [_]Plant{
+        .{ .at = 7, .put = std.math.inf(f32) },
+        .{ .at = 7, .put = -std.math.inf(f32) },
+        .{ .at = 7, .put = std.math.nan(f32) },
+    };
+    for (plants) |case| {
+        var terms: [2048]f32 = @splat(0);
+        var prng = std.Random.DefaultPrng.init(0x51ce + case.at);
+        for (&terms) |*v| v.* = (prng.random().float(f32) * 2 - 1) * 0.25;
+        terms[case.at] = case.put;
+        var want: f64 = 0;
+        for (terms) |v| want += @as(f64, v);
+        const got = compensatedSum(true, &terms);
+        try testing.expectEqual(c.classOf(want), c.classOf(got));
+    }
+    // opposite infinities: in one lane (2048-apart strided neighbours) and in different lanes
+    var terms: [2048]f32 = @splat(0);
+    var prng = std.Random.DefaultPrng.init(0x51ce);
+    for (&terms) |*v| v.* = (prng.random().float(f32) * 2 - 1) * 0.25;
+    terms[7] = std.math.inf(f32);
+    terms[7 + 64] = -std.math.inf(f32);
+    try testing.expectEqual(c.Class.nan, c.classOf(compensatedSum(true, &terms)));
+    terms[7 + 64] = 0;
+    terms[9] = -std.math.inf(f32);
+    try testing.expectEqual(c.Class.nan, c.classOf(compensatedSum(true, &terms)));
+    // and a lone -inf keeps its sign
+    terms[9] = 0;
+    terms[7] = -std.math.inf(f32);
+    terms[7 + 64] = 0;
+    try testing.expectEqual(c.Class.neg_inf, c.classOf(compensatedSum(true, &terms)));
 }
