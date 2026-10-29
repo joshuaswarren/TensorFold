@@ -187,6 +187,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const bw_images = [_]struct { name: []const u8, define: []const u8 }{
         .{ .name = "stream_copy", .define = "-DSTREAM_COPY" },
         .{ .name = "stream_read", .define = "-DSTREAM_READ" },
+        .{ .name = "stream_read_wide", .define = "-DSTREAM_READ_WIDE" },
         .{ .name = "stream_write", .define = "-DSTREAM_WRITE" },
     };
     const bw_files = b.addWriteFiles();

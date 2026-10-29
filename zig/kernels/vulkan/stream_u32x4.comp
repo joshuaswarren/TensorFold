@@ -7,6 +7,9 @@
 //   -DSTREAM_COPY   dst[i] = src[i]                       (read + write)
 //   -DSTREAM_READ   xor-reduce src into one word per workgroup (read-only;
 //                   the per-group store keeps the compiler from dropping loads)
+//   -DSTREAM_READ_WIDE  read-only, four contiguous uvec4 loads per lane per
+//                   step (64 B per lane), xor-reduced into one word per
+//                   workgroup; count_words must be a multiple of 16
 //   -DSTREAM_WRITE  dst[i] = pattern(i)                   (write-only)
 
 layout(local_size_x = 256) in;
@@ -15,7 +18,7 @@ layout(set = 0, binding = 0, std430) readonly buffer StreamIn {
   uvec4 values[];
 } stream_in;
 
-#if defined(STREAM_READ)
+#if defined(STREAM_READ) || defined(STREAM_READ_WIDE)
 layout(set = 0, binding = 1, std430) writeonly buffer StreamOut {
   uint words[];
 } stream_out;
@@ -29,8 +32,8 @@ layout(push_constant) uniform Params {
   uint count_words;  // u32 words this dispatch covers; a multiple of 4
 } params;
 
-#if !defined(STREAM_COPY) && !defined(STREAM_READ) && !defined(STREAM_WRITE)
-#error "define STREAM_COPY, STREAM_READ or STREAM_WRITE"
+#if !defined(STREAM_COPY) && !defined(STREAM_READ) && !defined(STREAM_READ_WIDE) && !defined(STREAM_WRITE)
+#error "define STREAM_COPY, STREAM_READ, STREAM_READ_WIDE or STREAM_WRITE"
 #endif
 
 shared uint lane_xor[256];
@@ -51,6 +54,19 @@ void main() {
 #elif defined(STREAM_WRITE)
   for (uint i = gl_GlobalInvocationID.x; i < vec_count; i += stride) {
     stream_out.values[i] = pattern(i);
+  }
+#elif defined(STREAM_READ_WIDE)
+  // Four contiguous uvec4 loads per lane per step; the host mirror of the
+  // index map is bw_ceiling_probe.zig wideVecIndex.
+  uint acc = 0u;
+  for (uint j = gl_GlobalInvocationID.x; j < vec_count / 4u; j += stride) {
+    uint base = j * 4u;
+    uvec4 a = stream_in.values[base];
+    uvec4 b = stream_in.values[base + 1u];
+    uvec4 c4 = stream_in.values[base + 2u];
+    uvec4 d = stream_in.values[base + 3u];
+    acc ^= a.x ^ a.y ^ a.z ^ a.w ^ b.x ^ b.y ^ b.z ^ b.w
+        ^ c4.x ^ c4.y ^ c4.z ^ c4.w ^ d.x ^ d.y ^ d.z ^ d.w;
   }
 #else
   uint acc = 0u;

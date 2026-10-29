@@ -5,17 +5,17 @@
 //! streams one uvec4 (16 B) with a grid-stride loop, in three integer-only
 //! kernels (no float arithmetic anywhere, so no denormal or NaN behaviour):
 //! COPY (read a uvec4, write a uvec4), READ (xor-reduce, one word stored per
-//! workgroup so the compiler cannot drop the loads) and WRITE (a pattern).
+//! workgroup so the compiler cannot drop the loads), READ WIDE (four contiguous uvec4 per lane per step, same xor fold) and WRITE (a pattern).
 //!
 //! Cases, in run order:
 //!   0. a byte-exact self-check on a 1 MiB buffer (copy against host bytes,
-//!      xor-reduce against the host fold, write against the host pattern) —
+//!      xor-reduce and read wide against the host fold, write against the host pattern) —
 //!      a check failure exits 1 before any timing.
 //!   1. COLD-TO-WARM RAMP, the first timed work: 32 batches of 4 dependent
 //!      256 MiB copies, each batch's GB/s printed in order, so a memory-clock
 //!      ramp shows as a rising series; first-batch GB/s vs the median of the
 //!      last 8.
-//!   2. SIZE SWEEP, warm: COPY/READ/WRITE at 64/256/512/1024 MiB, each at
+//!   2. SIZE SWEEP, warm: COPY/READ/READ WIDE/WRITE at 64/256/512/1024 MiB, each at
 //!      dependent depth N=0 floor plus N=1, 4 and 16 in one batched command
 //!      buffer (1 GiB runs N=1, 4 and 8 instead of 16 — Main's sanctioned
 //!      fallback, because 16 x 1 GiB batches can bust the two-minute cap at
@@ -428,7 +428,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("SKIP sweep {d:.0} MiB: the device refused a {d:.0} MiB allocation\n", .{ mib(size), mib(size * 2) });
     };
 
-    std.debug.print("MILESTONE bw-ceiling cases: (1) cold-to-warm ramp: {d} batches x {d} dependent {d:.0} MiB copies; (2) shader copy (uvec4) sweep: 4/16 MiB x N=16 then 64/256/512/1024 MiB x N=1/4/16 (1 GiB at N=1/4/8, since 16 x 1 GiB batches can bust the two-minute cap); (3) read sweep and (4) write sweep: 64/256/512/1024 MiB x N=1/4/16 (1 GiB at N=1/4/8); (5) driver copy (vkCmdCopyBuffer) sweep: 64/256/512/1024 MiB x N=1/4/16 (1 GiB at N=1/4/8), a transfer barrier between copies; (6) idle re-entry: 3 s host sleep then {d} dependent {d:.0} MiB copies; timed samples shrink with batch cost (15..63) to hold the two-minute cap\n", .{ ramp_batches, ramp_dep, mib(big_bytes), ramp_dep, mib(big_bytes) });
+    std.debug.print("MILESTONE bw-ceiling cases: (1) cold-to-warm ramp: {d} batches x {d} dependent {d:.0} MiB copies; (2) shader copy (uvec4) sweep: 4/16 MiB x N=16 then 64/256/512/1024 MiB x N=1/4/16 (1 GiB at N=1/4/8, since 16 x 1 GiB batches can bust the two-minute cap); (3) read sweep, read wide sweep and (4) write sweep: 64/256/512/1024 MiB x N=1/4/16 (1 GiB at N=1/4/8); (5) driver copy (vkCmdCopyBuffer) sweep: 64/256/512/1024 MiB x N=1/4/16 (1 GiB at N=1/4/8), a transfer barrier between copies; (6) idle re-entry: 3 s host sleep then {d} dependent {d:.0} MiB copies; timed samples shrink with batch cost (15..63) to hold the two-minute cap\n", .{ ramp_batches, ramp_dep, mib(big_bytes), ramp_dep, mib(big_bytes) });
 
     var cmds = try vk.Commands.init(&dev);
     defer cmds.deinit();
@@ -446,6 +446,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer copy_pipe.deinit();
     var read_pipe = try dispatch.Pipeline.init(&dev, &shaders.stream_read, layout);
     defer read_pipe.deinit();
+    var read_wide_pipe = try dispatch.Pipeline.init(&dev, &shaders.stream_read_wide, layout);
+    defer read_wide_pipe.deinit();
     var write_pipe = try dispatch.Pipeline.init(&dev, &shaders.stream_write, layout);
     defer write_pipe.deinit();
     if (!std.mem.eql(u32, &copy_pipe.local, &.{ 256, 1, 1 })) {
@@ -468,9 +470,11 @@ pub fn main(init: std.process.Init) !u8 {
     const groups = [3]u32{ groups_x, 1, 1 };
     const copy_pipes = [_]*dispatch.Pipeline{&copy_pipe};
     const read_pipes = [_]*dispatch.Pipeline{&read_pipe};
+    const read_wide_pipes = [_]*dispatch.Pipeline{&read_wide_pipe};
     const write_pipes = [_]*dispatch.Pipeline{&write_pipe};
     const copy_unit: Unit = .{ .shader = .{ .pipes = &copy_pipes, .binds = &copy_binds, .push = &[_]u8{}, .groups = groups } };
     const read_unit: Unit = .{ .shader = .{ .pipes = &read_pipes, .binds = &read_binds, .push = &[_]u8{}, .groups = groups } };
+    const read_wide_unit: Unit = .{ .shader = .{ .pipes = &read_wide_pipes, .binds = &read_binds, .push = &[_]u8{}, .groups = groups } };
     const write_unit: Unit = .{ .shader = .{ .pipes = &write_pipes, .binds = &write_binds, .push = &[_]u8{}, .groups = groups } };
     const driver_unit: Unit = .{ .driver = .{ .src = src, .dst = dst } };
 
@@ -511,6 +515,15 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
 
+    try vk.orExit(zeroBuf(&cmds, red, timeout)); // the read-wide check sees only what STREAM_READ_WIDE writes
+    try read_wide_pipe.bind(&check_read);
+    try vk.orExit(read_wide_pipe.run(&cmds, check_push_bytes, groups, timeout));
+    try vk.orExit(vk.download(&cmds, red, 0, staging, std.mem.sliceAsBytes(red_got), timeout));
+    if (xorWords(red_got) != xorWords(small)) {
+        printCheckFail("STREAM_READ_WIDE xor does not match the host fold on the {d} KiB check buffer", .{check_bytes >> 10}, std.mem.sliceAsBytes(red_got), std.mem.sliceAsBytes(small));
+        return 1;
+    }
+
     try write_pipe.bind(&check_in_out);
     try vk.orExit(write_pipe.run(&cmds, check_push_bytes, groups, timeout));
     try vk.orExit(vk.download(&cmds, check_dst, 0, staging, got_bytes, timeout));
@@ -525,7 +538,7 @@ pub fn main(init: std.process.Init) !u8 {
         printCheckFail("STREAM_WRITE output differs from the host pattern on the {d} KiB check buffer", .{check_bytes >> 10}, got_bytes, want_bytes);
         return 1;
     }
-    std.debug.print("MILESTONE checks-passed copy/read/write byte-exact on {d} KiB; timing begins\n", .{check_bytes >> 10});
+    std.debug.print("MILESTONE checks-passed copy/read/read-wide/write byte-exact on {d} KiB; timing begins\n", .{check_bytes >> 10});
 
     // ---- (1) cold-to-warm ramp: the first timed GPU work after the checks
     const ramp_bytes = ramp_dep * 2 * big_bytes;
@@ -551,6 +564,8 @@ pub fn main(init: std.process.Init) !u8 {
     try runSweep(io, &cmds, staging, "shader copy (uvec4)", copy_unit, &stream_sizes, &plan.stream, &stream_deps, &stream_1gib_deps, 2, timeout);
     std.debug.print("MILESTONE sweep read (xor-reduce): 64/256/512/1024 MiB at N=1/4/16 (1 GiB at N=1/4/8); size moved per dispatch\n", .{});
     try runSweep(io, &cmds, staging, "read (xor-reduce)", read_unit, &stream_sizes, &plan.stream, &stream_deps, &stream_1gib_deps, 1, timeout);
+    std.debug.print("MILESTONE sweep read wide (xor-reduce, 4 uvec4/lane): 64/256/512/1024 MiB at N=1/4/16 (1 GiB at N=1/4/8); size moved per dispatch\n", .{});
+    try runSweep(io, &cmds, staging, "read wide", read_wide_unit, &stream_sizes, &plan.stream, &stream_deps, &stream_1gib_deps, 1, timeout);
     std.debug.print("MILESTONE sweep write (pattern): 64/256/512/1024 MiB at N=1/4/16 (1 GiB at N=1/4/8); size moved per dispatch\n", .{});
     try runSweep(io, &cmds, staging, "write (pattern)", write_unit, &stream_sizes, &plan.stream, &stream_deps, &stream_1gib_deps, 1, timeout);
     std.debug.print("MILESTONE sweep driver copy (vkCmdCopyBuffer): 64/256/512/1024 MiB at N=1/4/16 (1 GiB at N=1/4/8); a transfer barrier between copies; 2x size moved per dispatch\n", .{});
@@ -687,6 +702,34 @@ test "firstDiff names the first differing byte with got/want words" {
     try testing.expectEqual(@as(usize, 4), tail.offset);
     try testing.expectEqual(@as(u32, 0x0909_0909), tail.got);
     try testing.expectEqual(@as(u32, 0x0707_0707), tail.want);
+}
+
+/// The READ WIDE kernel's vec index for lane `lane` at loop step `step` with
+/// grid stride `stride`: quad `lane + step*stride`, four contiguous uvec4
+/// loads (64 B per lane per step). The GLSL kernel mirrors this; a change
+/// here and there must land in the same commit.
+pub fn wideVecIndex(lane: u32, step: u32, stride: u32) u32 {
+    return (lane + step * stride) * 4;
+}
+
+test "wide read covers each uvec4 quad exactly once" {
+    const stride: u32 = 7;
+    const quads: u32 = 40; // not a multiple of stride: the tail must still be covered
+    var seen: [40]bool = @splat(false);
+    var lane: u32 = 0;
+    while (lane < stride) : (lane += 1) {
+        var step: u32 = 0;
+        while (wideVecIndex(lane, step, stride) / 4 < quads) : (step += 1) {
+            const q = wideVecIndex(lane, step, stride) / 4;
+            try testing.expect(!seen[q]);
+            seen[q] = true;
+        }
+    }
+    for (seen) |s| try testing.expect(s);
+    // 64 B per lane per step: the four loads are contiguous quads (wide read).
+    try testing.expectEqual([_]u32{ 12, 13, 14, 15 }, [_]u32{
+        wideVecIndex(3, 0, 1), wideVecIndex(3, 0, 1) + 1, wideVecIndex(3, 0, 1) + 2, wideVecIndex(3, 0, 1) + 3,
+    });
 }
 
 test "sampleCount shrinks with batch cost inside [15, 63], always odd" {
