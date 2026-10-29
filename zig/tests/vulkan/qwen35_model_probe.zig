@@ -195,7 +195,10 @@ fn readOracleMeta(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, oracle_dir:
     };
 }
 
-// Production probe and load test share the generated shader bundle.
+/// The exact production bundle: the build-generated qwen35_shaders SPIR-V
+/// image for every field of engine.ShaderBundle (10 stage-1 ops, 4 norm/MLP,
+/// 3 attention, 7 GDN, 3 greedy), shared by the probe run and the opt-in
+/// load test so both exercise the shader set the server serves with.
 fn bundle() engine_mod.ShaderBundle {
     return .{
         .ops = .{
@@ -208,6 +211,7 @@ fn bundle() engine_mod.ShaderBundle {
             .cast_f32_bf16 = &q35s.cast_f32_bf16,
             .copy_u32 = &q35s.copy_u32,
             .copy_u16 = &q35s.copy_u16,
+            .qmm_q4_sg = &q35s.qmm_q4_sg,
         },
         .norm = .{ .norm_bf16 = &q35s.norm_bf16, .add_bf16 = &q35s.add_bf16, .add_preserve_bf16 = &q35s.add_preserve_bf16, .swiglu_bf16 = &q35s.swiglu_bf16 },
         .attention = .{ .rope_bf16 = &q35s.rope_bf16, .sdpa_rows_bf16 = &q35s.sdpa_rows_bf16, .gate_bf16 = &q35s.gate_bf16 },
@@ -325,6 +329,11 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer engine.deinit();
     std.debug.print("MILESTONE engine-ready elapsed_ms={d} capacity={d} model_context={d} logits_bytes={d}\n", .{ clock.ms(), engine.capacity(), engine.modelContext(), engine.logitsLen() });
+    switch (engine.ops.qmm_path) {
+        .sg => std.debug.print("MILESTONE qmm-path sg\n", .{}),
+        .old_env => std.debug.print("MILESTONE qmm-path old (TF_VK_QMM=old)\n", .{}),
+        .old_device => std.debug.print("MILESTONE qmm-path old (device subgroup caps)\n", .{}),
+    }
     if (opts.vendor) |want| if (engine.vendorId() != want) {
         std.debug.print("FAIL device: vendor 0x{x:0>4} is not the requested 0x{x:0>4}\n", .{ engine.vendorId(), want });
         return 1;

@@ -35,6 +35,26 @@ pub fn chunkRows(l: Limits, k: u64, n: u64) Error!u64 {
 // qmm_q4_pk flags define plain, contiguous, or compensated arithmetic; production fixes strided compensated mode.
 pub var pk_variant: u32 = 2;
 
+/// The device subgroup facts the decode kernel choice reads (the 1.1 properties' two fields).
+pub const SubgroupCaps = struct { subgroup_size: u32, subgroup_ops: u32 };
+
+/// The same device gate the unit 11 probe's sgSubgroupOk applies: the subgroup kernel assumes a
+/// 32-lane subgroup and needs the arithmetic subgroup operations. Pure and host-tested.
+pub fn sgDeviceOk(subgroup_size: u32, supported_ops: u32) bool {
+    const arithmetic: u32 = 1 << 2; // VK_SUBGROUP_FEATURE_ARITHMETIC_BIT
+    return subgroup_size == 32 and (supported_ops & arithmetic) != 0;
+}
+
+/// The decode matmul takes the omarchy-mlx subgroup qmv (the probe's SG master) exactly when it is
+/// one row and the shape fits the kernel's lane step (k in whole 512-element steps) and column
+/// width (n in whole 8-column slots), on a device whose subgroup sgDeviceOk admits. Pure and host-tested.
+pub fn useSubgroupQmv(rows: u64, k: u64, n: u64, caps: SubgroupCaps) bool {
+    return rows == 1 and k % 512 == 0 and n % 8 == 0 and sgDeviceOk(caps.subgroup_size, caps.subgroup_ops);
+}
+
+/// The decode kernel the engine opened with: sg when init built the SG pipeline, else why it did not.
+pub const QmmPath = enum { sg, old_env, old_device };
+
 const Geometry = struct { m: u64, n: u64 };
 
 // One 64-lane workgroup per output; cap the dispatch and grid-stride the rest; refuse zero groups.
@@ -82,6 +102,15 @@ pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: Vi
     if (x.byteLen() > lim.max_range or out.byteLen() > lim.max_range) return error.TooLarge;
     const rows = try chunkRows(lim, k, g.n);
     if (rows == 0) {
+        // Decode's single-row dispatch takes the probe's SG master kernel when the engine built
+        // it and the shape fits its contract; the old kernel otherwise, byte-for-byte as before.
+        if (o.qmmDecodeSg(k, g.n)) |sg| {
+            try sg.bind(&.{ x.bind(), w.bind(), scales.bind(), biases.bind(), out.bind() });
+            var p = try q4Push(g.m, g.n, k);
+            p.flags = pk_variant;
+            try sg.run(cmds, std.mem.asBytes(&p), .{ try ops_mod.cast32((g.n + 7) / 8), 1, 1 }, timeout_ns);
+            return;
+        }
         const pipe = &o.qmm_q4_pk;
         try pipe.bind(&.{ x.bind(), w.bind(), scales.bind(), biases.bind(), out.bind() });
         var p = try q4Push(g.m, g.n, k);
@@ -242,6 +271,27 @@ test "checkIds refuses any id past the table" {
     try checkIds(&.{ 0, 3, 99 }, 100);
     try checkIds(&.{}, 1);
     try testing.expectError(error.OutOfRange, checkIds(&.{ 0, 100 }, 100));
+}
+
+test "useSubgroupQmv admits exactly the decode shapes the SG kernel serves on a 32-lane arithmetic subgroup" {
+    const ok: SubgroupCaps = .{ .subgroup_size = 32, .subgroup_ops = 1 << 2 }; // VK_SUBGROUP_FEATURE_ARITHMETIC_BIT
+    // the decode token's own shapes (n, k): every layer and the head
+    try testing.expect(useSubgroupQmv(1, 6144, 2048, ok));
+    try testing.expect(useSubgroupQmv(1, 2048, 6144, ok));
+    try testing.expect(useSubgroupQmv(1, 2048, 2048, ok));
+    try testing.expect(useSubgroupQmv(1, 2048, 4096, ok));
+    try testing.expect(useSubgroupQmv(1, 2048, 512, ok));
+    try testing.expect(useSubgroupQmv(1, 2048, 248320, ok));
+    // prefill rows never take the SG path
+    try testing.expect(!useSubgroupQmv(2, 2048, 2048, ok));
+    try testing.expect(!useSubgroupQmv(16, 2048, 2048, ok));
+    // the kernel's 512-element lane step needs whole steps; its 8-wide columns need whole columns
+    try testing.expect(!useSubgroupQmv(1, 2000, 2048, ok));
+    try testing.expect(!useSubgroupQmv(1, 2048, 7, ok));
+    // the subgroupAdd tree is written for a 32-lane subgroup with the arithmetic operations
+    try testing.expect(!useSubgroupQmv(1, 2048, 2048, .{ .subgroup_size = 16, .subgroup_ops = ok.subgroup_ops }));
+    try testing.expect(!useSubgroupQmv(1, 2048, 2048, .{ .subgroup_size = 64, .subgroup_ops = ok.subgroup_ops }));
+    try testing.expect(!useSubgroupQmv(1, 2048, 2048, .{ .subgroup_size = 32, .subgroup_ops = 1 })); // basic only
 }
 
 test "pkGroups plans one workgroup per output and clamps at the device limit" {
