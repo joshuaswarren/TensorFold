@@ -134,7 +134,7 @@ fn runGate(cmds: *vk.Commands, staging: vk.Buffer, pipe: *dispatch.Pipeline, bin
     return true;
 }
 
-fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Commands, staging: vk.Buffer, pipes: []const *dispatch.Pipeline, n: usize, k: usize, timeout: u64, add_floor_us: ?f64) !bool {
+fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Commands, staging: vk.Buffer, pipes: []const *dispatch.Pipeline, n: usize, k: usize, timeout: u64, add_floor_us: ?f64, special: bool) !bool {
     const words_count = n * k / 8;
     const param_count = n * (k / 64);
     const x_bytes = k * @sizeOf(u16);
@@ -161,6 +161,23 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
     const allowances_b2 = try a.alloc(f64, n);
     defer a.free(allowances_b2);
     qf.fillInputs(weights, scales, biases, x, 0x716d6d00 ^ @as(u64, n));
+    if (special) {
+        // Planted specials must stay inside the f64 reference's model: it
+        // assumes the unit-activation row, so x keeps its ones and the
+        // specials go into scales/biases/weights. Inf/NaN scales or biases
+        // make the affected columns' f64 expectations non-finite, which the
+        // bound gate skips and counts; zero rows, all-15 rows, a zero scale
+        // and large-but-f32-safe magnitudes gate normally.
+        scales[0] = 0x0000; // zero scale
+        scales[1] = 0x7F80; // +inf scale: that column's expectation goes non-finite
+        scales[2] = 0x7FC0; // NaN scale: same
+        scales[3] = 0x5F00; // large but f32-safe magnitude (~2^63)
+        biases[0] = 0x0000; // zero bias
+        biases[1] = 0xFF80; // -inf bias: non-finite expectation
+        biases[2] = 0xC200; // -128
+        @memset(weights[0..16], 0); // zero nibble rows
+        @memset(weights[100..116], 0xFFFF_FFFF); // all-15 nibbles
+    }
     const shape: c.Shape = .{ .rows = 1, .n = n, .k = k };
     const spec_a0 = qf.pkSpec();
     const spec_b1 = ablateSpec("qmm-ablate B1 128-lane compensated", &depth128);
@@ -257,6 +274,16 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     };
     const timeout = opts.timeout_ms * std.time.ns_per_ms;
+    // PREFLIGHT ONLY, NOT A RESULT: this throwaway build admits a CPU (lavapipe)
+    // device under BW_PREFLIGHT_CPU, divides the served shape sizes by
+    // BW_PREFLIGHT_SCALE, and plants non-finite/extreme inputs under
+    // BW_PREFLIGHT_SPECIAL. None of the knobs exists in the real branch.
+    var scale: u64 = 1;
+    if (std.c.getenv("BW_PREFLIGHT_SCALE")) |v| scale = std.fmt.parseInt(u64, std.mem.span(v), 10) catch 1;
+    if (scale == 0) scale = 1;
+    const preflight_cpu = std.c.getenv("BW_PREFLIGHT_CPU") != null;
+    const special = std.c.getenv("BW_PREFLIGHT_SPECIAL") != null;
+    std.debug.print("PREFLIGHT ONLY, NOT A RESULT: cpu-allowed={} scale={d} special={}\n", .{ preflight_cpu, scale, special });
     var rt = try vk.Runtime.open();
     defer rt.close();
     var dev = try vk.Device.open(&rt, .{});
@@ -264,7 +291,7 @@ pub fn main(init: std.process.Init) !u8 {
     const pr = dev.properties;
     const name = std.mem.sliceTo(&pr.deviceName, 0);
     std.debug.print("MILESTONE device-found name=\"{s}\" vendor=0x{x:0>4} device=0x{x:0>4} timeout={d}ms\n", .{ name, pr.vendorID, pr.deviceID, opts.timeout_ms });
-    if (pr.deviceType == vk.c.VK_PHYSICAL_DEVICE_TYPE_CPU) {
+    if (pr.deviceType == vk.c.VK_PHYSICAL_DEVICE_TYPE_CPU and !preflight_cpu) {
         std.debug.print("FAIL device: a CPU (software) Vulkan device is never a GPU result\n", .{});
         return 1;
     }
@@ -302,8 +329,9 @@ pub fn main(init: std.process.Init) !u8 {
     if (!plan.head_fits) std.debug.print("SKIP served head n=248320 k=2048: packed Q4 weights exceed maxStorageBufferRange={d}; using largest listed fallback n={d} k={d}\n", .{ pr.limits.maxStorageBufferRange, plan.shapes[2][0], plan.shapes[2][1] });
     var completed: usize = 0;
     for (plan.shapes) |shape| {
-        std.debug.print("MILESTONE case n={d} k={d} weight-bytes-per-dispatch={d}\n", .{ shape[0], shape[1], qf.weightBytesFor(shape[0], shape[1]) });
-        if (!try runShape(io, a, &dev, &cmds, staging, &pipes, shape[0], shape[1], timeout, opts.add_floor_us)) return 1;
+        std.debug.print("MILESTONE case n={d} k={d} weight-bytes-per-dispatch={d}\n", .{ shape[0] / scale, shape[1], qf.weightBytesFor(shape[0] / scale, shape[1]) });
+        const n_scaled = shape[0] / scale;
+        if (!try runShape(io, a, &dev, &cmds, staging, &pipes, n_scaled, shape[1], timeout, opts.add_floor_us, special)) return 1;
         completed += 1;
     }
     std.debug.print("RESULT qmm-ablate on \"{s}\": cases={d} ok\n", .{ name, completed });
