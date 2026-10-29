@@ -1,0 +1,100 @@
+#version 460
+
+// ABLATE A2 (private probe kernel): LOADS ONLY. Each lane loads exactly the
+// packed words, scales and biases (and the widened x row) the real kernel
+// loads, in the same order, and folds their BITS with integer xor — no
+// dequant, no float arithmetic anywhere. The same fixed 6-barrier tree folds
+// the 64 xor words and lane 0 stores one u32 word per output, so the loads
+// cannot be dropped. Timing-only: it measures the load stream alone.
+
+// Copyright © 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputX {
+  uint16_t values[];
+} input_x;
+layout(set = 0, binding = 1, std430) readonly buffer InputW {
+  uint values[];
+} input_w;
+layout(set = 0, binding = 2, std430) readonly buffer Scales {
+  uint16_t values[];
+} scales;
+layout(set = 0, binding = 3, std430) readonly buffer Biases {
+  uint16_t values[];
+} biases;
+layout(set = 0, binding = 4, std430) writeonly buffer Output {
+  uint values[];
+} output_data;
+
+layout(push_constant) uniform Params {
+  uint count;
+  uint operation;
+  uint lhs_size;
+  uint rhs_size;
+  uint reduce_size;
+  uint output_size;
+  uint lhs_offset;
+  uint rhs_offset;
+  uint output_offset;
+  uint aux_size;
+  uint aux_offset;
+  uint matrix_m;
+  uint matrix_n;
+  uint matrix_k;
+  uint flags;
+  float alpha;
+  float beta;
+  uint dims;
+  uint shape[4];
+  uint in_strides[4];
+  uint out_strides[4];
+} params;
+
+shared uint tree[64];
+
+void main() {
+  uint lane = gl_LocalInvocationID.x;
+  uint words_per_row = params.matrix_k / 8u;
+  uint groups_per_row = params.matrix_k / 64u;
+  uint packs = params.matrix_k / 8u;
+  uint total = params.matrix_m * params.matrix_n;
+
+  for (uint index = gl_WorkGroupID.x; index < total; index += gl_NumWorkGroups.x) {
+    uint row = index / params.matrix_n;
+    uint column = index - row * params.matrix_n;
+    uint w_base = column * words_per_row;
+    uint x_base = row * params.matrix_k;
+    bool contiguous = (params.flags & 1u) != 0u && (packs % 64u) == 0u;
+    uint chunk = packs / 64u;
+    uint first = contiguous ? lane * chunk : lane;
+    uint step = contiguous ? 1u : 64u;
+    uint last = contiguous ? first + chunk : packs;
+    uint acc = 0u;
+    for (uint pack = first; pack < last; pack += step) {
+      uint16_t scale = scales.values[column * groups_per_row + pack / 8u];
+      uint16_t bias = biases.values[column * groups_per_row + pack / 8u];
+      uint word = input_w.values[w_base + pack];
+      uint k_base = pack * 8u;
+      acc ^= word ^ (uint(scale) << 16u) ^ (uint(bias) << 16u);
+      for (uint e = 0u; e < 8u; ++e) {
+        acc ^= uint(input_x.values[x_base + k_base + e]) << 16u;
+      }
+    }
+    tree[lane] = acc;
+    barrier();
+    for (uint stride = 32u; stride >= 1u; stride >>= 1u) {
+      if (lane < stride) {
+        tree[lane] ^= tree[lane + stride];
+      }
+      barrier();
+    }
+    if (lane == 0u) {
+      output_data.values[index] = tree[0];
+    }
+    barrier();
+  }
+}

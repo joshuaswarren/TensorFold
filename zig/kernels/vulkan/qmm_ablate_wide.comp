@@ -1,0 +1,141 @@
+#version 460
+
+// ABLATE B (private probe kernel): the real qmm_q4_pk arithmetic with
+// -DABLATE_LANES = 128 or 256 lanes per output instead of 64 — lane l walks
+// the row's packed words l, l+L, ... , the same frozen per-element expression
+// with the same compensated TwoSum, and a fixed shared-memory tree of
+// log2(L) levels (7 or 8) with a barrier between levels. The output bits
+// CHANGE with the lane count, so the probe checks B against the contract's
+// f64 bound recomputed for the wider chain (wideDepthFor), never against R=1
+// bits. Timing-only relative to the product kernel: it is a candidate, not a
+// result. Never a shipped kernel.
+
+// Copyright © 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
+
+#ifndef ABLATE_LANES
+#error "define ABLATE_LANES (128 or 256)"
+#endif
+#if ABLATE_LANES != 128 && ABLATE_LANES != 256
+#error "ABLATE_LANES must be 128 or 256"
+#endif
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+layout(local_size_x = ABLATE_LANES) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer InputX {
+  uint16_t values[];
+} input_x;
+layout(set = 0, binding = 1, std430) readonly buffer InputW {
+  uint values[];
+} input_w;
+layout(set = 0, binding = 2, std430) readonly buffer Scales {
+  uint16_t values[];
+} scales;
+layout(set = 0, binding = 3, std430) readonly buffer Biases {
+  uint16_t values[];
+} biases;
+layout(set = 0, binding = 4, std430) writeonly buffer Output {
+  uint16_t values[];
+} output_data;
+
+layout(push_constant) uniform Params {
+  uint count;
+  uint operation;
+  uint lhs_size;
+  uint rhs_size;
+  uint reduce_size;
+  uint output_size;
+  uint lhs_offset;
+  uint rhs_offset;
+  uint output_offset;
+  uint aux_size;
+  uint aux_offset;
+  uint matrix_m;
+  uint matrix_n;
+  uint matrix_k;
+  uint flags;
+  float alpha;
+  float beta;
+  uint dims;
+  uint shape[4];
+  uint in_strides[4];
+  uint out_strides[4];
+} params;
+
+shared float tree[ABLATE_LANES];
+shared float tree_lo[ABLATE_LANES];
+
+float bf16_load(uint16_t bits) {
+  return uintBitsToFloat(uint(bits) << 16u);
+}
+
+uint16_t bf16_store(float value) {
+  uint bits = floatBitsToUint(value);
+  if (isnan(value)) {
+    return uint16_t((bits >> 16) | 0x40u);
+  }
+  return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+
+void main() {
+  const uint L = uint(ABLATE_LANES);
+  uint lane = gl_LocalInvocationID.x;
+  uint words_per_row = params.matrix_k / 8u;
+  uint groups_per_row = params.matrix_k / 64u;
+  uint packs = params.matrix_k / 8u;
+  uint total = params.matrix_m * params.matrix_n;
+
+  for (uint index = gl_WorkGroupID.x; index < total; index += gl_NumWorkGroups.x) {
+    uint row = index / params.matrix_n;
+    uint column = index - row * params.matrix_n;
+    uint w_base = column * words_per_row;
+    uint x_base = row * params.matrix_k;
+    bool contiguous = (params.flags & 1u) != 0u && (packs % L) == 0u;
+    uint chunk = packs / L;
+    uint first = contiguous ? lane * chunk : lane;
+    uint step = contiguous ? 1u : L;
+    uint last = contiguous ? first + chunk : packs;
+    float partial = 0.0;
+    float comp = 0.0;
+    for (uint pack = first; pack < last; pack += step) {
+      float scale = bf16_load(scales.values[column * groups_per_row + pack / 8u]);
+      float bias = bf16_load(biases.values[column * groups_per_row + pack / 8u]);
+      uint word = input_w.values[w_base + pack];
+      uint k_base = pack * 8u;
+      for (uint e = 0u; e < 8u; ++e) {
+        float q = float((word >> (e * 4u)) & 0xFu);
+        precise float term = bf16_load(input_x.values[x_base + k_base + e]) *
+            (scale * q + bias);
+        precise float t = partial + term;
+        if (abs(partial) >= abs(term)) {
+          comp += (partial - t) + term;
+        } else {
+          comp += (term - t) + partial;
+        }
+        partial = t;
+      }
+    }
+    tree[lane] = partial;
+    tree_lo[lane] = comp;
+    barrier();
+    for (uint stride = L / 2u; stride >= 1u; stride >>= 1u) {
+      if (lane < stride) {
+        precise float a = tree[lane];
+        precise float b2 = tree[lane + stride];
+        precise float sum = a + b2;
+        precise float bb = sum - a;
+        precise float err = (a - (sum - bb)) + (b2 - bb);
+        tree[lane] = sum;
+        tree_lo[lane] = tree_lo[lane] + tree_lo[lane + stride] + err;
+      }
+      barrier();
+    }
+    if (lane == 0u) {
+      float total_sum = (isnan(tree[0]) || isinf(tree[0])) ? tree[0] : tree[0] + tree_lo[0];
+      output_data.values[index] = bf16_store(total_sum);
+    }
+    barrier();
+  }
+}

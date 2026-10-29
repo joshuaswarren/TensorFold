@@ -181,6 +181,58 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     }) });
     host.dependOn(&b.addRunArtifact(qmm_floor_host_tests).step);
 
+    // The ablation probe: A1 (plain accumulation), A2 (loads-only xor), A3
+    // (cache-resident full arithmetic) and B1/B2 (128/256 lanes) isolate what
+    // keeps qmm_q4_pk at 28 percent of the chip's streaming bandwidth.
+    // tf-qmm-ablate gates A0 and B1/B2 on the f64 bound and times all six.
+    const ablate_files = b.addWriteFiles();
+    _ = ablate_files.addCopyFile(qmm_floor_spv, "qmm_q4_pk.spv");
+    var ablate_embed: std.ArrayListUnmanaged(u8) = .empty;
+    ablate_embed.appendSlice(b.allocator, "pub const qmm_q4_pk align(4) = @embedFile(\"qmm_q4_pk.spv\").*;\n") catch @panic("OOM");
+    inline for (.{ .{ "a1", "" }, .{ "a2", "" }, .{ "a3", "" }, .{ "wide128", "-DABLATE_LANES=128" }, .{ "wide256", "-DABLATE_LANES=256" } }) |pair| {
+        const ablate_cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp" });
+        if (pair[1].len > 0) ablate_cmd.addArg(pair[1]);
+        ablate_cmd.addArg("-o");
+        const ablate_spv = ablate_cmd.addOutputFileArg(b.fmt("qmm_ablate_{s}.spv", .{pair[0]}));
+        ablate_cmd.addFileArg(b.path(b.fmt("zig/kernels/vulkan/qmm_ablate_{s}.comp", .{if (pair[0][0] == 'w') "wide" else pair[0]})));
+        _ = ablate_files.addCopyFile(ablate_spv, b.fmt("qmm_ablate_{s}.spv", .{pair[0]}));
+        ablate_embed.appendSlice(b.allocator, b.fmt("pub const qmm_ablate_{s} align(4) = @embedFile(\"qmm_ablate_{s}.spv\").*;\n", .{ pair[0], pair[0] })) catch @panic("OOM");
+    }
+    const ablate_shaders = b.createModule(.{ .root_source_file = ablate_files.add("qmm_ablate_shaders.zig", ablate_embed.items) });
+    // one contract instance shared by the probe and the qf helpers: a file may live in one module only
+    const ablate_contract = @import("kernel_contract.zig").module(b, target, .debug);
+    const ablate_qf = b.createModule(.{ .root_source_file = b.path("zig/tests/vulkan/qmm_floor_probe.zig"), .imports = &.{.{ .name = "contract", .module = ablate_contract }} });
+    const ablate_probe = b.addExecutable(.{ .name = "tf-qmm-ablate", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/qmm_ablate_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "vulkan", .module = vulkan },
+            .{ .name = "contract", .module = ablate_contract },
+            .{ .name = "qf", .module = ablate_qf },
+            .{ .name = "ablate_shaders", .module = ablate_shaders },
+        },
+    }) });
+    b.step("qmm-ablate-build", "Build zig-out/bin/tf-qmm-ablate and its SPIR-V without running GPU work").dependOn(&b.addInstallArtifact(ablate_probe, .{}).step);
+    const ablate_run = b.addRunArtifact(ablate_probe);
+    ablate_run.addPassthruArgs();
+    b.step("qmm-ablate-run", "Run the qmm ablation probe on the chosen device (args after --)").dependOn(&ablate_run.step);
+    const ablate_host_tests = b.addTest(.{ .root_module = blk: {
+        const host_contract = @import("kernel_contract.zig").module(b, b.graph.host, .debug);
+        break :blk b.createModule(.{
+            .root_source_file = b.path("zig/tests/vulkan/qmm_ablate_probe.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+            .imports = &.{
+                .{ .name = "vulkan", .module = module(b, b.graph.host, .debug, o) },
+                .{ .name = "contract", .module = host_contract },
+                .{ .name = "qf", .module = b.createModule(.{ .root_source_file = b.path("zig/tests/vulkan/qmm_floor_probe.zig"), .imports = &.{.{ .name = "contract", .module = host_contract }} }) },
+            },
+        });
+    } });
+    host.dependOn(&b.addRunArtifact(ablate_host_tests).step);
+
     // The multi-output re-batching probe: qmm_q4_pk_r.comp at R=2/4/8 carries R
     // outputs through the same per-output arithmetic with shared barriers;
     // tf-qmm-multi proves each variant bit-exact against R=1 before timing it.
