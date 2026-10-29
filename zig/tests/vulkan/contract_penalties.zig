@@ -205,6 +205,17 @@ pub fn firstFault(got: []const u16, want: []const u16, input: []const u16, named
 /// preservation; anything else fails.
 pub const Verdict = enum { pass, known, fail };
 
+/// The run's accounting, pure so a host test pins it: the items are the kernel's gates (one per kernel), every
+/// planted control (it counts as passed when it went red as planted) and the denormal row; `known` is the denormal
+/// row's KNOWN verdict. The run passes when no kernel failed, no control was missed and every item passed or is known.
+pub const Accounting = struct { passed: usize, known: usize, total: usize, ok: bool };
+pub fn accounting(t: g.Tally, sub: Verdict, refused: bool) Accounting {
+    const passed = t.passed + t.caught + @intFromBool(sub == .pass);
+    const known = t.known + @intFromBool(sub == .known);
+    const total = t.kernels + t.controls + 1;
+    return .{ .passed = passed, .known = known, .total = total, .ok = !refused and t.problems() == 0 and t.caught == t.controls and passed + known == total };
+}
+
 pub fn subnormalVerdict(got: []const u16, want: []const u16, input: []const u16, preserve32: bool) Verdict {
     var clean = true;
     var flushed_only = true;
@@ -636,6 +647,32 @@ test "the checker refuses planted outputs: a wrong word, a scribbled neighbor, a
     got[2] = 0x3f80; // NaN planted, finite read back
     try testing.expectEqual(@as(usize, 2), firstFault(&got, &want, &input, &named).?.token);
     _ = &named;
+}
+
+test "the run's accounting counts caught controls as passed: the device's numbers give total 6 and exit 0" {
+    // jw16 G13C: 1 kernel passing gates 1-4, 4 controls red as planted, the denormal row known
+    const t: g.Tally = .{ .kernels = 1, .passed = 1, .failed = 0, .controls = 4, .caught = 4, .missed = 0, .known = 0 };
+    const a = accounting(t, .known, false);
+    try testing.expectEqual(@as(usize, 5), a.passed);
+    try testing.expectEqual(@as(usize, 1), a.known);
+    try testing.expectEqual(@as(usize, 6), a.total);
+    try testing.expect(a.ok);
+    // a missed control, a failed kernel, a failed denormal row, a refused device each fail the run
+    var missed = t;
+    missed.caught = 3;
+    missed.missed = 1;
+    try testing.expect(!accounting(missed, .known, false).ok);
+    var failed = t;
+    failed.passed = 0;
+    failed.failed = 1;
+    try testing.expect(!accounting(failed, .known, false).ok);
+    try testing.expect(!accounting(t, .fail, false).ok);
+    try testing.expect(!accounting(t, .known, true).ok);
+    // a device that preserves denormals and passes the row: all six pass, none known
+    const clean = accounting(t, .pass, false);
+    try testing.expectEqual(@as(usize, 6), clean.passed);
+    try testing.expectEqual(@as(usize, 0), clean.known);
+    try testing.expect(clean.ok);
 }
 
 test "the denormal verdict is KNOWN only for the unchanged-logit flush on a device reporting no preservation" {
