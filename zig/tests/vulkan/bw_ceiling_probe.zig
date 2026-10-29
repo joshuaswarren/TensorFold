@@ -220,12 +220,13 @@ fn wordAt(bytes: []const u8, at: usize) u32 {
 }
 
 /// The FAIL line for a byte-exact check: names the first differing byte and
-/// the u32 words got/want there, so a device failure names the byte.
-fn printCheckFail(comptime what: []const u8, got: []const u8, want: []const u8) void {
+/// the u32 words got/want there, so a device failure names the byte. `args`
+/// are `what`'s own format arguments.
+fn printCheckFail(comptime what: []const u8, args: anytype, got: []const u8, want: []const u8) void {
     if (firstDiff(got, want)) |d| {
-        std.debug.print("FAIL check: " ++ what ++ "; first differing byte at {d}: got=0x{x:0>8} want=0x{x:0>8}\n", .{ d.offset, d.got, d.want });
+        std.debug.print("FAIL check: " ++ what ++ "; first differing byte at {d}: got=0x{x:0>8} want=0x{x:0>8}\n", args ++ .{ d.offset, d.got, d.want });
     } else {
-        std.debug.print("FAIL check: " ++ what ++ "; byte slices compare equal (aggregate mismatch)\n", .{});
+        std.debug.print("FAIL check: " ++ what ++ "; byte slices compare equal (aggregate mismatch)\n", args);
     }
 }
 
@@ -497,7 +498,7 @@ pub fn main(init: std.process.Init) !u8 {
     try vk.orExit(copy_pipe.run(&cmds, check_push_bytes, groups, timeout));
     try vk.orExit(vk.download(&cmds, check_dst, 0, staging, got_bytes, timeout));
     if (!std.mem.eql(u8, got_bytes, std.mem.sliceAsBytes(small))) {
-        printCheckFail("STREAM_COPY output differs from its source on the {d} KiB check buffer", got_bytes, std.mem.sliceAsBytes(small));
+        printCheckFail("STREAM_COPY output differs from its source on the {d} KiB check buffer", .{check_bytes >> 10}, got_bytes, std.mem.sliceAsBytes(small));
         return 1;
     }
 
@@ -506,7 +507,7 @@ pub fn main(init: std.process.Init) !u8 {
     try vk.orExit(read_pipe.run(&cmds, check_push_bytes, groups, timeout));
     try vk.orExit(vk.download(&cmds, red, 0, staging, std.mem.sliceAsBytes(red_got), timeout));
     if (xorWords(red_got) != xorWords(small)) {
-        printCheckFail("STREAM_READ xor does not match the host fold on the {d} KiB check buffer", std.mem.sliceAsBytes(red_got), std.mem.sliceAsBytes(small));
+        printCheckFail("STREAM_READ xor does not match the host fold on the {d} KiB check buffer", .{check_bytes >> 10}, std.mem.sliceAsBytes(red_got), std.mem.sliceAsBytes(small));
         return 1;
     }
 
@@ -521,7 +522,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     if (!std.mem.eql(u8, got_bytes, want_bytes)) {
-        printCheckFail("STREAM_WRITE output differs from the host pattern on the {d} KiB check buffer", got_bytes, want_bytes);
+        printCheckFail("STREAM_WRITE output differs from the host pattern on the {d} KiB check buffer", .{check_bytes >> 10}, got_bytes, want_bytes);
         return 1;
     }
     std.debug.print("MILESTONE checks-passed copy/read/write byte-exact on {d} KiB; timing begins\n", .{check_bytes >> 10});
