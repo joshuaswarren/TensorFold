@@ -110,13 +110,24 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     stage5_host.dependOn(&b.addRunArtifact(stage5_fixture_tests).step);
 
     const vulkan = module(b, target, optimize, o);
-    const gpu = b.addTest(.{ .root_module = b.createModule(.{
+    // The timing gpu test's own trivial kernel, compiled once like the probe's qmm fixture.
+    const timing_glslang = b.addSystemCommand(&.{ o.glslang orelse "glslang", "-V", "--target-env", "vulkan1.2", "-S", "comp", "-o" });
+    const timing_spv = timing_glslang.addOutputFileArg("timing_probe.spv");
+    timing_glslang.addFileArg(b.path("zig/kernels/vulkan/timing_probe.comp"));
+    const timing_files = b.addWriteFiles();
+    _ = timing_files.addCopyFile(timing_spv, "timing_probe.spv");
+    const gpu_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/vulkan/gpu_tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{.{ .name = "vulkan", .module = vulkan }},
-    }) });
+    });
+    gpu_mod.addImport("test_shaders", b.createModule(.{ .root_source_file = timing_files.add("timing_shader.zig",
+        \\pub const timing_probe align(4) = @embedFile("timing_probe.spv").*;
+        \\
+    ) }));
+    const gpu = b.addTest(.{ .root_module = gpu_mod });
     b.step("vulkan-gpu-build", "Compile the Vulkan device tests without running GPU work").dependOn(&gpu.step);
     b.step("vulkan-gpu-test", "Real Vulkan device selection and staged device-local buffer round trips").dependOn(&b.addRunArtifact(gpu).step);
     const glslang = o.glslang orelse "glslang";
