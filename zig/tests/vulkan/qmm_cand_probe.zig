@@ -220,8 +220,8 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
     // ---- correctness gates: A0's f64 bound, C1 bit-exact vs A0, C2/C3's pack bound
     if (!try runGate(cmds, staging, pipes[0], &bindings, push_bytes, groups_vec, timeout, ref_out, want, allowances, spec_a0, shape, "A0 real")) return false;
     // ---- DIAGNOSTIC, report-only: C1 and four suspect variants against A0 (real activations); nothing here is a result
-    const diag_labels = [_][]const u8{ "C1 pipelined", "C1v1 dq precise", "C1v2 precise accumulators", "C1v3 x as u32 words", "C1v4 all three" };
-    for ([_]usize{ 1, 6, 7, 8, 9 }, 0..) |vi, di| {
+    const diag_labels = [_][]const u8{ "C1 pipelined", "C1v1 dq precise", "C1v2 precise accumulators", "C1v3 x as u32 words", "C1v4 all three", "A0p the OLD kernel with precise accumulators" };
+    for ([_]usize{ 1, 6, 7, 8, 9, 10 }, 0..) |vi, di| {
         @memset(c_out, 0x7fc5);
         try pipes[vi].bind(&bindings);
         try vk.orExit(pipes[vi].run(cmds, push_bytes, groups_vec, timeout));
@@ -391,11 +391,13 @@ pub fn main(init: std.process.Init) !u8 {
     defer pipe_v3.deinit();
     var pipe_v4 = try dispatch.Pipeline.init(&dev, &shaders.qmm_cand_c1v4, layout);
     defer pipe_v4.deinit();
+    var pipe_a0p = try dispatch.Pipeline.init(&dev, &shaders.qmm_cand_a0p, layout);
+    defer pipe_a0p.deinit();
     if (!std.mem.eql(u32, &pipe_a0.local, &.{ 64, 1, 1 })) {
         std.debug.print("FAIL device: qmm_q4_pk local size is {any}, expected 64x1x1\n", .{pipe_a0.local});
         return 1;
     }
-    const pipes = [_]*dispatch.Pipeline{ &pipe_a0, &pipe_c1, &pipe_c2, &pipe_c3, &pipe_v2, &pipe_a3, &pipe_v1, &pipe_v2, &pipe_v3, &pipe_v4 };
+    const pipes = [_]*dispatch.Pipeline{ &pipe_a0, &pipe_c1, &pipe_c2, &pipe_c3, &pipe_v2, &pipe_a3, &pipe_v1, &pipe_v2, &pipe_v3, &pipe_v4, &pipe_a0p };
     const plan = qf.planCases(pr.limits.maxStorageBufferRange);
     if (!plan.head_fits) std.debug.print("SKIP served head n=248320 k=2048: packed Q4 weights exceed maxStorageBufferRange={d}; using largest listed fallback n={d} k={d}\n", .{ pr.limits.maxStorageBufferRange, plan.shapes[2][0], plan.shapes[2][1] });
     var completed: usize = 0;
