@@ -144,6 +144,42 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const run = b.addRunArtifact(probe);
     run.addPassthruArgs();
     b.step("vulkan-probe", "Run the Vulkan qmm probe on the chosen GPU (args after --)").dependOn(&run.step);
+    // Time the real compensated split-K Q4 projection at the served decode shapes.
+    const qmm_floor_files = b.addWriteFiles();
+    const qmm_floor_cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-o" });
+    const qmm_floor_spv = qmm_floor_cmd.addOutputFileArg("qmm_q4_pk_floor.spv");
+    qmm_floor_cmd.addFileArg(b.path("zig/kernels/vulkan/qmm_q4_pk.comp"));
+    _ = qmm_floor_files.addCopyFile(qmm_floor_spv, "qmm_q4_pk_floor.spv");
+    const qmm_floor_shaders = b.createModule(.{ .root_source_file = qmm_floor_files.add("qmm_floor_shaders.zig", "pub const qmm_q4_pk align(4) = @embedFile(\"qmm_q4_pk_floor.spv\").*;\n") });
+    const qmm_floor_contract = @import("kernel_contract.zig").module(b, target, .debug);
+    const qmm_floor_chunk_cap = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/backend/vulkan/chunk_cap.zig"), .target = target, .optimize = .debug });
+    const qmm_floor_probe = b.addExecutable(.{ .name = "tf-qmm-floor", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/qmm_floor_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "vulkan", .module = vulkan },
+            .{ .name = "contract", .module = qmm_floor_contract },
+            .{ .name = "qmm_pk_shaders", .module = qmm_floor_shaders },
+            .{ .name = "qwen35_chunk_cap", .module = qmm_floor_chunk_cap },
+        },
+    }) });
+    b.step("qmm-floor-build", "Build zig-out/bin/tf-qmm-floor and its SPIR-V without running GPU work").dependOn(&b.addInstallArtifact(qmm_floor_probe, .{}).step);
+    const qmm_floor_run = b.addRunArtifact(qmm_floor_probe);
+    qmm_floor_run.addPassthruArgs();
+    b.step("qmm-floor-run", "Run the qmm-floor probe on the chosen device (args after --)").dependOn(&qmm_floor_run.step);
+    const qmm_floor_host_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/qmm_floor_probe.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+        .imports = &.{
+            .{ .name = "vulkan", .module = module(b, b.graph.host, .debug, o) },
+            .{ .name = "contract", .module = @import("kernel_contract.zig").module(b, b.graph.host, .debug) },
+            .{ .name = "qwen35_chunk_cap", .module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/backend/vulkan/chunk_cap.zig"), .target = b.graph.host, .optimize = .debug }) },
+        },
+    }) });
+    host.dependOn(&b.addRunArtifact(qmm_floor_host_tests).step);
 
 
     // Stage 1: the operator variants as SPIR-V assets, and the GPU probe from the fixture owner's root.
