@@ -244,6 +244,44 @@ test "TF_VK_FUSE_SWIGLU and the census: 24 swiglu dispatches go, 376 remain" {
     try testing.expectEqual(@as(u64, 376), 490 - saved_by_b - swiglu_dispatches);
 }
 
+test "candidate D's add-norm pairs: 47 of 48 adds fuse, 14 norms survive" {
+    // The decode tower's (add, norm) pairs, read off the engine: every layer's
+    // post-mixer addNorm (24) plus every layer after the first taking its
+    // input norm from an addNorm (23). Not pairs, left alone: layer 0's plain
+    // input norm, the final add + last-row norm in finish, the per-head q/k
+    // norms (6 full layers x 2) and the gated GDN norms (18).
+    const layers = 24;
+    var pairs: u64 = 0;
+    var adds: u64 = 0; // add_preserve_bf16 / add_bf16 dispatches
+    var norms: u64 = 0; // norm_bf16 dispatches
+    for (0..layers) |i| {
+        if (i != 0) {
+            pairs += 1; // the previous MLP's output add feeding this layer's input norm
+            adds += 1;
+            norms += 1;
+        } else {
+            norms += 1; // layer 0's plain input norm: no add
+        }
+        pairs += 1; // the mixer output add feeding the post-attention norm
+        adds += 1;
+        norms += 1;
+        if (i % 4 == 3) norms += 2; // the full layer's q and k head norms
+        // GDN layers' gated norm and full layers' gated attention norm ride
+        // their own kernels (gated_norm / gate), never the pair. The MLP
+        // output add and its norm ARE the next layer's input pair (or, after
+        // the last layer, finish's), counted where they run.
+    }
+    adds += 1; // finish's final add
+    norms += 1; // finish's final norm: last row only, never fused
+    try testing.expectEqual(@as(u64, 47), pairs);
+    try testing.expectEqual(@as(u64, 48), adds); // the K receipts' add count
+    try testing.expectEqual(@as(u64, 61), norms); // the K receipts' norm count
+    try testing.expectEqual(@as(u64, 14), norms - pairs); // surviving norms
+    try testing.expectEqual(@as(u64, 1), adds - pairs); // surviving adds
+    // census: C leaves 376 dispatches; each fused pair removes one dispatch
+    try testing.expectEqual(@as(u64, 376 - 47), 376 - pairs);
+}
+
 /// The single-row qmm chain on the host, over packed words exactly as
 /// uploaded (the affine_fixture replay's in-order acc += x * (s q + b),
 /// bf16 params widened exactly): one output element per weight row.
