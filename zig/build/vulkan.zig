@@ -402,7 +402,19 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         },
     });
     host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = contract_fixture })).step);
-    // The gdn group's host proofs: walker vs the stage 4 fixture's, depth shape honesty, stress sums' f32 and fp16 margins
+    // The parallel-K fixture's host proofs: stated depth, one-row routing, every control's arithmetic refused by its checker.
+    const contract_pk_fixture = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/contract_qmm_pk.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+        .imports = &.{
+            .{ .name = "vulkan", .module = module(b, b.graph.host, .debug, o) },
+            .{ .name = "contract", .module = @import("kernel_contract.zig").module(b, b.graph.host, .debug) },
+            .{ .name = "qwen35_chunk_cap", .module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/backend/vulkan/chunk_cap.zig"), .target = b.graph.host, .optimize = .debug }) },
+        },
+    });
+    host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = contract_pk_fixture })).step);
+    // The gdn group's host proofs: walker vs the stage 4 fixture's, depth shape honesty, stress sums' f32 and fp16 margins.
     const contract_gdn_fixture = b.createModule(.{
         .root_source_file = b.path("zig/tests/vulkan/contract_gdn.zig"),
         .target = b.graph.host,
@@ -467,10 +479,35 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         }
         break :blk out;
     };
+    // The one-row parallel-K kernel and its five controls (contract_controls_pk.comp, a copy of
+    // the kernel with one fault per define), compiled for the same runner.
+    const pk_cmd = b.addSystemCommand(&.{ contract_glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-o" });
+    const qmm_q4_pk = pk_cmd.addOutputFileArg("qmm_q4_pk.spv");
+    pk_cmd.addFileArg(b.path("zig/kernels/vulkan/qmm_q4_pk.comp"));
+    const pk_variants = .{
+        .{ "pk_drop_tail", "-DTF_CTL_PK_DROP_TAIL=1" },
+        .{ "pk_fp16_accum", "-DTF_CTL_PK_FP16=1" },
+        .{ "pk_skip_level", "-DTF_CTL_PK_SKIP_LEVEL=1" },
+        .{ "pk_write_weights", "-DTF_CTL_PK_WRITE_W=1" },
+        .{ "pk_write_biases", "-DTF_CTL_PK_WRITE_B=1" },
+    };
+    const pk_controls: [5]std.Build.LazyPath = blk: {
+        var out: [5]std.Build.LazyPath = undefined;
+        inline for (pk_variants, 0..) |variant, i| {
+            const command = b.addSystemCommand(&.{ contract_glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", variant[1], "-o" });
+            out[i] = command.addOutputFileArg(variant[0] ++ ".spv");
+            command.addFileArg(b.path("zig/kernels/vulkan/contract_controls_pk.comp"));
+        }
+        break :blk out;
+    };
     const contract_files = b.addWriteFiles();
     _ = contract_files.addCopyFile(qmm_bf16, "qmm_bf16.spv");
     inline for (variants, 0..) |variant, i| {
         _ = contract_files.addCopyFile(controls[i], variant[0] ++ ".spv");
+    }
+    _ = contract_files.addCopyFile(qmm_q4_pk, "qmm_q4_pk.spv");
+    inline for (pk_variants, 0..) |variant, i| {
+        _ = contract_files.addCopyFile(pk_controls[i], variant[0] ++ ".spv");
     }
     const contract_shaders = b.createModule(.{ .root_source_file = contract_files.add("vulkan_contract_shaders.zig", "pub const qmm_bf16 align(4) = @embedFile(\"qmm_bf16.spv\").*;\n" ++
         "pub const qmm_fmax align(4) = @embedFile(\"qmm_fmax.spv\").*;\n" ++
@@ -478,7 +515,13 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         "pub const scribble_sum align(4) = @embedFile(\"scribble_sum.spv\").*;\n" ++
         "pub const drop_tail align(4) = @embedFile(\"drop_tail.spv\").*;\n" ++
         "pub const fp16_accum align(4) = @embedFile(\"fp16_accum.spv\").*;\n" ++
-        "pub const over_limit align(4) = @embedFile(\"over_limit.spv\").*;\n") });
+        "pub const over_limit align(4) = @embedFile(\"over_limit.spv\").*;\n" ++
+        "pub const qmm_q4_pk align(4) = @embedFile(\"qmm_q4_pk.spv\").*;\n" ++
+        "pub const pk_drop_tail align(4) = @embedFile(\"pk_drop_tail.spv\").*;\n" ++
+        "pub const pk_fp16_accum align(4) = @embedFile(\"pk_fp16_accum.spv\").*;\n" ++
+        "pub const pk_skip_level align(4) = @embedFile(\"pk_skip_level.spv\").*;\n" ++
+        "pub const pk_write_weights align(4) = @embedFile(\"pk_write_weights.spv\").*;\n" ++
+        "pub const pk_write_biases align(4) = @embedFile(\"pk_write_biases.spv\").*;\n") });
     const contract_module = @import("kernel_contract.zig").module(b, target, .debug);
     const contract_exe = b.addExecutable(.{ .name = "tf-vulkan-kernel-contract", .root_module = b.createModule(.{
         .root_source_file = b.path(o.contract_root orelse "zig/tests/vulkan/contract_main.zig"),
@@ -495,6 +538,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
             .{ .name = "stage5_shaders", .module = stage5_shaders_mod },
             .{ .name = "core", .module = contract_module },
             .{ .name = "contract", .module = contract_module },
+            .{ .name = "qwen35_chunk_cap", .module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/backend/vulkan/chunk_cap.zig"), .target = target, .optimize = .debug }) },
         },
     }) });
     const contract_install = b.addInstallArtifact(contract_exe, .{});
