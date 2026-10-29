@@ -20,7 +20,7 @@ pub const Params = extern struct {
     in_strides: [4]u32 = .{ 0, 0, 0, 0 }, out_strides: [4]u32 = .{ 0, 0, 0, 0 },
 };
 comptime { if (@sizeOf(Params) != 120) @compileError("qmm.comp push constants must stay 120 bytes"); }
-fn depth(s: c.Shape) usize { return s.k + 2; }
+pub fn depth(s: c.Shape) usize { return s.k + 2; }
 // The shapes the Qwen3.5-2B engine calls the projection at (K 2048 and 6144, N from the 16-wide gates up to the
 // 248320-row head, M = 1 for decode and up to 32 rows for a prefill chunk), plus the small fixture shapes.
 const served = [_]c.Shape{
@@ -36,7 +36,7 @@ pub const spec: c.Spec = .{
 };
 
 /// The shared gate harness expects a rig object; as in HIP, it exposes bytes while the fixture owns device buffers.
-const Rig = struct {
+pub const Rig = struct {
     output: []const u8 = &.{},
     inputs: []const u8 = &.{},
     guards_ok: bool = false,

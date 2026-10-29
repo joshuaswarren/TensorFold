@@ -4,6 +4,7 @@ const vk = @import("vulkan");
 const shaders = @import("vulkan_shaders");
 const core = @import("core");
 const fx = @import("contract_qmm.zig");
+const fxpk = @import("contract_qmm_pk.zig");
 const g = core.gates;
 const records = core.vulkan_records;
 
@@ -54,6 +55,34 @@ pub fn main(init: std.process.Init) !u8 {
     writes_w.corrupt = 1;
     var writes_b = fx.Fixture.init(init.gpa, &dev, &cmds, staging, &p_b); defer writes_b.deinit();
     writes_b.corrupt = 3;
+
+    // The one-row parallel-K kernel: its own pipeline (64 lanes a workgroup) and five planted
+    // controls compiled from contract_controls_pk.comp, a copy of the kernel with one fault each.
+    // The two input-write controls declare their writable input binding, so the checked disjoint
+    // binding rule sees what the fault writes.
+    var pk_pipeline = try vk.dispatch.Pipeline.init(&dev, &shaders.qmm_q4_pk, layout); defer pk_pipeline.deinit();
+    if (!std.mem.eql(u32, &pk_pipeline.local, &.{ fxpk.local_size_x, 1, 1 })) {
+        std.debug.print("FAIL qmm_q4_pk: the pipeline's local size is {any}, the fixture states {d}\n", .{ pk_pipeline.local, fxpk.local_size_x });
+        return 1;
+    }
+    const pk_control_layout: vk.dispatch.Layout = .{ .bindings = 5, .push_bytes = @sizeOf(fx.Params), .writes = 1 << 4 };
+    const pk_writes_w_layout: vk.dispatch.Layout = .{ .bindings = 5, .push_bytes = @sizeOf(fx.Params), .writes = (1 << 4) | (1 << 1) };
+    const pk_writes_b_layout: vk.dispatch.Layout = .{ .bindings = 5, .push_bytes = @sizeOf(fx.Params), .writes = (1 << 4) | (1 << 3) };
+    var p_pk_tail = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_drop_tail, pk_control_layout); defer p_pk_tail.deinit();
+    var p_pk_fp16 = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_fp16_accum, pk_control_layout); defer p_pk_fp16.deinit();
+    var p_pk_skip = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_skip_level, pk_control_layout); defer p_pk_skip.deinit();
+    var p_pk_write_w = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_write_weights, pk_writes_w_layout); defer p_pk_write_w.deinit();
+    var p_pk_write_b = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_write_biases, pk_writes_b_layout); defer p_pk_write_b.deinit();
+    var pk_fixture = fxpk.Fixture.init(init.gpa, &dev, &cmds, staging, &pk_pipeline); defer pk_fixture.deinit();
+    var pk_controls = [_]fxpk.Fixture{
+        fxpk.Fixture.initControl(init.gpa, &dev, &cmds, staging, &p_pk_tail, .drop_tail),
+        fxpk.Fixture.initControl(init.gpa, &dev, &cmds, staging, &p_pk_fp16, .fp16_accum),
+        fxpk.Fixture.initControl(init.gpa, &dev, &cmds, staging, &p_pk_skip, .skip_level),
+        fxpk.Fixture.initControl(init.gpa, &dev, &cmds, staging, &p_pk_write_w, .write_weights),
+        fxpk.Fixture.initControl(init.gpa, &dev, &cmds, staging, &p_pk_write_b, .write_biases),
+    };
+    defer for (&pk_controls) |*control| control.deinit();
+
     var controls = [_]fx.Control{
         fx.Control.init(init.gpa, &dev, &cmds, staging, &p_fmax, .qmm_fmax),
         fx.Control.init(init.gpa, &dev, &cmds, staging, &p_atomic, .atomic_sum),
@@ -62,15 +91,17 @@ pub fn main(init: std.process.Init) !u8 {
         fx.Control.init(init.gpa, &dev, &cmds, staging, &p_fp16, .fp16_accum),
     };
     defer for (&controls) |*control| control.deinit();
-    var kernels: [8]g.Kernel = undefined;
+    var kernels: [14]g.Kernel = undefined;
     kernels[0] = fixture.kernel();
     for (&controls, 1..) |*control, i| kernels[i] = control.kernel();
     kernels[6] = writes_w.kernel();
     kernels[7] = writes_b.kernel();
+    kernels[8] = pk_fixture.kernel();
+    for (&pk_controls, 9..) |*control, i| kernels[i] = control.kernel();
     const start = std.Io.Clock.awake.now(init.io);
     tally.controls += gate5_controls;
     tally.caught += gate5_controls;
-    try g.runAll(init.gpa, &kernels, 0x766b, &tally);
+    try g.runAll(init.gpa, &kernels, fxpk.runner_seed, &tally);
     const elapsed = start.durationTo(std.Io.Clock.awake.now(init.io)).toMilliseconds();
     std.debug.print("SUMMARY {s} {d} kernels: {d} pass gates 1-4, {d} fail, {d} known findings; {d} controls: {d} caught, {d} missed; {d} limit failures; gates {d} ms\n", .{ name, tally.kernels, tally.passed, tally.failed, tally.known, tally.controls, tally.caught, tally.missed, problems, elapsed });
     if (tally.problems() != 0 or tally.missed != 0 or problems != 0) return 1;

@@ -30,6 +30,11 @@ pub const devices = [_]limits.VulkanDeviceLimits{
 
 pub const records = [_]Record{
     .{ .launch = .{ .name = "qmm_bf16", .local_size = .{ 256, 1, 1 } } },
+    // The one-row parallel-K kernel: 64 lanes, the TwoSum tree's two shared arrays (512 bytes).
+    // Its five contract controls compile from the same source copy with the same launch shape,
+    // so this record covers their launches too; the two input-write controls only widen the
+    // writable-binding mask, never the workgroup or the shared bytes.
+    .{ .launch = .{ .name = "qmm_q4_pk", .local_size = .{ 64, 1, 1 }, .shared_bytes = 512 } },
     .{ .launch = .{ .name = "control:qmm_fmax_nonfinite", .local_size = .{ 256, 1, 1 } }, .control_gate = 1 },
     .{ .launch = .{ .name = "control:atomic_sum", .local_size = .{ 256, 1, 1 } }, .control_gate = 2 },
     .{ .launch = .{ .name = "control:scribble_input", .local_size = .{ 256, 1, 1 } }, .control_gate = 2 },
