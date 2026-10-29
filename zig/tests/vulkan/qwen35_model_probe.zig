@@ -382,6 +382,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer engine.deinit();
     std.debug.print("MILESTONE engine-ready elapsed_ms={d} capacity={d} model_context={d} logits_bytes={d}\n", .{ clock.ms(), engine.capacity(), engine.modelContext(), engine.logitsLen() });
     std.debug.print("MILESTONE barrier-elision {s}\n", .{if (q35v.vk.dispatch.elide_barriers) "on" else "off (TF_VK_NOBAR=0)"});
+    std.debug.print("MILESTONE group-fusion {s}\n", .{if (engine.model.fuse_switch) "on" else "off (TF_VK_FUSE=0)"});
     switch (engine.ops.qmm_path) {
         .sg => std.debug.print("MILESTONE qmm-path sg\n", .{}),
         .old_env => std.debug.print("MILESTONE qmm-path old (TF_VK_QMM=old)\n", .{}),
