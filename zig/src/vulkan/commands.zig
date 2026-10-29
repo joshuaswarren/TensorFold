@@ -21,6 +21,9 @@ pub const Commands = struct {
     batch_staging: Buffer = undefined,
 
     pub fn init(dev: *const Device) Error!Commands {
+        // The elision switch, read once per engine: TF_VK_NOBAR=0 restores the
+        // barrier after every dispatch for a same-binary A/B.
+        dispatch.elide_barriers = dispatch.elideFromEnv(std.c.getenv("TF_VK_NOBAR"));
         const api = &dev.api;
         const pool_info: c.VkCommandPoolCreateInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -54,6 +57,7 @@ pub const Commands = struct {
     /// The command buffer, reset and begun for one submission; in an open batch it is the batch already-begun buffer.
     pub fn begin(self: *Commands) Error!c.VkCommandBuffer {
         if (self.session) return self.cmd;
+        dispatch.hazard_pending.clear(); // a fresh submission orders nothing against an abandoned record
         try check(self.dev.api.vkResetCommandBuffer(self.cmd, 0));
         const info: c.VkCommandBufferBeginInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -73,6 +77,7 @@ pub const Commands = struct {
     /// Physical submission: end, one vkQueueSubmit, one finite fence wait, fence reset; only with no batch open.
     fn submitAndWait(self: *Commands, timeout_ns: u64) Error!void {
         const api = &self.dev.api;
+        dispatch.flushHazard(self.dev, self.cmd); // the submission ends here: the last deferred barrier is owed
         try check(api.vkEndCommandBuffer(self.cmd));
         const info: c.VkSubmitInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -94,10 +99,17 @@ pub const Commands = struct {
 
     // ------------------------------------------------ batch session
 
-    /// Opens a batch: one reset+begin and fresh staging ledgers; nesting refused; failure rolls the contexts back.
-    pub fn beginBatch(self: *Commands, staging: Buffer) Error!void {
+    /// Opens a batch: one reset+begin and fresh staging ledgers against `staging`. Nested batches
+    /// are refused. The physical reset+begin happens BEFORE the session and
+    /// the global batch contexts are considered open, and any begin failure
+    /// rolls those contexts back, so recording never rides a stale command
+    /// buffer. Batched descriptor banks key on the new epoch, so every
+    /// pipeline's snapshot cursor restarts only here — always after the
+    /// previous batch's fence has been waited.
+    pub fn beginBatch(self: *Commands, staging: Buffer) dispatch.Error!void {
         if (self.session) return error.Invalid;
         if (staging.dev != self.dev or staging.kind != .staging or staging.mapped == null) return error.Invalid;
+        dispatch.hazard_pending.clear(); // the previous batch flushed at its end; an abandoned one never ran
         try self.lifecycle.start();
         dispatch.batchBegin();
         errdefer { // begin failed before anything was recorded: undo the global batch contexts
@@ -116,9 +128,16 @@ pub const Commands = struct {
         self.batch_staging = staging;
     }
 
-    /// The batch's one submission: staging flush, one end/submit/fence cycle, invalidate; contexts close on every path.
-    pub fn endBatch(self: *Commands, timeout_ns: u64) Error!void {
+    /// Records the one physical submission of the open batch: the staging
+    /// flush, one end/submit/fence-wait cycle for the whole token, then the
+    /// staging invalidate so the host can read the down slices. The batch
+    /// contexts close on EVERY path — a pre-submit flush/end/submit failure
+    /// unconditionally closes them, so the next call starts clean; the fence
+    /// discipline is unchanged (Timeout/InFlight still demand orExit at the
+    /// call site).
+    pub fn endBatch(self: *Commands, timeout_ns: u64) dispatch.Error!void {
         if (!self.session) return error.Invalid;
+        dispatch.flushHazard(self.dev, self.cmd); // the batch's last deferred barrier, before the buffer ends
         self.session = false;
         dispatch.batchEnd();
         defer self.lifecycle.finish();
@@ -132,6 +151,7 @@ pub const Commands = struct {
         if (!self.session) return;
         self.session = false;
         dispatch.batchEnd();
+        dispatch.hazard_pending.clear(); // nothing was submitted, so nothing is owed
         self.lifecycle.finish();
     }
 
@@ -228,7 +248,9 @@ pub fn orExit(result: anytype) @TypeOf(result) {
 }
 
 /// One global memory dependency: `src_access` by `src_stage` made visible to `dst_access` by `dst_stage`.
+/// Any non-dispatch command boundary: a deferred dispatch barrier is emitted here first.
 pub fn barrier(dev: *const Device, cmd: c.VkCommandBuffer, src_stage: u32, src_access: u32, dst_stage: u32, dst_access: u32) void {
+    dispatch.flushHazard(dev, cmd);
     const b: c.VkMemoryBarrier = .{
         .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
         .srcAccessMask = src_access,
@@ -247,6 +269,7 @@ pub fn fillRange(buf_len: u64, offset: u64, len: u64) Error!void {
 pub fn recordFill(dev: *const Device, cmd: c.VkCommandBuffer, dst: Buffer, offset: u64, len: u64, value: u32) Error!void {
     if (dst.dev != dev or dst.kind != .device) return error.Invalid;
     try fillRange(dst.len, offset, len);
+    dispatch.flushHazard(dev, cmd); // the fill writes a buffer earlier dispatches may have touched
     dev.api.vkCmdFillBuffer(cmd, dst.handle, offset, len, value);
 }
 

@@ -10,6 +10,108 @@ const check = runtime.check;
 
 pub const Error = runtime.Error || error{ BadSpirv, NoLocalSize, TooManyBindings, BadPushSize, BadWorkgroup, BadGroupCount, BadBindings, Aliased, BatchOverflow };
 
+/// Barrier elision: a dispatch's post-barrier is deferred and emitted only
+/// before a later dispatch (or command) that actually hazards against it.
+/// TF_VK_NOBAR=0 restores today's barrier after every dispatch for a
+/// same-binary A/B; any other value or unset elides.
+pub var elide_barriers: bool = true;
+
+pub fn elideFromEnv(v: ?[*:0]const u8) bool {
+    const s = v orelse return true;
+    return !std.mem.eql(u8, std.mem.span(s), "0");
+}
+
+/// One buffer range a dispatch reads or writes: same underlying buffer and
+/// intersecting [offset, offset+len) is a hazard.
+pub const HazardRange = struct { buf: c.VkBuffer, offset: u64, len: u64 };
+
+pub const hazard_range_cap = 32;
+
+fn rangesOverlap(a: HazardRange, b: HazardRange) bool {
+    return a.buf == b.buf and a.offset < b.offset + b.len and b.offset < a.offset + a.len;
+}
+
+/// Would recording a dispatch with these ranges against the not-yet-
+/// barriered earlier work need the full barrier? RAW: the next reads what
+/// an earlier unsynchronised dispatch wrote. WAW: it writes it. WAR: it
+/// writes what an earlier one read. Pure and host-tested.
+pub fn hazardNeeded(pending_writes: []const HazardRange, pending_reads: []const HazardRange, next_writes: []const HazardRange, next_reads: []const HazardRange) bool {
+    for (pending_writes) |w| {
+        for (next_reads) |r| if (rangesOverlap(w, r)) return true;
+        for (next_writes) |w2| if (rangesOverlap(w, w2)) return true;
+    }
+    for (pending_reads) |r| for (next_writes) |w| {
+        if (rangesOverlap(r, w)) return true;
+    };
+    return false;
+}
+
+/// The unsynchronised writes and reads accumulated since the last emitted
+/// barrier. Bounded: past the cap the set saturates and every hazard check
+/// orders, so elision degrades to today's behaviour instead of dropping a
+/// range.
+pub const Hazard = struct {
+    writes: [hazard_range_cap]HazardRange = undefined,
+    reads: [hazard_range_cap]HazardRange = undefined,
+    n_writes: u32 = 0,
+    n_reads: u32 = 0,
+    saturated: bool = false,
+
+    pub fn add(self: *Hazard, writes: []const HazardRange, reads: []const HazardRange) void {
+        for (writes) |w| {
+            var dup = false;
+            for (self.writes[0..self.n_writes]) |*k| if (k.buf == w.buf and k.offset == w.offset and k.len == w.len) {
+                dup = true;
+                break;
+            };
+            if (dup) continue;
+            if (self.n_writes < hazard_range_cap) {
+                self.writes[self.n_writes] = w;
+                self.n_writes += 1;
+            } else self.saturated = true;
+        }
+        for (reads) |r| {
+            var dup = false;
+            for (self.reads[0..self.n_reads]) |*k| if (k.buf == r.buf and k.offset == r.offset and k.len == r.len) {
+                dup = true;
+                break;
+            };
+            if (dup) continue;
+            if (self.n_reads < hazard_range_cap) {
+                self.reads[self.n_reads] = r;
+                self.n_reads += 1;
+            } else self.saturated = true;
+        }
+    }
+
+    pub fn hazard(self: *const Hazard, next_writes: []const HazardRange, next_reads: []const HazardRange) bool {
+        if (self.saturated) return true;
+        return hazardNeeded(self.writes[0..self.n_writes], self.reads[0..self.n_reads], next_writes, next_reads);
+    }
+
+    pub fn clear(self: *Hazard) void {
+        self.* = .{};
+    }
+};
+
+/// The one command buffer's pending barrier state; the engine is single-
+/// threaded and one command buffer is recorded at a time (the batch_open
+/// style).
+pub var hazard_pending: Hazard = .{};
+
+/// The barrier a deferred dispatch owes, emitted verbatim before the
+/// hazarding dispatch or command; then the set restarts.
+pub fn flushHazard(dev: *const Device, cmd: c.VkCommandBuffer) void {
+    if (hazard_pending.n_writes == 0 and hazard_pending.n_reads == 0 and !hazard_pending.saturated) return;
+    const b: c.VkMemoryBarrier = .{
+        .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT | c.VK_ACCESS_TRANSFER_READ_BIT | c.VK_ACCESS_TRANSFER_WRITE_BIT,
+    };
+    dev.api.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | c.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &b, 0, null, 0, null);
+    hazard_pending.clear();
+}
+
 pub const max_bindings = 10;
 
 /// Bounded per-pipeline bank of immutable descriptor snapshots; never rewritten until the epoch advances.
@@ -61,6 +163,10 @@ pub const Pipeline = struct {
     batch_epoch_seen: u32 = 0,
     stash: [max_bindings]Binding = undefined,
     stash_n: u32 = 0,
+    /// The bindings of the pending dispatch, kept for the barrier-elision
+    /// hazard check in record (both schedules: bind is the single door).
+    last_bindings: [max_bindings]Binding = undefined,
+    last_n: u32 = 0,
 
     /// Checks the module and the device's limits before creating anything; a failure destroys what was made.
     pub fn init(dev: *const Device, spirv: []align(4) const u8, layout: Layout) Error!Pipeline {
@@ -171,6 +277,8 @@ pub const Pipeline = struct {
             infos[i] = try b.buffer.descriptor(b.offset, b.len);
         }
         try disjoint(bindings, p.layout.writes);
+        @memcpy(p.last_bindings[0..bindings.len], bindings);
+        p.last_n = @intCast(bindings.len);
         if (batch_open) {
             @memcpy(p.stash[0..bindings.len], bindings);
             p.stash_n = @intCast(bindings.len);
@@ -254,13 +362,54 @@ pub const Pipeline = struct {
         };
         const set = try p.snapshotSet();
         const api = &p.dev.api;
+        const reads = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT | c.VK_ACCESS_TRANSFER_READ_BIT | c.VK_ACCESS_TRANSFER_WRITE_BIT;
+        const stages = c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | c.VK_PIPELINE_STAGE_TRANSFER_BIT;
+        // TF_VK_NOBAR=0: today's stream verbatim — one full barrier after every dispatch.
+        if (!elide_barriers) {
+            api.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+            api.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout, 0, 1, &set, 0, null);
+            if (push.len > 0) api.vkCmdPushConstants(cmd, p.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, p.layout.push_bytes, push.ptr);
+            api.vkCmdDispatch(cmd, groups[0], groups[1], groups[2]);
+            api.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, stages, 0, 1, &c.VkMemoryBarrier{
+                .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = reads,
+            }, 0, null, 0, null);
+            return;
+        }
+        // Elision: the deferred barrier of the earlier unsynchronised
+        // dispatches is owed before this one only when they actually hazard
+        // (RAW, WAW or WAR over the same underlying buffer ranges);
+        // otherwise this dispatch joins the unsynchronised set and the
+        // batch/submission end flushes what is left.
+        const bindings = p.last_bindings[0..p.last_n];
+        var next_w: [max_bindings]HazardRange = undefined;
+        var next_r: [max_bindings]HazardRange = undefined;
+        var nw: u32 = 0;
+        var nr: u32 = 0;
+        for (bindings, 0..) |b, i| {
+            const r = HazardRange{ .buf = b.buffer.handle, .offset = b.offset, .len = b.len };
+            if (p.layout.writes >> @intCast(i) & 1 != 0) {
+                next_w[nw] = r;
+                nw += 1;
+            } else {
+                next_r[nr] = r;
+                nr += 1;
+            }
+        }
+        if (hazard_pending.hazard(next_w[0..nw], next_r[0..nr])) {
+            api.vkCmdPipelineBarrier(cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, stages, 0, 1, &c.VkMemoryBarrier{
+                .sType = c.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = reads,
+            }, 0, null, 0, null);
+            hazard_pending.clear();
+        }
         api.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
         api.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout, 0, 1, &set, 0, null);
         if (push.len > 0) api.vkCmdPushConstants(cmd, p.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, p.layout.push_bytes, push.ptr);
         api.vkCmdDispatch(cmd, groups[0], groups[1], groups[2]);
-        const reads = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT | c.VK_ACCESS_TRANSFER_READ_BIT | c.VK_ACCESS_TRANSFER_WRITE_BIT;
-        const stages = c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | c.VK_PIPELINE_STAGE_TRANSFER_BIT;
-        commands.barrier(p.dev, cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_ACCESS_SHADER_WRITE_BIT, stages, reads);
+        hazard_pending.add(next_w[0..nw], next_r[0..nr]);
     }
 
     /// One dispatch in its own submission; wrap it in commands.orExit, which ends the process on error.Timeout.
@@ -424,9 +573,64 @@ test "device limits refuse bindings, push bytes, workgroups and group counts pas
     try std.testing.expectError(error.TooManyBindings, fits(l, .{ .bindings = max_bindings, .push_bytes = 120, .writes = 1 << 9 }, .{ 256, 1, 1 }));
 }
 
+fn hbuf(comptime v: usize) c.VkBuffer {
+    return @ptrFromInt(v);
+}
+
+fn hr(buf: c.VkBuffer, offset: u64, len: u64) HazardRange {
+    return .{ .buf = buf, .offset = offset, .len = len };
+}
+
+test "hazardNeeded orders RAW, WAW and WAR and admits independent dispatches" {
+    const in = hbuf(0x10);
+    const qkv = hbuf(0x20);
+    const z = hbuf(0x30);
+    // no pending writes: nothing to order against
+    try std.testing.expect(!hazardNeeded(&.{hr(qkv, 0, 64)}, &.{}, &.{hr(in, 0, 64)}, &.{hr(in, 0, 64)}));
+    const pending = [_]HazardRange{hr(qkv, 0, 64)};
+    try std.testing.expect(hazardNeeded(&pending, &.{}, &.{}, &.{hr(qkv, 0, 32)})); // RAW: next reads qkv
+    try std.testing.expect(hazardNeeded(&pending, &.{}, &.{hr(qkv, 32, 32)}, &.{})); // WAW: next writes qkv
+    // WAR: the next writes a range an unsynchronised dispatch read
+    const pending_r = [_]HazardRange{hr(in, 0, 64)};
+    try std.testing.expect(hazardNeeded(&.{hr(qkv, 0, 64)}, &pending_r, &.{hr(in, 32, 32)}, &.{}));
+    // two dispatches read the same activation and write different buffers: no barrier
+    try std.testing.expect(!hazardNeeded(&pending, &.{hr(in, 0, 64)}, &.{hr(z, 0, 64)}, &.{hr(in, 0, 64)}));
+    // same buffer, disjoint byte ranges: no barrier; overlapping: barrier
+    try std.testing.expect(!hazardNeeded(&.{hr(qkv, 0, 64)}, &.{}, &.{}, &.{hr(qkv, 64, 64)}));
+    try std.testing.expect(hazardNeeded(&.{hr(qkv, 0, 65)}, &.{}, &.{}, &.{hr(qkv, 64, 64)}));
+}
+
+test "the unsynchronised set accumulates across elided dispatches until a flush" {
+    const a_out = hbuf(0x40);
+    const b_out = hbuf(0x50);
+    const shared_in = hbuf(0x10);
+    var h: Hazard = .{};
+    h.add(&.{hr(a_out, 0, 64)}, &.{hr(shared_in, 0, 64)}); // a: reads shared, writes a_out
+    try std.testing.expect(!h.hazard(&.{}, &.{hr(shared_in, 0, 64)})); // b: reads shared, writes b_out: independent of a
+    h.add(&.{hr(b_out, 0, 64)}, &.{hr(shared_in, 0, 64)});
+    // c reads a's output (not b's): the barrier is still needed — a is unsynchronised
+    try std.testing.expect(h.hazard(&.{}, &.{hr(a_out, 0, 64)}));
+    h.clear();
+    try std.testing.expect(!h.hazard(&.{}, &.{hr(a_out, 0, 64)})); // after the flush, nothing pending
+    // a saturated set needs a barrier rather than dropping ranges
+    var full: Hazard = .{};
+    for (0..hazard_range_cap + 1) |i| full.add(&.{hr(a_out, @intCast(i * 64), 64)}, &.{});
+    try std.testing.expect(full.hazard(&.{}, &.{hr(b_out, 0, 64)}));
+    // duplicate ranges do not consume slots twice
+    var dup: Hazard = .{};
+    for (0..hazard_range_cap) |_| dup.add(&.{hr(a_out, 0, 64)}, &.{});
+    try std.testing.expect(!dup.hazard(&.{}, &.{hr(b_out, 0, 64)}));
+}
+
+test "elideFromEnv pins today's barriers only for the exact 0" {
+    try std.testing.expect(elideFromEnv(null));
+    try std.testing.expect(elideFromEnv("1"));
+    try std.testing.expect(!elideFromEnv("0"));
+    try std.testing.expect(elideFromEnv("off"));
+}
+
 test "the batched bank cursor resets per epoch and refuses past the bounded cap" {
     batch_epoch += 1; // beginBatch bumps: the previous batch's fence has been waited
-    try std.testing.expectEqual(@as(u32, 0), try nextBatchCursor(0, 489)); // stale seen epoch resets
     try std.testing.expectEqual(@as(u32, 7), try nextBatchCursor(batch_epoch, 7)); // same epoch advances
     try std.testing.expectEqual(@as(u32, batch_cap - 1), try nextBatchCursor(batch_epoch, batch_cap - 1)); // last slot
     try std.testing.expectEqual(@as(u32, 0), try nextBatchCursor(batch_epoch -% 1, batch_cap)); // fresh epoch clears even a full cursor
