@@ -569,11 +569,17 @@ fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const
     }
     ids_out[0] = try e.draw();
     try e.logitsBytes(rows_out[0..row_len]);
+    // The steady window for the barrier census: the prefill and the warm-up
+    // draw above are excluded; the counters cover exactly the tokens below.
+    q35v.vk.dispatch.barrier_census.reset();
     for (1..ids_out.len) |step| {
         const feed: u32 = if (teacher_forced) expected[step - 1] else ids_out[step - 1];
         samples_out[step - 1] = try steadyToken(io, e, step, feed, rows_out[step * row_len ..][0..row_len]);
         ids_out[step] = samples_out[step - 1].id;
     }
+    var barriers_buf: [160]u8 = undefined;
+    const bc = q35v.vk.dispatch.barrier_census;
+    std.debug.print("{s}\n", .{q35v.vk.dispatch.formatBarriers(&barriers_buf, bc.elided, bc.emitted, bc.dispatches, samples_out.len)});
 }
 
 const RepeatChecks = struct { runs: u64 = 2, generated_ids_equal: bool, logits_bytes_equal: bool };
