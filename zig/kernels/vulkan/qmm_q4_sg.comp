@@ -313,6 +313,14 @@ layout(push_constant) uniform Params {
 shared float reduce_scratch[256];
 #endif
 
+#ifdef FUSED_SWIGLU
+// Candidate C's exchange: each slot's lead lane posts its two rows' rounded
+// dots here (slots 0-1 the gate rows, slots 2-3 the matching up rows), and
+// four threads apply the ASH swiglu program after one workgroup barrier.
+shared float fused_gate[4];
+shared float fused_up[4];
+#endif
+
 // Push-constant routing: operation carries bits (2, 3, 4, 5, 6, or 8),
 // reduce_size the group size, flags bit 0 the non-transposed layout.
 // Affine bindings 2/3 are the separate scale/bias streams; aux_offset
@@ -745,6 +753,17 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
   } \
 }
 #endif
+#endif
+
+// The store-point bf16 rounding, shared by the multi main's add epilogue and
+// candidate C's fused swiglu (defined outside the multi-only region: the
+// plain build's epilogue needs it too).
+#ifdef USE_FP16
+#define ROUND_STORAGE(f) (unpackHalf2x16(packHalf2x16(vec2(f, 0.0))).x)
+#elif defined(USE_BF16)
+#define ROUND_STORAGE(f) LOAD_VALUE(bf16_store(f))
+#else
+#define ROUND_STORAGE(f) (f)
 #endif
 
 #ifdef QMM_VEC_MULTI
@@ -1777,8 +1796,18 @@ void main() {
   uint batch = params.shape[0];
   uint w_batch_words = params.shape[1];
   uint param_batch = params.shape[2];
+#ifdef FUSED_SWIGLU
+  // Candidate C: the merged gate|up weight. Slots 0 and 1 compute gate rows
+  // 4w..4w+3, slots 2 and 3 the matching up rows (matrix_n/2 past them), so
+  // one workgroup produces four gate/up pairs and the epilogue stores only
+  // the four activations.
+  uint column = gl_WorkGroupID.x * (uint(ROWS_PER_SLOT) * 2u) +
+      (column_slot % 2u) * uint(ROWS_PER_SLOT) +
+      (column_slot / 2u) * (params.matrix_n / 2u);
+#else
   uint column = gl_WorkGroupID.x * COLUMNS_PER_GROUP +
       column_slot * uint(ROWS_PER_SLOT);
+#endif
   uint n = params.matrix_n;
   bool column_active = column < n;
   uint words_per_row = params.matrix_k / 8u;
@@ -1800,11 +1829,38 @@ void main() {
     }
     for (uint r = 0u; r < uint(ROWS_PER_SLOT); ++r) {
       float total = subgroupAdd(acc[r]);
+#ifdef FUSED_SWIGLU
+      if (lane_in_slot == 0u && column + r < n) {
+        float rounded = ROUND_STORAGE(total);
+        if (column < params.matrix_n / 2u) {
+          fused_gate[(column_slot % 2u) * uint(ROWS_PER_SLOT) + r] = rounded;
+        } else {
+          fused_up[(column_slot % 2u) * uint(ROWS_PER_SLOT) + r] = rounded;
+        }
+      }
+#else
       if (lane_in_slot == 0u && column + r < n) {
         output_data.values[params.output_offset + b * params.matrix_n +
             column + r] = STORE_VALUE(total);
       }
+#endif
     }
+#ifdef FUSED_SWIGLU
+    // The ASH swiglu program (swiglu.comp ASH_QWEN35): the operands are the
+    // bf16-rounded dots (exactly what the unfused pipeline stores and swiglu
+    // re-reads), denom = 1 + exp(-g), silu = g / denom (the division form,
+    // no intermediate rounding), one round at the output store.
+    barrier();
+    if (lane < 4u) {
+      float g = fused_gate[lane];
+      float u = fused_up[lane];
+      float denom = 1.0 + exp(-g);
+      float silu = g / denom;
+      output_data.values[params.output_offset + b * (params.matrix_n / 2u) +
+          gl_WorkGroupID.x * (uint(ROWS_PER_SLOT) * 2u) + lane] =
+          STORE_VALUE(silu * u);
+    }
+#endif
   }
 }
 #endif
