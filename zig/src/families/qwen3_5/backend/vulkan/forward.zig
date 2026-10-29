@@ -116,6 +116,9 @@ pub const Core = struct {
         var qraw: View = undefined;
         var k: View = undefined;
         var v: View = undefined;
+        var q: View = undefined;
+        var qn: View = undefined;
+        var kn: View = undefined;
         const qkv_group = if (rows == 1) layer.qkv else null;
         if (qkv_group) |g| {
             const block = try c.scratch.alloc(.bf16, g.fused.n);
@@ -123,20 +126,27 @@ pub const Core = struct {
             qraw = try block.slice(g.starts[0], 2 * pinned.query_heads * pinned.head_dim);
             k = try block.slice(g.starts[1], pinned.kv_heads * pinned.head_dim);
             v = try block.slice(g.starts[2], pinned.kv_heads * pinned.head_dim);
+            q = try c.scratch.alloc(.bf16, rows * pinned.query_heads * pinned.head_dim);
+            try c.extractQueries(q, qraw, rows);
+            qn = try c.scratch.alloc(.bf16, q.elements);
+            try vk.orExit(c.acc.norm.rmsNorm(c.cmds, qn, q, layer.q_norm, rows * pinned.query_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
+            kn = try c.scratch.alloc(.bf16, k.elements);
+            try vk.orExit(c.acc.norm.rmsNorm(c.cmds, kn, k, layer.k_norm, rows * pinned.kv_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
         } else {
+            // FUSE=0 keeps unit 12's interleaved order exactly.
             qraw = try c.scratch.alloc(.bf16, rows * 2 * pinned.query_heads * pinned.head_dim);
             try c.project(qraw, x, layer.q);
+            q = try c.scratch.alloc(.bf16, rows * pinned.query_heads * pinned.head_dim);
+            try c.extractQueries(q, qraw, rows);
+            qn = try c.scratch.alloc(.bf16, q.elements);
+            try vk.orExit(c.acc.norm.rmsNorm(c.cmds, qn, q, layer.q_norm, rows * pinned.query_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
             k = try c.scratch.alloc(.bf16, rows * pinned.kv_heads * pinned.head_dim);
             try c.project(k, x, layer.k);
+            kn = try c.scratch.alloc(.bf16, k.elements);
+            try vk.orExit(c.acc.norm.rmsNorm(c.cmds, kn, k, layer.k_norm, rows * pinned.kv_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
             v = try c.scratch.alloc(.bf16, rows * pinned.kv_heads * pinned.head_dim);
             try c.project(v, x, layer.v);
         }
-        const q = try c.scratch.alloc(.bf16, rows * pinned.query_heads * pinned.head_dim);
-        try c.extractQueries(q, qraw, rows);
-        const qn = try c.scratch.alloc(.bf16, q.elements);
-        try vk.orExit(c.acc.norm.rmsNorm(c.cmds, qn, q, layer.q_norm, rows * pinned.query_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
-        const kn = try c.scratch.alloc(.bf16, k.elements);
-        try vk.orExit(c.acc.norm.rmsNorm(c.cmds, kn, k, layer.k_norm, rows * pinned.kv_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
         const queries = try c.scratch.alloc(.bf16, q.elements);
         try vk.orExit(c.acc.attn.setBasePosition(c.cmds, c.staging, @intCast(base), c.timeout_ns));
         try vk.orExit(c.acc.attn.ropeQueries(c.cmds, queries, qn, rows, c.timeout_ns));
