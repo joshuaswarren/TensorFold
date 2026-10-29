@@ -127,14 +127,14 @@ fn body(a: std.mem.Allocator, clock: Elapsed, vendor: ?u32, timeout: u64) !bool 
             break :blk .fail;
         };
     }
-    passed = t.passed + @intFromBool(sub_verdict == .pass);
-    known = t.known + @intFromBool(sub_verdict == .known);
-    const total = t.kernels + t.controls + 1;
+    const acct = fx.accounting(t, sub_verdict, refused);
+    passed = acct.passed;
+    known = acct.known;
+    const total = acct.total;
     std.debug.print("SUMMARY contract-penalties on \"{s}\": {d} kernel, {d} pass gates 1-4, {d} fail; " ++
         "{d} controls: {d} red as planted, {d} missed; denormal row: {t}\n", .{ name, t.kernels, t.passed, t.failed, t.controls, t.caught, t.missed, sub_verdict });
     std.debug.print("RESULT contract-penalties elapsed_ms={d} on \"{s}\": passed={d} known={d} total={d} preserve32={} flush32={}\n", .{ clock.ms(), name, passed, known, total, preserve32, flush32 });
-    const ok = !refused and t.problems() == 0 and t.caught == t.controls and passed + known == total;
-    return ok;
+    return acct.ok;
 }
 
 /// The denormal gate wrapped so a raised error is that case's FAIL, never the
