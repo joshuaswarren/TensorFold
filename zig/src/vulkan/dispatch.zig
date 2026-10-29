@@ -99,6 +99,37 @@ pub const Hazard = struct {
 /// style).
 pub var hazard_pending: Hazard = .{};
 
+/// The barrier census of the current steady window: three integers on the
+/// record path, always on. The probe resets it at the window's first token
+/// and reads the per-token means at the window's end.
+pub const BarrierCensus = struct {
+    elided: u64 = 0,
+    emitted: u64 = 0,
+    dispatches: u64 = 0,
+
+    pub fn reset(self: *BarrierCensus) void {
+        self.* = .{};
+    }
+
+    /// Per-token means; zero tokens answer zero rather than divide by zero.
+    pub fn means(self: BarrierCensus, tokens: u64) [3]f64 {
+        const t: f64 = @floatFromInt(@max(tokens, 1));
+        if (tokens == 0) return .{ 0, 0, 0 };
+        return .{
+            @as(f64, @floatFromInt(self.elided)) / t,
+            @as(f64, @floatFromInt(self.emitted)) / t,
+            @as(f64, @floatFromInt(self.dispatches)) / t,
+        };
+    }
+};
+
+pub var barrier_census: BarrierCensus = .{};
+
+pub fn formatBarriers(buf: []u8, elided: u64, emitted: u64, dispatches: u64, tokens: u64) []const u8 {
+    const m = BarrierCensus.means(.{ .elided = elided, .emitted = emitted, .dispatches = dispatches }, tokens);
+    return std.fmt.bufPrint(buf, "MILESTONE barriers per steady token elided={d:.2} emitted={d:.2} dispatches={d:.2}", .{ m[0], m[1], m[2] }) catch "";
+}
+
 /// The barrier a deferred dispatch owes, emitted verbatim before the
 /// hazarding dispatch or command; then the set restarts.
 pub fn flushHazard(dev: *const Device, cmd: c.VkCommandBuffer) void {
@@ -394,6 +425,8 @@ pub const Pipeline = struct {
                 .srcAccessMask = c.VK_ACCESS_SHADER_WRITE_BIT,
                 .dstAccessMask = reads,
             }, 0, null, 0, null);
+            barrier_census.emitted += 1;
+            barrier_census.dispatches += 1;
             return;
         }
         // Elision: the deferred barrier of the earlier unsynchronised
@@ -423,12 +456,16 @@ pub const Pipeline = struct {
                 .dstAccessMask = reads,
             }, 0, null, 0, null);
             hazard_pending.clear();
+            barrier_census.emitted += 1;
+        } else {
+            barrier_census.elided += 1;
         }
         api.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
         api.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout, 0, 1, &set, 0, null);
         if (push.len > 0) api.vkCmdPushConstants(cmd, p.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, p.layout.push_bytes, push.ptr);
         api.vkCmdDispatch(cmd, groups[0], groups[1], groups[2]);
         hazard_pending.add(next_w[0..nw], next_r[0..nr]);
+        barrier_census.dispatches += 1;
     }
 
     /// One dispatch in its own submission; wrap it in commands.orExit, which ends the process on error.Timeout.
@@ -641,6 +678,32 @@ test "the unsynchronised set accumulates across elided dispatches until a flush"
     var dup: Hazard = .{};
     for (0..hazard_range_cap) |_| dup.add(&.{hr(a_out, 0, 64)}, &.{});
     try std.testing.expect(!dup.hazard(&.{}, &.{hr(b_out, 0, 64)}));
+}
+
+test "the barrier census accumulates, resets and averages per token" {
+    var census: BarrierCensus = .{};
+    census.elided = 90;
+    census.emitted = 310;
+    census.dispatches = 400;
+    const m = census.means(10);
+    try std.testing.expectEqual(@as(f64, 9.0), m[0]);
+    try std.testing.expectEqual(@as(f64, 31.0), m[1]);
+    try std.testing.expectEqual(@as(f64, 40.0), m[2]);
+    try std.testing.expectEqual(@as(f64, 0), census.means(0)[0]);
+    census.reset();
+    try std.testing.expectEqual(@as(u64, 0), census.elided + census.emitted + census.dispatches);
+}
+
+test "the barriers milestone line format is exact" {
+    var buf: [160]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "MILESTONE barriers per steady token elided=9.00 emitted=31.00 dispatches=40.00",
+        formatBarriers(&buf, 90, 310, 400, 10),
+    );
+    try std.testing.expectEqualStrings(
+        "MILESTONE barriers per steady token elided=0.00 emitted=0.00 dispatches=0.00",
+        formatBarriers(&buf, 0, 0, 0, 0),
+    );
 }
 
 test "elideFromEnv pins today's barriers only for the exact 0" {
