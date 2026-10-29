@@ -110,16 +110,10 @@ void main() {
           precise float term = bf16_load(input_x.values[x_base + k_base + e]) *
               (scale * q + bias);
           precise float t = partial + term;
-          // The error term is meaningless once the sum is not finite (inf - inf is NaN), and
-          // feeding it to comp would turn a row the float64 reference keeps at one infinity
-          // into NaN. Finite sums never take this branch's else, so finite outputs are
-          // bit-identical to the unguarded form.
-          if (!isnan(t) && !isinf(t)) {
-            if (abs(partial) >= abs(term)) {
-              comp += (partial - t) + term;
-            } else {
-              comp += (term - t) + partial;
-            }
+          if (abs(partial) >= abs(term)) {
+            comp += (partial - t) + term;
+          } else {
+            comp += (term - t) + partial;
           }
           partial = t;
         } else {
@@ -138,14 +132,10 @@ void main() {
           precise float a = tree[lane];
           precise float b2 = tree[lane + stride];
           precise float sum = a + b2;
-          // same guard as the lane sums: a non-finite node keeps the sum's class and leaves
-          // the compensation chain alone, instead of poisoning it with inf - inf
-          if (!isnan(sum) && !isinf(sum)) {
-            precise float bb = sum - a;
-            precise float err = (a - (sum - bb)) + (b2 - bb);
-            tree_lo[lane] = tree_lo[lane] + tree_lo[lane + stride] + err;
-          }
+          precise float bb = sum - a;
+          precise float err = (a - (sum - bb)) + (b2 - bb);
           tree[lane] = sum;
+          tree_lo[lane] = tree_lo[lane] + tree_lo[lane + stride] + err;
         } else {
           tree[lane] += tree[lane + stride];
         }
@@ -153,7 +143,16 @@ void main() {
       barrier();
     }
     if (lane == 0u) {
-      float total_sum = compensated ? tree[0] + tree_lo[0] : tree[0];
+      // The class fix, once per output where the lane high+low final and the tree result are
+      // both formed: a non-finite high keeps its class - on such a sum the compensation chain
+      // is meaningless, and the frozen per-step updates may have NaN'd it with inf - inf - and
+      // a finite high always has a finite chain beneath it (non-finiteness only ever climbs the
+      // high tree), so the select's else operand is exactly the frozen expression and finite
+      // outputs execute precisely the arithmetic this kernel shipped with.
+      float total_sum = tree[0];
+      if (compensated) {
+        total_sum = (isnan(tree[0]) || isinf(tree[0])) ? tree[0] : tree[0] + tree_lo[0];
+      }
       output_data.values[index] = bf16_store(total_sum);
     }
     barrier(); // orders this iteration's reads before the next grid-stride iteration's writes
