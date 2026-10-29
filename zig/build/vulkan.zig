@@ -240,7 +240,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     _ = cand_files.addCopyFile(qmm_floor_spv, "qmm_q4_pk.spv");
     var cand_embed: std.ArrayListUnmanaged(u8) = .empty;
     cand_embed.appendSlice(b.allocator, "pub const qmm_q4_pk align(4) = @embedFile(\"qmm_q4_pk.spv\").*;\n") catch @panic("OOM");
-    inline for (.{ "c1", "c2", "c3", "c1v1", "c1v2", "c1v3", "c1v4", "a0p" }) |cv| {
+    inline for (.{ "c1", "c2", "c3", "c1v1", "c1v2", "c1v3", "c1v4", "a0p", "sgm", "sgo" }) |cv| {
         const cand_cmd = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-o" });
         const cand_spv = cand_cmd.addOutputFileArg(b.fmt("qmm_cand_{s}.spv", .{cv}));
         cand_cmd.addFileArg(b.path(b.fmt("zig/kernels/vulkan/qmm_cand_{s}.comp", .{cv})));

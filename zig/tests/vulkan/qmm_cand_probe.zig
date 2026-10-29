@@ -70,6 +70,24 @@ pub fn firstDiff16(a: []const u16, b: []const u16) ?WordDiff {
     return null;
 }
 
+/// The subgroup kernel assumes a 32-lane subgroup (Vulkan lets a compute shader not ask), and needs the arithmetic
+/// subgroup operations: the same gate the omarchy-mlx dispatch applies. Pure and host-tested.
+pub fn sgSubgroupOk(subgroup_size: u32, supported_ops: u32) bool {
+    const arithmetic: u32 = 1 << 2; // VK_SUBGROUP_FEATURE_ARITHMETIC_BIT
+    return subgroup_size == 32 and (supported_ops & arithmetic) != 0;
+}
+
+/// The rounding-chain depth stated for the subgroup kernel: per 512-element step a lane runs 16 fma/add rounds in
+/// the dot, the same again in the x sum, and the scale/bias combine (24 as a round figure), then the five-level subgroup
+/// reduction, the final store and a slack of 10. Pure and host-tested; the device gate checks it, it is not a theorem.
+pub fn sgDepth(s: c.Shape) usize {
+    return 24 * (s.k / 512) + 16;
+}
+
+fn sgSpec() c.Spec {
+    return .{ .name = "omarchy qmv subgroup", .accum = .f32, .depth = &sgDepth, .out = .bf16, .served = &.{} };
+}
+
 fn candSpec(comptime name: []const u8) c.Spec {
     return .{ .name = name, .accum = .f32, .depth = &packDepth, .out = .bf16, .served = &.{} };
 }
@@ -162,6 +180,12 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
     defer a.free(allowances);
     const allowances_pack = try a.alloc(f64, n);
     defer a.free(allowances_pack);
+    const allowances_sg = try a.alloc(f64, n);
+    defer a.free(allowances_sg);
+    const sg_a = try a.alloc(u16, n);
+    defer a.free(sg_a);
+    const sg_b = try a.alloc(u16, n);
+    defer a.free(sg_b);
     qf.fillInputs(weights, scales, biases, x, 0x716d6d00 ^ @as(u64, n));
     const shape: c.Shape = .{ .rows = 1, .n = n, .k = k };
     const spec_a0 = qf.pkSpec();
@@ -172,6 +196,7 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
         magnitude[column] = ref[1];
         allowances[column] = c.bound(spec_a0, shape, ref[0], ref[1]);
         allowances_pack[column] = c.bound(spec_pack, shape, ref[0], ref[1]);
+        allowances_sg[column] = c.bound(sgSpec(), shape, ref[0], ref[1]);
     }
     var x_buf = try vk.Buffer.init(dev, .device, x_bytes);
     defer x_buf.deinit();
@@ -198,11 +223,24 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
     const push_bytes = std.mem.asBytes(&push)[0..@sizeOf(qf.Params)];
     const groups = try vk.ops_q4.pkGroups(n, dev.properties.limits.maxComputeWorkGroupCount[0]);
     const groups_vec = [3]u32{ groups, 1, 1 };
-    const labels = [_][]const u8{ "A0 real", "C1 pipelined", "C2 pack-comp", "C3 C1+C2", "C1v2 precise accumulators", "A3 cached" };
+    // the subgroup kernels: 4 slots of 2 rows per 128-lane workgroup, one batch row; the arguments as the omarchy dispatch sets them
+    var sg_push = push;
+    sg_push.shape[0] = 1;
+    const sg_push_bytes = std.mem.asBytes(&sg_push)[0..@sizeOf(qf.Params)];
+    const sg_groups = [3]u32{ @intCast((n + 7) / 8), 1, 1 };
+    const labels = [_][]const u8{ "A0 real", "C1 pipelined (plain accumulators)", "SG master (omarchy qmv)", "SG overlap (w7Q branch)", "8a kernel (C1 precise)", "A3 cached" };
     const timing_only = [_]bool{ false, false, false, false, false, true };
 
     // ---- correctness gates: A0's f64 bound, C1 bit-exact vs A0, C2/C3's pack bound
     if (!try runGate(cmds, staging, pipes[0], &bindings, push_bytes, groups_vec, timeout, ref_out, want, allowances, spec_a0, shape, "A0 real")) return false;
+    // ---- the subgroup kernels: the f64 bound at their own depth, and master vs overlap output by output
+    if (!try runGate(cmds, staging, pipes[2], &bindings, sg_push_bytes, sg_groups, timeout, sg_a, want, allowances_sg, sgSpec(), shape, "SG master")) return false;
+    if (!try runGate(cmds, staging, pipes[3], &bindings, sg_push_bytes, sg_groups, timeout, sg_b, want, allowances_sg, sgSpec(), shape, "SG overlap")) return false;
+    if (firstDiff16(sg_b, sg_a)) |d| {
+        var cnt: usize = 0;
+        for (sg_a, sg_b) |wa, wb| cnt += @intFromBool(wa != wb and !(isNan16(wa) and isNan16(wb)));
+        std.debug.print("NOTE: SG overlap differs from SG master at index {d}: got=0x{x:0>4} want=0x{x:0>4}; {d} of {d} outputs differ\n", .{ d.index, d.got, d.want, cnt, n });
+    } else std.debug.print("MILESTONE SG overlap equals SG master on all {d} outputs\n", .{n});
     // ---- DIAGNOSTIC, report-only: C1 and four suspect variants against A0 (real activations); nothing here is a result
     const diag_labels = [_][]const u8{ "C1 pipelined", "C1v1 dq precise", "C1v2 precise accumulators", "C1v3 x as u32 words", "C1v4 all three", "A0p the OLD kernel with precise accumulators" };
     for ([_]usize{ 1, 6, 7, 8, 9, 10 }, 0..) |vi, di| {
@@ -230,7 +268,7 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
         }
         std.debug.print("DIAG {s} vs A0 (report-only): {d} of {d} outputs differ ({d} NaN payload only)\n", .{ diag_labels[di], finite_diff, n, nan_diff });
     }
-    for ([_]struct { vi: usize, label: []const u8 }{ .{ .vi = 1, .label = "C1 pipelined" }, .{ .vi = 2, .label = "C2 pack-comp" }, .{ .vi = 3, .label = "C3 C1+C2" } }) |gate| {
+    for ([_]struct { vi: usize, label: []const u8 }{ .{ .vi = 1, .label = "C1 pipelined" } }) |gate| {
         @memset(c_out, 0x7fc5);
         try pipes[gate.vi].bind(&bindings);
         try vk.orExit(pipes[gate.vi].run(cmds, push_bytes, groups_vec, timeout));
@@ -289,7 +327,8 @@ fn runShape(io: std.Io, a: std.mem.Allocator, dev: *vk.Device, cmds: *vk.Command
     var stats: [6][deps.len]qf.Stats = undefined;
     for (pipes[0..6], 0..) |pipe, vi| {
         for (deps, 0..) |dep, di| {
-            try runCase(io, cmds, staging, pipe, &bindings, push_bytes, groups_vec, dep, timeout, &stats[vi][di]);
+            const is_sg = vi == 2 or vi == 3;
+            try runCase(io, cmds, staging, pipe, &bindings, if (is_sg) sg_push_bytes else push_bytes, if (is_sg) sg_groups else groups_vec, dep, timeout, &stats[vi][di]);
             printStats(dep, stats[vi][di]);
         }
     }
@@ -330,6 +369,10 @@ pub fn main(init: std.process.Init) !u8 {
     var dev = try vk.Device.open(&rt, .{});
     defer dev.close();
     const pr = dev.properties;
+    if (!sgSubgroupOk(dev.v11.subgroupSize, dev.v11.subgroupSupportedOperations)) {
+        std.debug.print("SKIP guard: subgroupSize={d} operations=0x{x}: the subgroup kernels need a 32-lane subgroup with the arithmetic operations; nothing measured\n", .{ dev.v11.subgroupSize, dev.v11.subgroupSupportedOperations });
+        return 0;
+    }
     const name = std.mem.sliceTo(&pr.deviceName, 0);
     std.debug.print("MILESTONE device-found name=\"{s}\" vendor=0x{x:0>4} device=0x{x:0>4} timeout={d}ms\n", .{ name, pr.vendorID, pr.deviceID, opts.timeout_ms });
     if (pr.deviceType == vk.c.VK_PHYSICAL_DEVICE_TYPE_CPU) {
@@ -349,9 +392,9 @@ pub fn main(init: std.process.Init) !u8 {
     defer pipe_a0.deinit();
     var pipe_c1 = try dispatch.Pipeline.init(&dev, &shaders.qmm_cand_c1, layout);
     defer pipe_c1.deinit();
-    var pipe_c2 = try dispatch.Pipeline.init(&dev, &shaders.qmm_cand_c2, layout);
+    var pipe_c2 = try dispatch.Pipeline.init(&dev, &shaders.qmm_cand_sgm, layout);
     defer pipe_c2.deinit();
-    var pipe_c3 = try dispatch.Pipeline.init(&dev, &shaders.qmm_cand_c3, layout);
+    var pipe_c3 = try dispatch.Pipeline.init(&dev, &shaders.qmm_cand_sgo, layout);
     defer pipe_c3.deinit();
     var pipe_a1 = try dispatch.Pipeline.init(&dev, &shaders.qmm_ablate_a1, layout);
     defer pipe_a1.deinit();
@@ -417,4 +460,17 @@ test "firstDiff16 names the first differing word or null when equal" {
     try testing.expectEqual(@as(usize, 1), d.index);
     try testing.expectEqual(@as(u16, 0x5678), d.got);
     try testing.expectEqual(@as(u16, 0x4321), d.want);
+}
+
+test "the subgroup guard admits exactly a 32-lane subgroup with the arithmetic operations" {
+    const arith: u32 = 1 << 2; // VK_SUBGROUP_FEATURE_ARITHMETIC_BIT
+    try std.testing.expect(sgSubgroupOk(32, arith | 1));
+    try std.testing.expect(!sgSubgroupOk(32, 1));
+    try std.testing.expect(!sgSubgroupOk(16, arith));
+    try std.testing.expect(!sgSubgroupOk(64, arith));
+}
+
+test "the subgroup kernel's stated depth grows with the steps of 512 elements" {
+    try std.testing.expectEqual(@as(usize, 112), sgDepth(.{ .rows = 1, .n = 1, .k = 2048 }));
+    try std.testing.expectEqual(@as(usize, 304), sgDepth(.{ .rows = 1, .n = 1, .k = 6144 }));
 }
