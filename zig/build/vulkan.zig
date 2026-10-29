@@ -748,7 +748,14 @@ pub fn serverModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
 /// adapter's bundle() reads). Reusing the arrays means a define change (e.g.
 /// cast's source/dest variants, argreduce_chunk's bf16) cannot drift between
 /// the probe builds and the server bundle.
-const server_shader_images = shader_variants ++ stage2_variants ++ stage3_variants ++ stage4_variants[0 .. stage4_variants.len - 1] ++ stage5_variants;
+/// The decode subgroup qmv image (unit 12): the probe's SG master kernel. Appended LAST so the
+/// bundle's module order up to here stays byte-identical and the module check sees exactly one
+/// module added at the end.
+const sg_decode_variants = [_]ShaderVariant{
+    .{ .name = "qmm_q4_sg", .src = "zig/kernels/vulkan/qmm_q4_sg.comp", .defines = &.{} },
+};
+
+const server_shader_images = shader_variants ++ stage2_variants ++ stage3_variants ++ stage4_variants[0 .. stage4_variants.len - 1] ++ stage5_variants ++ sg_decode_variants;
 
 /// The house core module (core/root.zig) the family loader's config/shard/
 /// slicing/table imports resolve through, built exactly as cuda.zig builds it.
