@@ -8,8 +8,9 @@ const state = @import("state.zig");
 const Arena = vk.arena.Arena;
 const View = vk.tensor.View;
 
-// Whole-prompt rows are split into dispatch chunks capped here; persistent windows use this cap.
-pub const max_prefill_rows: usize = 32;
+/// Per-dispatch activation chunk cap: a whole-prompt pass cuts its rows into
+/// forward chunks of at most this many (the persistent windows are sized for it).
+pub const max_prefill_rows: usize = @import("chunk_cap.zig").max_prefill_rows;
 /// The GDN prefill scan's chunk cap (chunks of 1 when a prefill fits one).
 pub const max_gdn_chunk: u64 = 32;
 
