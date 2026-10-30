@@ -435,8 +435,7 @@ test "the stated depth comes from the lane's strided packs and the six tree leve
     try testing.expectEqual(@as(usize, 25), depth(.{ .rows = 1, .n = 1, .k = 64 }));
     try testing.expectEqual(@as(usize, 49), depth(.{ .rows = 1, .n = 16, .k = 2048 }));
     try testing.expectEqual(@as(usize, 113), depth(.{ .rows = 1, .n = 2048, .k = 6144 }));
-    // rows repeat the per-output chain and add nothing to it: the bound at a full prefill chunk
-    // is the bound at one row of the same width
+    // rows repeat the per-output chain; a full prefill chunk keeps one row's bound
     try testing.expectEqual(depth(.{ .rows = 1, .n = 6144, .k = 2048 }), depth(.{ .rows = max_chunk_rows, .n = 6144, .k = 2048 }));
     // tighter than the serial kernel's k + 2 chain at every served K
     for (served) |s| try testing.expect(depth(s) < qmm.depth(s));
@@ -611,11 +610,7 @@ test "the fixture keeps the qmm storage discipline: raw u16 poison, guards align
 }
 
 test "the shipped pk kernel keeps its pack-level compensation, class fix and six tree levels" {
-    // A source-level pin: a later edit of qmm_q4_pk.comp must not silently drop the plain in-pack
-    // adds with their precise order, the ONE Neumaier fold per pack, the non-finite class fix at the
-    // high+low combine, the six tree levels (strides 32, 16, 8, 4, 2, 1) or the one-64-lane shape.
-    // The accumulators are precise: with plain accumulators the device compiler built a pipelined
-    // variant of this kernel so that real activations differed from the reference body.
+    // Pin plain in-pack adds, one Neumaier fold per pack, the class fix, six tree levels, the 64-lane shape.
     const src = pk_src.qmm_q4_pk;
     try testing.expect(std.mem.indexOf(u8, src, "precise float psum = 0.0;") != null);
     try testing.expect(std.mem.indexOf(u8, src, "psum += bf16_load(input_x.values[x_base + k_base + e]) *") != null);
