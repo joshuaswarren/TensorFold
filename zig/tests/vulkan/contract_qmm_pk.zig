@@ -1,8 +1,4 @@
-//! Vulkan Q4 parallel-K fixture: the qmm_q4_pk kernel through the shared gates at the engine's
-//! real calls (one-row decode and prefill chunks to the forward pass's chunk ceiling), its five
-//! planted controls, and the host models that prove each control cannot pass its gate. Host
-//! tests here run without a device; the gates themselves run in tf-vulkan-kernel-contract, whose
-//! contract_main.zig wires this fixture's pipelines from the same SPIR-V images the build compiles.
+//! Fixture for parallel-K Q4 projections, engine calls, planted controls, and host-side gate models.
 const std = @import("std");
 const vk = @import("vulkan");
 const contract = @import("contract");
@@ -18,14 +14,10 @@ const timeout_ns: u64 = 10 * std.time.ns_per_s;
 pub const Params = qmm.Params;
 const Rig = qmm.Rig;
 
-/// The engine's per-pass forward chunk ceiling (qwen3_5 vulkan forward.zig's max_prefill_rows,
-/// shared from one leaf file): a prompt is cut into passes of at most this many rows, so the
-/// projection's row counts are 1 and 2..here. The contract's row envelope and its fixtures
-/// derive from this constant, not from a local copy of it.
+// The shared forward-row ceiling drives contract shapes from one row through the maximum prefill chunk.
 pub const max_chunk_rows: usize = cap_mod.max_prefill_rows;
 
-/// tf-vulkan-kernel-contract's runAll seed: the host tests below check each control at the exact
-/// fill the device run will use, so the literal here and the runner's must stay the same one.
+// Host control checks use the same seed as the device contract run.
 pub const runner_seed: u64 = 0x766b;
 
 fn harnessSeed(of: []const u8) u64 {
@@ -37,23 +29,12 @@ fn laneElements(k: usize) usize {
     return 8 * ((k / 8 + 63) / 64);
 }
 
-/// The longest chain of roundings ONE OUTPUT's sums pass through; the row count never enters,
-/// because rows only repeat the same per-output chain, so the bound at a 32-row prefill chunk is
-/// the bound at one row. Each term takes three (scale*q, + bias, * x, the qmm counting); the
-/// lane's f32 chain adds one per further element of its share (the Neumaier compensation only
-/// tightens a plain chain, and its own second-order accumulation is covered by the +1 below);
-/// the fixed tree over the 64 lanes adds its six levels; the final high + low add is the last
-/// one. At K 2048 that is 42 roundings against the serial kernel's 2050: gamma(42, 2^-24) is
-/// about 2.5e-6 where the serial bound's gamma(2050) is about 1.2e-4, so the compensated kernel
-/// states the tighter bound, and gate 4 still proves fp32 sums exact.
+// Error bound counts lane, tree, and final-sum roundings; at K=2048 it beats serial, and gate 4 tests exactness.
 pub fn depth(s: c.Shape) usize {
     return laneElements(s.k) + 10;
 }
 
-/// The projection widths the forward pass calls, as (n, k): the attention k/v 512, the o
-/// projection and the GDN z/a/b/out 2048, the q projection 4096, the GDN qkv and the MLP gate/up
-/// 6144, all at K 2048; the MLP down at K 6144. The 248320-row head is the finish path's last-row
-/// projection, so it is called at one row only.
+// Fixture covers every engine projection width and K, including the one-row 248320-vocabulary head.
 const projection_pairs = [_][2]usize{ .{ 512, 2048 }, .{ 2048, 2048 }, .{ 4096, 2048 }, .{ 6144, 2048 }, .{ 2048, 6144 } };
 
 const served = blk: {
@@ -66,8 +47,7 @@ const served = blk: {
     }
     // the head, past the workgroup-count clamp so the kernel grid-strides
     list = list ++ [_]c.Shape{.{ .rows = 1, .n = 248320, .k = 2048 }};
-    // the prefill calls: the forward pass cuts a prompt into chunks of 2..ceiling rows, every
-    // projection width, the same (n, k) as decode
+    // Prefill uses every projection width for chunk sizes from two rows through the shared ceiling.
     var rows: usize = 2;
     while (rows <= max_chunk_rows) : (rows += 1) {
         for (projection_pairs) |pair| {
@@ -81,11 +61,7 @@ pub const spec: c.Spec = .{
     .accum = .f32,
     .depth = depth,
     .out = .bf16,
-    // rows' edges sit at one row, the chunk ceiling and one under it; a chunk of ceiling+1 rows
-    // is not an engine call (the pass never cuts one), so nothing past the ceiling is served.
-    // n's edges sit at the smallest workgroup-count clamp Vulkan allows (65535) and one past it,
-    // then at the head; k's edges at the group and the first edge past it. k is always a group
-    // multiple: the kernel's packs and scale groups require it.
+    // Shape cases cover row, workgroup-count, and group-size boundaries; no unserved chunk or K past the limit.
     .tiles = .{
         .{ .size = max_chunk_rows, .step = 1, .min = 1 },
         .{ .size = 65536, .step = 1, .min = 1 },
@@ -118,11 +94,7 @@ fn controlGate(kind: Kind) g.Gate {
     };
 }
 
-/// The shapes a control runs at. The two arithmetic faults are exercised at one row and at a
-/// full prefill chunk, so the fault is proven caught in both dispatch shapes; n 16 keeps sixteen
-/// independent draws sharing the fault at each row count, so one near-cancelling column cannot
-/// leave a control green. The fp16 accumulator's gate replays one row's sums (the sums gate caps
-/// rows at 4 anyway) and the input writes are row-independent, so one shape carries those.
+// Controls run at decode and full-chunk sizes; sixteen columns guard against a single green output.
 fn controlShapes(kind: Kind) [2]c.Shape {
     const one = [_]c.Shape{.{ .rows = 1, .n = 16, .k = 2048 }};
     return switch (kind) {
@@ -142,8 +114,7 @@ fn controlSpec(f: *const Fixture) c.Spec {
     };
 }
 
-/// Element i of output (r, j)'s sum: the kernel's per-element expression in f64, the fixture
-/// family's dequantized form.
+// Per-element f64 reference for output (r,j), using the fixture's dequantized weights.
 pub fn termAt(q: *const contract.affine.Affine, r: usize, j: usize, i: usize) f64 {
     const k = q.shape.k;
     const at = j * (k / q.group) + i / q.group;
@@ -163,9 +134,7 @@ fn roundTo(acc: c.Accum, v: f64) f64 {
     };
 }
 
-/// One output's sum in the kernel's own order, replayed in `acc`: 64 lanes over strided packs,
-/// then the fixed tree (strides 32, 16, 8, 4, 2, 1). The model's lane sums are plain accumulator
-/// chains; the kernel's Neumaier compensation only tightens them.
+// Host replay follows the kernel's strided lanes and fixed TwoSum tree; Neumaier only tightens sums.
 pub fn pkSum(acc: c.Accum, q: *const contract.affine.Affine, r: usize, j: usize) f64 {
     const packs = q.shape.k / 8;
     var tree: [64]f64 = @splat(0);
@@ -184,8 +153,7 @@ pub fn pkSum(acc: c.Accum, q: *const contract.affine.Affine, r: usize, j: usize)
     return tree[0];
 }
 
-/// A control's arithmetic for output (r, j) on the host, in the shader's f32 lane and tree order,
-/// fault and all: the value its kernel stores, before the bf16 store. `kind` must be a control.
+// Control replay follows shader f32 lane/tree order and returns the pre-bf16 stored value.
 pub fn controlSum(kind: Kind, q: *const contract.affine.Affine, r: usize, j: usize) f64 {
     std.debug.assert(kind != .kernel);
     const packs = q.shape.k / 8;
@@ -218,14 +186,11 @@ fn controlStored(kind: Kind, q: *const contract.affine.Affine, r: usize, j: usiz
     return c.fromBf16(c.toBf16(@floatCast(controlSum(kind, q, r, j))));
 }
 
-/// Caps on what prepare() builds on the host, the qmm fixture's: the largest served shape, the
-/// 248320-row head at K 2048, takes 0.5 GB of codes plus 0.25 GB of packed words. A served shape
-/// over a cap would be refused and fail gate 3; the caps bound the generated edge shapes only.
+// Fixture caps bound generated shapes; the largest served head uses 0.5 GB codes and 0.25 GB packed words.
 const max_weights: usize = 520_000_000;
 const max_outputs: usize = 300_000;
 
-/// The gate harness's rig and fixture for the kernel and, with a control kind, its controls: the
-/// same bindings, pushes and dispatch shape, only the SPIR-V image and the registered spec differ.
+// Kernel and control rig share bindings, pushes, and dispatch shape; only SPIR-V and spec differ.
 pub const Fixture = struct {
     a: std.mem.Allocator,
     dev: *const vk.Device,
@@ -237,9 +202,18 @@ pub const Fixture = struct {
     served_n: usize = 0,
     shape: c.Shape = .{ .rows = 1, .n = 16, .k = 64 },
     affine: ?contract.affine.Affine = null,
-    x: []u16 = &.{}, w: []u32 = &.{}, scales: []u16 = &.{}, biases: []u16 = &.{}, out: []u16 = &.{},
-    want: []f64 = &.{}, magnitude: []f64 = &.{}, input_snapshot: []u8 = &.{}, rig: Rig = .{},
-    buffers: [5]vk.Buffer = undefined, made: usize = 0, bindings: [5]dispatch.Binding = undefined,
+    x: []u16 = &.{},
+    w: []u32 = &.{},
+    scales: []u16 = &.{},
+    biases: []u16 = &.{},
+    out: []u16 = &.{},
+    want: []f64 = &.{},
+    magnitude: []f64 = &.{},
+    input_snapshot: []u8 = &.{},
+    rig: Rig = .{},
+    buffers: [5]vk.Buffer = undefined,
+    made: usize = 0,
+    bindings: [5]dispatch.Binding = undefined,
 
     pub fn init(a: std.mem.Allocator, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, pipeline: *dispatch.Pipeline) Fixture {
         return .{ .a = a, .dev = dev, .cmds = cmds, .staging = staging, .pipeline = pipeline };
@@ -271,11 +245,18 @@ pub const Fixture = struct {
         if (f.w.len != 0) f.a.free(f.w);
         for ([_][]f64{ f.want, f.magnitude }) |b| if (b.len != 0) f.a.free(b);
         if (f.input_snapshot.len != 0) f.a.free(f.input_snapshot);
-        f.x = &.{}; f.w = &.{}; f.scales = &.{}; f.biases = &.{}; f.out = &.{};
-        f.want = &.{}; f.magnitude = &.{}; f.input_snapshot = &.{}; f.rig = .{};
+        f.x = &.{};
+        f.w = &.{};
+        f.scales = &.{};
+        f.biases = &.{};
+        f.out = &.{};
+        f.want = &.{};
+        f.magnitude = &.{};
+        f.input_snapshot = &.{};
+        f.rig = .{};
     }
 
-    // The table is a comptime constant: `&g.hooks(Fixture)` would point at a stack temporary that dies when kernel() returns.
+    // Comptime hook table avoids a stack temporary expiring when kernel() returns.
     const vt = g.hooks(Fixture);
 
     pub fn kernel(f: *Fixture) g.Kernel {
@@ -325,7 +306,15 @@ pub const Fixture = struct {
         errdefer f.a.free(mag);
         try q.reference(want, mag);
         if (fill != .nonfinite) for (want, mag) |v, m| if (!std.math.isFinite(v) or !std.math.isFinite(m)) return error.NonFiniteReference;
-        f.x = x; f.w = w; f.scales = scales; f.biases = biases; f.out = out; f.want = want; f.magnitude = mag; f.affine = q; q = undefined;
+        f.x = x;
+        f.w = w;
+        f.scales = scales;
+        f.biases = biases;
+        f.out = out;
+        f.want = want;
+        f.magnitude = mag;
+        f.affine = q;
+        q = undefined;
         const data = [_][]const u8{ std.mem.sliceAsBytes(f.x), std.mem.sliceAsBytes(f.w), std.mem.sliceAsBytes(f.scales), std.mem.sliceAsBytes(f.biases), std.mem.sliceAsBytes(f.out) };
         var input_total: usize = 0;
         for (data[0..4]) |bytes| input_total += bytes.len;
@@ -363,8 +352,7 @@ pub const Fixture = struct {
         const groups = try vk.ops_q4.pkGroups(p.count, f.dev.properties.limits.maxComputeWorkGroupCount[0]);
         try vk.orExit(f.pipeline.run(f.cmds, std.mem.asBytes(&p), .{ groups, 1, 1 }, timeout_ns));
         try vk.orExit(vk.download(f.cmds, f.buffers[4], 0, f.staging, std.mem.sliceAsBytes(f.out), timeout_ns));
-        // Gate 2 compares the inputs before and after the runs, so what it sees must be what the
-        // device holds now: read the four input buffers back into the snapshot.
+        // Gate 2 snapshots the four device input buffers after each run for before/after comparison.
         var at: usize = 0;
         for (f.bindings[0..4]) |b| {
             try vk.orExit(vk.download(f.cmds, b.buffer.*, 0, f.staging, f.input_snapshot[at..][0..b.len], timeout_ns));
@@ -387,10 +375,7 @@ pub const Fixture = struct {
         @memcpy(mag, f.magnitude);
     }
 
-    /// The sums replayed in `acc`: the kernel's own order (64 lanes, then the tree) and, for the
-    /// harness's other two orders, the same terms in one chain and in balanced halves. The stress
-    /// inputs are exact in fp32 in any of the three, so the order only changes what gate 4 can
-    /// prove about fp16 and bf16.
+    // Sum replay compares kernel, serial, and balanced orders; exact fp32 stress inputs expose fp16/bf16 limits.
     pub fn simulate(f: *Fixture, accum: c.Accum, order: contract.rows.Order, out: []f64) !void {
         const q = &f.affine.?;
         const k = f.shape.k;
@@ -415,8 +400,7 @@ test "planted parallel-K controls bind to the intended gate" {
 }
 
 test "the served shapes are the engine's calls: one-row decode and prefill chunks to the ceiling" {
-    // the ceiling is the engine's forward chunking constant, not a local guess: no served row
-    // count passes it, and every projection width repeats at every chunk size 2..ceiling
+    // Use the engine's forward chunk ceiling for every served row count and projection width.
     var top: usize = 0;
     for (served) |s| {
         try testing.expect(s.rows == 1 or (s.rows >= 2 and s.rows <= max_chunk_rows));
@@ -450,8 +434,7 @@ test "the stated depth comes from the lane's strided packs and the six tree leve
     try testing.expectEqual(@as(usize, 18), depth(.{ .rows = 1, .n = 1, .k = 64 }));
     try testing.expectEqual(@as(usize, 42), depth(.{ .rows = 1, .n = 16, .k = 2048 }));
     try testing.expectEqual(@as(usize, 106), depth(.{ .rows = 1, .n = 2048, .k = 6144 }));
-    // rows repeat the per-output chain and add nothing to it: the bound at a full prefill chunk
-    // is the bound at one row of the same width
+    // Rows repeat each per-output chain, so the error bound is unchanged by a full prefill chunk.
     try testing.expectEqual(depth(.{ .rows = 1, .n = 6144, .k = 2048 }), depth(.{ .rows = max_chunk_rows, .n = 6144, .k = 2048 }));
     // tighter than the serial kernel's k + 2 chain at every served K
     for (served) |s| try testing.expect(depth(s) < qmm.depth(s));
@@ -596,13 +579,11 @@ test "the input-write controls land a fixed value the read-back must see, past t
     defer a.free(w);
     @memset(w, 0xffff_ffff);
     q.words(w[0..weightsWords(shape)]);
-    // the weights control writes 0xdeadbeef at the first guard word past the data, where no
-    // workgroup reads: the bytes the read-back returns must differ from the snapshot's
+    // Weights control must change the unread guard word beyond the input data.
     const at = weightsWords(shape);
     try testing.expect(at + 1 <= w.len);
     try testing.expect(w[at] != 0xdeadbeef);
-    // the biases control writes a fixed bf16 1.0 at the first guard element past its data,
-    // which the fixture fills with the 0x7fc5 poison: the bytes must differ there too
+    // Biases control must change the guard element poisoned with bf16 1.0.
     try testing.expect(@as(u16, 0x3f80) != poison);
 }
 
