@@ -690,9 +690,7 @@ pub fn serverModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
 /// The decode SG qmv (unit 12) appended last so the bundle before it stays byte-identical; one module added at the end.
 const sg_decode_variants = [_]ShaderVariant{
     .{ .name = "qmm_q4_sg", .src = "zig/kernels/vulkan/qmm_q4_sg.comp", .defines = &.{} },
-    // Candidate C: the same source with the merged gate|up weight and the
-    // ASH swiglu epilogue in one dispatch; appended last so every earlier
-    // module offset stays put and the module check sees exactly one added.
+    // Candidate C: the same source with the merged gate|up weight and swiglu epilogue, appended last.
     .{ .name = "qmm_q4_sg_swiglu", .src = "zig/kernels/vulkan/qmm_q4_sg.comp", .defines = &.{"-DFUSED_SWIGLU"} },
 };
 

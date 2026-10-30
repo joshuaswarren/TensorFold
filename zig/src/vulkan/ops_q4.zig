@@ -154,16 +154,10 @@ pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: Vi
     }
 }
 
-/// Candidate C: the merged gate|up projection and the ASH swiglu in ONE
-/// dispatch of the -DFUSED_SWIGLU kernel: slots 0-1 compute gate rows
-/// 4w..4w+3, slots 2-3 the matching up rows of the merged weight, and the
-/// epilogue writes only the `act` activations (gate_rows elements). Refuses
-/// when the SG decode gate does not admit the merged shape; the caller then
-/// runs candidate B's path. The merged weight must already be laid out.
+/// Candidate C: merged gate|up projection plus ASH swiglu in ONE dispatch writing only `act`; refuses if SG declines.
 pub fn projectSwiglu(o: *Ops, cmds: *Commands, act: tensor.View, x: tensor.View, fused_w: tensor.View, fused_scales: tensor.View, fused_biases: tensor.View, k: u64, timeout_ns: u64) Error!void {
     const pipe = if (o.qmm_q4_sg_swiglu) |*sw| sw else return error.Invalid;
-    // NOT projectGeometry: the weight carries gate+up rows (2 x act.elements)
-    // against an activation-sized output, which the plain geometry refuses.
+    // NOT projectGeometry: the weight carries gate+up rows (2 x act.elements) against an activation-sized output.
     if (act.kind != .bf16 or x.kind != .bf16 or fused_w.kind != .u32) return error.Invalid;
     if (k == 0 or k % group_size != 0) return error.Invalid;
     if (x.elements != k) return error.Invalid; // the epilogue is a one-row dispatch

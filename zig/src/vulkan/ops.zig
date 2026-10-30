@@ -26,8 +26,7 @@ pub const Shaders = struct {
     copy_u16: []align(4) const u8,
     /// The decode subgroup qmv image (the probe's SG master); null keeps every qmm dispatch on the old kernel.
     qmm_q4_sg: ?[]align(4) const u8 = null,
-    /// The same kernel with the fused swiglu epilogue (-DFUSED_SWIGLU); null keeps the
-    /// decode MLP on candidate B's merged dispatch plus the separate swiglu.
+    /// The same kernel with the fused swiglu epilogue (-DFUSED_SWIGLU); null keeps B's merged dispatch plus swiglu.
     qmm_q4_sg_swiglu: ?[]align(4) const u8 = null,
 };
 
@@ -92,8 +91,7 @@ pub const Ops = struct {
     copy_u16: dispatch.Pipeline,
     /// The decode matmul's subgroup qmv pipeline when engine init built it; null keeps the old kernel byte-for-byte.
     qmm_q4_sg: ?dispatch.Pipeline,
-    /// The swiglu-epilogue variant of that kernel (candidate C), built only when TF_VK_FUSE_SWIGLU
-    /// admits it; null keeps the decode MLP on the merged dispatch plus the separate swiglu.
+    /// The swiglu-epilogue variant (candidate C), built when TF_VK_FUSE_SWIGLU admits it; null keeps B's path.
     qmm_q4_sg_swiglu: ?dispatch.Pipeline,
     /// Fixed once at init; the model probe reports it at ready.
     qmm_path: ops_q4.QmmPath,
@@ -152,8 +150,7 @@ pub const Ops = struct {
             o.qmm_path = .sg;
         }
         errdefer if (o.qmm_q4_sg) |*sg| sg.deinit();
-        // Candidate C's switch, read once at engine init: TF_VK_FUSE_SWIGLU=0 keeps the
-        // decode MLP on candidate B's merged dispatch plus the separate swiglu.
+        // Candidate C's switch, read once at engine init: TF_VK_FUSE_SWIGLU=0 keeps B's merged dispatch plus swiglu.
         o.fuse_swiglu = fuse.swigluFromEnv(std.c.getenv("TF_VK_FUSE_SWIGLU"));
         if (o.fuse_swiglu) {
             if (shaders.qmm_q4_sg_swiglu) |img| {
