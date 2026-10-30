@@ -179,17 +179,26 @@ pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: Vi
 /// runs candidate B's path. The merged weight must already be laid out.
 pub fn projectSwiglu(o: *Ops, cmds: *Commands, act: tensor.View, x: tensor.View, fused_w: tensor.View, fused_scales: tensor.View, fused_biases: tensor.View, k: u64, timeout_ns: u64) Error!void {
     const pipe = if (o.qmm_q4_sg_swiglu) |*sw| sw else return error.Invalid;
-    const g = try projectGeometry(act, x, fused_w, fused_scales, fused_biases, k);
+    // NOT projectGeometry: the weight carries gate+up rows (2 x act.elements)
+    // against an activation-sized output, which the plain geometry refuses.
+    if (act.kind != .bf16 or x.kind != .bf16 or fused_w.kind != .u32) return error.Invalid;
+    if (k == 0 or k % group_size != 0) return error.Invalid;
+    if (x.elements != k) return error.Invalid; // the epilogue is a one-row dispatch
+    const per_row_w = k / 8;
+    const per_row_p = k / 64;
+    const n_merged = fused_w.elements / per_row_w;
+    if (n_merged % 2 != 0) return error.Invalid;
+    const gate_rows = n_merged / 2;
+    if (act.elements != gate_rows) return error.Invalid;
+    if (fused_scales.elements != n_merged * per_row_p or fused_biases.elements != n_merged * per_row_p) return error.Invalid;
     const limits = o.dev.properties.limits;
     const lim = Limits{ .max_range = limits.maxStorageBufferRange, .alignment = limits.minStorageBufferOffsetAlignment };
     if (x.byteLen() > lim.max_range or act.byteLen() > lim.max_range) return error.TooLarge;
-    const rows = try chunkRows(lim, k, g.n);
+    const rows = try chunkRows(lim, k, n_merged);
     if (rows != 0) return error.TooLarge; // the epilogue's one-workgroup mapping needs the whole weight
-    const gate_rows = g.n / 2;
-    if (act.elements != gate_rows) return error.Invalid; // the epilogue writes exactly the activations
     if (!o.fuse_swiglu) return error.Invalid;
     try pipe.bind(&.{ x.bind(), fused_w.bind(), fused_scales.bind(), fused_biases.bind(), act.bind() });
-    var p = try q4Push(g.m, g.n, k);
+    var p = try q4Push(1, n_merged, k);
     p.flags = pk_variant;
     try pipe.run(cmds, std.mem.asBytes(&p), .{ try ops_mod.cast32(gate_rows / 4), 1, 1 }, timeout_ns);
 }
