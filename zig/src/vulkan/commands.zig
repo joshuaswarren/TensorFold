@@ -21,8 +21,7 @@ pub const Commands = struct {
     batch_staging: Buffer = undefined,
 
     pub fn init(dev: *const Device) Error!Commands {
-        // The elision switch, read once per engine: TF_VK_NOBAR=0 restores the
-        // barrier after every dispatch for a same-binary A/B.
+        //  The elision switch, read once per engine: TF_VK_NOBAR=0 restores the per-dispatch barrier for an A/B.
         dispatch.elide_barriers = dispatch.elideFromEnv(std.c.getenv("TF_VK_NOBAR"));
         const api = &dev.api;
         const pool_info: c.VkCommandPoolCreateInfo = .{
@@ -99,13 +98,7 @@ pub const Commands = struct {
 
     // ------------------------------------------------ batch session
 
-    /// Opens a batch: one reset+begin and fresh staging ledgers against `staging`. Nested batches
-    /// are refused. The physical reset+begin happens BEFORE the session and
-    /// the global batch contexts are considered open, and any begin failure
-    /// rolls those contexts back, so recording never rides a stale command
-    /// buffer. Batched descriptor banks key on the new epoch, so every
-    /// pipeline's snapshot cursor restarts only here — always after the
-    /// previous batch's fence has been waited.
+    /// Opens a batch: one reset+begin and fresh staging ledgers; nesting refused; failures roll contexts back.
     pub fn beginBatch(self: *Commands, staging: Buffer) dispatch.Error!void {
         if (self.session) return error.Invalid;
         if (staging.dev != self.dev or staging.kind != .staging or staging.mapped == null) return error.Invalid;
@@ -128,13 +121,7 @@ pub const Commands = struct {
         self.batch_staging = staging;
     }
 
-    /// Records the one physical submission of the open batch: the staging
-    /// flush, one end/submit/fence-wait cycle for the whole token, then the
-    /// staging invalidate so the host can read the down slices. The batch
-    /// contexts close on EVERY path — a pre-submit flush/end/submit failure
-    /// unconditionally closes them, so the next call starts clean; the fence
-    /// discipline is unchanged (Timeout/InFlight still demand orExit at the
-    /// call site).
+    /// The batch's one submission: staging flush, end/submit/fence, invalidate; contexts close on every path.
     pub fn endBatch(self: *Commands, timeout_ns: u64) dispatch.Error!void {
         if (!self.session) return error.Invalid;
         dispatch.flushHazard(self.dev, self.cmd); // the batch's last deferred barrier, before the buffer ends
