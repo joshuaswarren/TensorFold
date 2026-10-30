@@ -243,9 +243,7 @@ shared float reduce_scratch[256];
 #endif
 
 #ifdef FUSED_SWIGLU
-// Candidate C's exchange: each slot's lead lane posts its two rows' rounded
-// dots here (slots 0-1 the gate rows, slots 2-3 the matching up rows), and
-// four threads apply the ASH swiglu program after one workgroup barrier.
+// Swiglu epilogue exchange: lead lanes post their rounded dots (slots 0-1 gate, 2-3 up); four threads apply swiglu.
 shared float fused_gate[4];
 shared float fused_up[4];
 #endif
@@ -614,9 +612,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
 #endif
 #endif
 
-// The store-point bf16 rounding, shared by the multi main's add epilogue and
-// candidate C's fused swiglu (defined outside the multi-only region: the
-// plain build's epilogue needs it too).
+// The store-point bf16 rounding, shared by the multi main's add epilogue and the fused swiglu.
 #ifdef USE_FP16
 #define ROUND_STORAGE(f) (unpackHalf2x16(packHalf2x16(vec2(f, 0.0))).x)
 #elif defined(USE_BF16)
@@ -1560,10 +1556,7 @@ void main() {
   uint w_batch_words = params.shape[1];
   uint param_batch = params.shape[2];
 #ifdef FUSED_SWIGLU
-  // Candidate C: the merged gate|up weight. Slots 0 and 1 compute gate rows
-  // 4w..4w+3, slots 2 and 3 the matching up rows (matrix_n/2 past them), so
-  // one workgroup produces four gate/up pairs and the epilogue stores only
-  // the four activations.
+  // Swiglu epilogue, merged gate|up weight: slots 0-1 gate rows 4w..4w+3, slots 2-3 the up rows; four activations.
   uint column = gl_WorkGroupID.x * (uint(ROWS_PER_SLOT) * 2u) +
       (column_slot % 2u) * uint(ROWS_PER_SLOT) +
       (column_slot / 2u) * (params.matrix_n / 2u);
@@ -1609,10 +1602,7 @@ void main() {
 #endif
     }
 #ifdef FUSED_SWIGLU
-    // The ASH swiglu program (swiglu.comp ASH_QWEN35): the operands are the
-    // bf16-rounded dots (exactly what the unfused pipeline stores and swiglu
-    // re-reads), denom = 1 + exp(-g), silu = g / denom (the division form,
-    // no intermediate rounding), one round at the output store.
+    // Ash's Qwen3.5 swiglu program (swiglu.comp): bf16-rounded dots, denom = 1 + exp(-g), silu = g / denom, one round.
     barrier();
     if (lane < 4u) {
       float g = fused_gate[lane];
