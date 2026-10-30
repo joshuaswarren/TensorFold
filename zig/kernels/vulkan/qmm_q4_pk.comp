@@ -110,10 +110,16 @@ void main() {
           precise float term = bf16_load(input_x.values[x_base + k_base + e]) *
               (scale * q + bias);
           precise float t = partial + term;
-          if (abs(partial) >= abs(term)) {
-            comp += (partial - t) + term;
-          } else {
-            comp += (term - t) + partial;
+          // The error term is meaningless once the sum is not finite (inf - inf is NaN), and
+          // feeding it to comp would turn a row the float64 reference keeps at one infinity
+          // into NaN. Finite sums never take this branch's else, so finite outputs are
+          // bit-identical to the unguarded form.
+          if (!isnan(t) && !isinf(t)) {
+            if (abs(partial) >= abs(term)) {
+              comp += (partial - t) + term;
+            } else {
+              comp += (term - t) + partial;
+            }
           }
           partial = t;
         } else {
@@ -132,10 +138,14 @@ void main() {
           precise float a = tree[lane];
           precise float b2 = tree[lane + stride];
           precise float sum = a + b2;
-          precise float bb = sum - a;
-          precise float err = (a - (sum - bb)) + (b2 - bb);
+          // same guard as the lane sums: a non-finite node keeps the sum's class and leaves
+          // the compensation chain alone, instead of poisoning it with inf - inf
+          if (!isnan(sum) && !isinf(sum)) {
+            precise float bb = sum - a;
+            precise float err = (a - (sum - bb)) + (b2 - bb);
+            tree_lo[lane] = tree_lo[lane] + tree_lo[lane + stride] + err;
+          }
           tree[lane] = sum;
-          tree_lo[lane] = tree_lo[lane] + tree_lo[lane + stride] + err;
         } else {
           tree[lane] += tree[lane + stride];
         }
