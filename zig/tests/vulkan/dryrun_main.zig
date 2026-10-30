@@ -77,6 +77,7 @@ pub fn main(init: std.process.Init) !u8 {
     const d = md.mock.dispatchCount();
     const b = md.mock.barrierCount();
     std.debug.print("DRYRUN decode 3 tokens dispatches={d} barriers={d} verdict_failures={d}\n", .{ d - load_d, b - load_b, verdict_failures });
+    std.debug.print("DRYRUN per decode token dispatches={d} barriers={d}\n", .{ (d - load_d) / 3, (b - load_b) / 3 });
 
     var sha: [32]u8 = undefined;
     try md.mock.logSha(&sha);
