@@ -51,6 +51,18 @@ pub fn swigluEpilogue(acc_g: f32, acc_u: f32) f32 {
     return bf16Round(silu * u);
 }
 
+/// Candidate C rides candidate B: the epilogue dispatches the merged
+/// gate|up group, so group fusion off means the epilogue is off however the
+/// env switch is set.
+pub fn swigluEffective(swiglu_switch: bool, fuse_switch: bool) bool {
+    return swiglu_switch and fuse_switch;
+}
+
+pub fn swigluMilestone(buf: []u8, swiglu_switch: bool, fuse_switch: bool) []const u8 {
+    if (swigluEffective(swiglu_switch, fuse_switch)) return "on";
+    return std.fmt.bufPrint(buf, "off ({s})", .{if (fuse_switch) "TF_VK_FUSE_SWIGLU=0" else "group fusion off"}) catch "off";
+}
+
 /// TF_VK_FUSE=0 loads exactly as today; any other value or unset fuses.
 pub fn fuseFromEnv(v: ?[*:0]const u8) bool {
     const s = v orelse return true;
@@ -333,4 +345,15 @@ test "the real 2B tower fuses 90 of its 490 decode dispatches away" {
     try testing.expectEqual(@as(u64, 187), qmm);
     try testing.expectEqual(@as(u64, 90), saved);
     try testing.expectEqual(@as(u64, 490 - 90), 490 - saved); // 400 remain
+}
+
+test "the swiglu epilogue requires group fusion and says which switch turned it off" {
+    try testing.expect(swigluEffective(true, true));
+    try testing.expect(!swigluEffective(true, false)); // C rides B's merged weights
+    try testing.expect(!swigluEffective(false, true));
+    try testing.expect(!swigluEffective(false, false));
+    var buf: [96]u8 = undefined;
+    try testing.expectEqualStrings("on", swigluMilestone(&buf, true, true));
+    try testing.expectEqualStrings("off (group fusion off)", swigluMilestone(&buf, true, false));
+    try testing.expectEqualStrings("off (TF_VK_FUSE_SWIGLU=0)", swigluMilestone(&buf, false, true));
 }
