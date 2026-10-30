@@ -195,10 +195,7 @@ fn readOracleMeta(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, oracle_dir:
     };
 }
 
-/// The exact production bundle: the build-generated qwen35_shaders SPIR-V
-/// image for every field of engine.ShaderBundle (10 stage-1 ops, 4 norm/MLP,
-/// 3 attention, 7 GDN, 3 greedy), shared by the probe run and the opt-in
-/// load test so both exercise the shader set the server serves with.
+/// The exact production bundle: the generated qwen35_shaders SPIR-V image, shared by probe run and load test.
 fn bundle() engine_mod.ShaderBundle {
     return .{
         .ops = .{
