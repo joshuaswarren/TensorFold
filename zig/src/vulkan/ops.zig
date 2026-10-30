@@ -23,8 +23,7 @@ pub const Shaders = struct {
     cast_f32_bf16: []align(4) const u8,
     copy_u32: []align(4) const u8,
     copy_u16: []align(4) const u8,
-    /// The decode subgroup qmv image (the probe's SG master); null in builds that do not ship it,
-    /// which keeps every qmm dispatch on the old kernel.
+    /// The decode subgroup qmv image (the probe's SG master); null keeps every qmm dispatch on the old kernel.
     qmm_q4_sg: ?[]align(4) const u8 = null,
 };
 
@@ -87,8 +86,7 @@ pub const Ops = struct {
     cast_f32_bf16: dispatch.Pipeline,
     copy_u32: dispatch.Pipeline,
     copy_u16: dispatch.Pipeline,
-    /// The decode matmul's subgroup qmv pipeline when engine init built it; null keeps every
-    /// qmm dispatch on the old kernel, byte-for-byte.
+    /// The decode matmul's subgroup qmv pipeline when engine init built it; null keeps the old kernel byte-for-byte.
     qmm_q4_sg: ?dispatch.Pipeline,
     /// Fixed once at init; the model probe reports it at ready.
     qmm_path: ops_q4.QmmPath,
@@ -132,8 +130,7 @@ pub const Ops = struct {
         errdefer o.copy_u32.deinit();
         o.copy_u16 = try dispatch.Pipeline.init(dev, shaders.copy_u16, .{ .bindings = 4, .push_bytes = params.push_bytes, .writes = 1 << 2 });
         errdefer o.copy_u16.deinit();
-        // The decode kernel decision, read once here: TF_VK_QMM=old pins today's kernel for a
-        // same-binary A/B; otherwise the device's subgroup admits the SG kernel or it does not.
+        // The decode kernel decision, read once: TF_VK_QMM=old pins today's kernel, else the device gate decides.
         const env = std.c.getenv("TF_VK_QMM");
         if (env != null and std.mem.eql(u8, std.mem.span(env.?), "old")) {
             o.qmm_path = .old_env;
@@ -166,9 +163,7 @@ pub const Ops = struct {
         return .{ .buffer = &o.dummy, .len = dummy_bytes };
     }
 
-    /// The decode matmul's SG pipeline when this dispatch may use it: init built the pipeline
-    /// (the env and device gate) and the batch's real row count with its shape passes the pure
-    /// gate; null keeps the old kernel.
+    /// The SG pipeline when this dispatch may use it: init built it and the batch's shape passes the pure gate.
     pub fn qmmDecodeSg(o: *Ops, m: u64, k: u64, n: u64) ?*dispatch.Pipeline {
         if (!ops_q4.qmmDecodeSgAdmits(m, k, n, .{ .subgroup_size = o.dev.v11.subgroupSize, .subgroup_ops = o.dev.v11.subgroupSupportedOperations }, o.qmm_q4_sg != null)) return null;
         return &o.qmm_q4_sg.?;

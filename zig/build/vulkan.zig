@@ -687,7 +687,7 @@ pub fn serverModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
 }
 
 /// Every image the bundle embeds: the real stage arrays, concatenated; names are what the adapter's bundle() reads.
-/// The decode SG qmv (unit 12) appended last so the bundle before it stays byte-identical; one module added at the end.
+/// The decode subgroup qmv, appended last so the bundle before it stays byte-identical; one module added at the end.
 const sg_decode_variants = [_]ShaderVariant{
     .{ .name = "qmm_q4_sg", .src = "zig/kernels/vulkan/qmm_q4_sg.comp", .defines = &.{} },
 };
