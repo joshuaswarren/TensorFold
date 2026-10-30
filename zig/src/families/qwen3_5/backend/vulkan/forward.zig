@@ -129,7 +129,7 @@ pub const Core = struct {
         var a: View = undefined;
         var b: View = undefined;
         const qkvzab_group = if (rows == 1) layer.qkvzab else null;
-        // Decode row: the qkv projection writes the conv window tail (3 state rows in front), so the window copy is skipped.
+        // Decode row: the qkv projection writes the conv window tail (3 state rows in front); no window copy.
         const window_prefix: u64 = state.conv_rows * pinned.conv_dim;
         const limits = c.acc.ops.dev.properties.limits;
         const in_place = vk.fuse.convInplaceAllowed(c.acc.ops.conv_inplace, rows, window_prefix * 2, limits.minStorageBufferOffsetAlignment) and
