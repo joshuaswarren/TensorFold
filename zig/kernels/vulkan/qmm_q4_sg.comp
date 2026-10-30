@@ -1,54 +1,18 @@
 #version 460
-// omarchy-mlx qmm_vec.comp (MIT, same owner) at 5e40ecf953e8b907dcae1ce6caadce6ad62b0e0f, compiled as the QmmVecQ4WordSubgroupBF16 kernel:
+// omarchy-mlx qmm_vec.comp (MIT, same owner) at 5e40ecf9, compiled as the QmmVecQ4WordSubgroupBF16 kernel.
 #define USE_BF16 1
 #define USE_SUBGROUP 1
 #define QMM_VEC_Q4_WORD 1
 #define ROWS_PER_SLOT 2
 #define SLOTS_PER_GROUP 4
 
-// Fused matrix-vector path for QuantizedMatmul when x is a single row:
-// out[1, n] = x[1, k] @ dequant(w) with w packed uint32 words holding
-// 32/bits affine values along the packed axis in the low bits first
-// (bits 2/4/8) or lane-atomic little-endian byte packs of 8/3, 8/5,
-// or 4/3 bytes (bits 3/5/6), one affine scale and bias per group_size
-// elements; with -DFP_MODE the fp modes instead (fp4 e2m1 / fp8 e4m3
-// element bytes, one scale byte per group, no bias). Decode is this
-// shape on every layer, and the general kernel serializes it: one
-// thread per output column walks the whole row serially, so its
-// 32-lane reads sit words-per-row*4 bytes apart - every lane a
-// separate cache line. Here each of the workgroup's 32-lane subgroups
-// owns one weight row (ROWS_PER_SLOT consecutive rows in the packed-x
-// subgroup builds) and lanes stride single k steps, so consecutive lanes
-// read consecutive x elements, consecutive weight-row words, and one
-// shared cache line of row bytes per step.
-// Dequantization happens in registers inside the dot product - no
-// dequantized intermediate tensor, no extra pass over memory, one
-// dispatch.
-//
-// Two reduction flavors compile from this same source via -DUSE_SUBGROUP:
-//   * default: five-round workgroup-shared tree (correct on any
-//     subgroup size; lane split is plain workgroup arithmetic). The
-//     five barrier rounds are the cost.
-//   * USE_SUBGROUP=1: one subgroupAdd(accumulator) per 32-lane slot
-//     (Honeykrisp's actual subgroupSize). Trades the barriers for the
-//     hardware reduction; the bench (tools/subgroup-bench) decides
-//     whether the trade pays on this device. Dispatch is gated on
-//     caps.subgroup_size == 32 and the ARITHMETIC subgroup-feature bit,
-//     so a device that lacks either falls back to the tree path
-//     unchanged.
-// Both flavors pair lanes stride 1 first, then 2, 4, 8, 16. That is the
-// order native Metal simd_sum reduces in, and Honeykrisp's 32-bit float
-// subgroupAdd is the same hardware reduction (agx_nir_lower_subgroups
-// leaves it unlowered) and measured that pairing bit for bit, so the Q4
-// word path below is bit-identical to native qmv
-// (receipts/2026-09-09-q4-gemv-order). subgroupShuffleXor is not used:
-// Honeykrisp emulates arbitrary shuffles with four read_invocation
-// selects per step.
-//
-// QMM_VEC_Q4_WORD compiles the transposed affine 4-bit/group-64 decode
-// path in native qmv arithmetic: one lane owns one packed word per
-// block, loads scale and bias once, and applies all eight nibbles with
-// constant shifts.
+// Fused single-row Q4 decode: one subgroup per weight row, lanes stride k, dequant in registers, one dispatch.
+
+// Two reductions: the five-round shared tree fits any subgroup size; USE_SUBGROUP swaps barriers for subgroupAdd.
+
+// Lanes pair stride 1 first as native simd_sum does; Honeykrisp's subgroupAdd measures the same order bit for bit.
+
+// QMM_VEC_Q4_WORD compiles the transposed 4-bit group-64 decode path in native qmv arithmetic with constant shifts.
 
 #ifdef USE_FP16
 #extension GL_EXT_shader_16bit_storage : require
@@ -75,12 +39,7 @@ uint16_t bf16_store(float value) {
 #define STORE_VALUE(f) STORAGE_TYPE(f)
 #endif
 #ifdef USE_SUBGROUP
-// The subgroup reduction variant assumes subgroupSize == 32, gated in
-// dispatch (see QuantizedMatmul::eval_gpu). The kernel does not check
-// this itself because Vulkan does not let compute shaders query
-// subgroupSize at runtime. Compiling this on a device with a different
-// subgroup size produces a wrong sum, so the dispatch gate is the
-// load-bearing part of this codepath.
+// The pairing order assumes a 32-lane subgroup; dispatch gates on the device's subgroup size.
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #endif
@@ -97,12 +56,7 @@ uint16_t bf16_store(float value) {
 #error "QMM_VEC_OUTGATE builds on the bf16 subgroup multi column"
 #endif
 
-// Decode geometry: SLOTS_PER_GROUP 32-lane slots per workgroup, each slot
-// owning ROWS_PER_SLOT consecutive output rows (native qmv_fast keeps four
-// rows per simdgroup: the x quads load once per block and feed every row,
-// and the row loads sit independent in flight). ROWS_PER_SLOT > 1 needs the
-// packed x view (f16/bf16) and the subgroup reduction; the per-row
-// arithmetic order is the single-row chain, so results stay bit-identical.
+// SLOTS_PER_GROUP slots per workgroup own ROWS_PER_SLOT rows; per-row order keeps the single-row chain bit-identical.
 #ifndef ROWS_PER_SLOT
 #define ROWS_PER_SLOT 1
 #endif
@@ -125,9 +79,7 @@ uint16_t bf16_store(float value) {
 #if !defined(USE_SUBGROUP) && SLOTS_PER_GROUP != 8
 #error "the tree reduction assumes 8 slots"
 #endif
-// The x fetch inside Q4_WORD / Q4_ROWS: the out-gate prologue variant
-// (QMM_VEC_OUTGATE, multi-only) transforms the two prologue vectors
-// instead of reading the product; every other variant reads input_x.
+// The out-gate prologue variant transforms the two prologue vectors; every other variant reads input_x.
 #if defined(QMM_VEC_OUTGATE)
 #define OUTGATE_XWORDS(x_base) outgate_quad((x_base) / 8u)
 #else
@@ -139,8 +91,7 @@ const uint LANES = 32u;
 layout(local_size_x = SLOTS_PER_GROUP * 32) in;
 
 #if (defined(USE_FP16) || defined(USE_BF16)) && defined(QMM_VEC_Q4_WORD)
-// Decode x rows are 16-byte aligned by dispatch. Reading eight packed halves
-// at once keeps native's half arithmetic while avoiding eight scalar loads.
+// Decode x rows are 16-byte aligned, so one load reads eight packed bf16 values.
 layout(set = 0, binding = 0, std430) readonly buffer InputX {
   uvec4 values[];
 } input_x;
@@ -153,18 +104,7 @@ layout(set = 0, binding = 0, std430) readonly buffer InputX {
 #ifndef QMM_VEC_Q4_WORD
 #error "QMM_VEC_MULTI builds on QMM_VEC_Q4_WORD"
 #endif
-// Multi-weight decode dispatch: up to four transposed 4-bit/group-64
-// weights against one x row in one dispatch, each with its own
-// scale/bias/output triple and an optional fused Add epilogue
-// (sum = out + addend, the elementwise Add's float add and storage
-// rounding). Workgroups are laid out weight after weight; shape[i]
-// carries weight i's N, dims the weight count, flags bit 8+i the
-// epilogue for weight i. Every weight, scale, bias, output, and addend
-// starts at element 0 of its buffer (the host refuses otherwise), so no
-// per-weight offsets ride in the push constants — except a weight's sum
-// store under the direct-KV flag (bit 12+i), which the host may aim at
-// one token row of a KV cache copy: out_strides[i] base element,
-// in_strides[i] the row gap, matrix_m the head dim.
+// Up to four 4-bit group-64 weights per dispatch, each with its own scale, bias, output and optional Add epilogue.
 #define QMM_VEC_MULTI_WEIGHT(I, B) \
 layout(set = 0, binding = B, std430) readonly buffer InputW##I { \
   uint values[]; \
@@ -189,16 +129,7 @@ QMM_VEC_MULTI_WEIGHT(1, 7)
 QMM_VEC_MULTI_WEIGHT(2, 13)
 QMM_VEC_MULTI_WEIGHT(3, 19)
 #if defined(QMM_VEC_OUTGATE)
-// Out-gate prologue (flags bit 17): x = out * bf16(sigmoid(gate)), the
-// exact arithmetic and rounding of the two elementwise kernels the
-// prologue deletes (unary_vec.comp / elementwise.comp: float math on
-// the widened operand, one round to storage per kernel boundary —
-// sig_b = bf16(1/(1+exp(-g))), m = bf16(o * sig_b), both bf16_store
-// RNE). Every workgroup recomputes the full product from the same two
-// read-only vectors and gets identical bits; workgroup 0 stores the
-// materialized product so retained references to the deleted
-// Multiply's output stay valid (bindings 25-27; the vectors start at
-// element 0 — the host refuses otherwise).
+// The prologue recomputes the product per workgroup with identical bits; workgroup 0 stores it for retained references.
 layout(set = 0, binding = 25, std430) readonly buffer OutgateOut {
   uvec4 values[];
 } outgate_out;
@@ -253,9 +184,7 @@ layout(set = 0, binding = 3, std430) readonly buffer Biases {
   STORAGE_TYPE values[];
 } biases;
 #ifdef QMM_VEC_GREEDY
-// Greedy-argmax head (see the QMM_VEC_GREEDY main): top-bit plane, the
-// token, scratch (state words, per-row bounds, survivor rows, row
-// values), and the two stats words.
+// Greedy head bindings: top-bit plane, token, scratch state and the two stats words.
 layout(set = 0, binding = 4, std430) readonly buffer Plane {
   uint values[];
 } plane;
@@ -313,16 +242,9 @@ layout(push_constant) uniform Params {
 shared float reduce_scratch[256];
 #endif
 
-// Push-constant routing: operation carries bits (2, 3, 4, 5, 6, or 8),
-// reduce_size the group size, flags bit 0 the non-transposed layout.
-// Affine bindings 2/3 are the separate scale/bias streams; aux_offset
-// is the scale base item and aux_size the bias base item (storage
-// offsets in elements), shape[2] the per-batch param stride. FP_MODE
-// binding 2 is the scale-byte stream (one byte per group, aux_offset =
-// byte offset into it).
+// Push routing: operation bits, reduce_size group size, flags bit 0 layout, scale and bias bindings, per-batch stride.
 
-// Constant-shift select chain from scatter.comp: runtime word and lane,
-// constant shift per lane.
+// Constant-shift select chain from scatter.comp: runtime word and lane, constant shift per lane.
 uint byte_at(uint word, uint lane) {
   return (lane == 0u)
       ? (word & 0xFFu)
@@ -343,16 +265,13 @@ float e8m0_decode(uint bits) {
   return uintBitsToFloat(bits == 0u ? 0x400000u : bits << 23u);
 }
 
-// FP4 E2M1 decode via the fp16 bit trick from the Metal fp4_e2m1
-// constructor: (bits & 7) << 9 reinterprets the exponent and mantissa
-// as fp16 subnormals, the missing 2^14 lands in the scale factor.
+// FP4 E2M1 decodes through the fp16 subnormal bit trick, the missing 2^14 landing in the scale factor.
 float fp4_decode(uint code) {
   float magnitude = unpackHalf2x16((code & 7u) << 9u).x * 16384.0;
   return ((code & 8u) != 0u) ? -magnitude : magnitude;
 }
 #else
-// Affine byte-pack decode: element e of a pack, upstream extract table
-// (all constant shifts; e routes between constant expressions).
+// Affine byte-pack decode uses the upstream extract table of constant shifts.
 uint q3_at(uint e, uint c0, uint c1, uint c2) {
   if (e == 0u) return c0 & 0x7u;
   if (e == 1u) return (c0 >> 3) & 0x7u;
@@ -383,10 +302,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
 }
 #endif
 
-// Affine weight format of the multi-row word kernel (compile time). The
-// shipped builds are 4-bit group 64. QGROUP=32 changes only the block's
-// scale/bias group; QBITS=8 reads two weight words (bytes low first) per
-// eight x values, with the same quad chain and block epilogue.
+// Shipped builds are 4-bit group 64; QGROUP=32 changes the group, QBITS=8 reads two weight words per eight values.
 #ifndef QBITS
 #define QBITS 4
 #endif
@@ -404,15 +320,9 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
 #endif
 #endif
 #ifdef QMM_VEC_Q4_WORD
-// One x quad against the low 16 bits of `packed` (nibbles low first).
-// The quad's half chain sum joins input_sum; ((p0 + p1) + p2) + p3 joins
-// dot as an fma chain: every product is exact (11-bit x times a 4-bit
-// nibble), so each fma rounds exactly the sum native qdot rounds, and
-// nibble i times x equals native's (x / 16^i) * (word & mask_i).
+// One x quad against the low 16 bits: every product is exact, so each fma rounds exactly the sum native qdot rounds.
 #ifdef USE_FP16
-// Native load_vector adds the four T=half values in half. unpackFloat2x16 is
-// an f16vec2 bitcast, not a widening conversion. Q4_WORD supplies one uvec4
-// load for all eight x values.
+// Native load_vector adds four halves in half; unpackFloat2x16 is a bitcast; Q4_WORD supplies one uvec4 load.
 #define Q4_QUAD_LOAD(lo, hi) \
   f16vec2 h01 = unpackFloat2x16(lo); \
   f16vec2 h23 = unpackFloat2x16(hi); \
@@ -426,11 +336,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
   float x2 = float(h2); \
   float x3 = float(h3);
 #elif defined(USE_BF16)
-// Packed-x bf16 quad: two uint words of the uvec4 carry four bf16 halves
-// (low half first, as stored). bf16 -> f32 is an exact left shift by 16,
-// so every x value equals the scalar LOAD_VALUE, the sum chain keeps the
-// float order, and one uvec4 load replaces eight 2-byte scalar loads per
-// weight word.
+// Packed-x bf16 quads widen exactly and keep the float order; one uvec4 load replaces eight 2-byte scalar loads.
 #define Q4_QUAD_LOAD(lo, hi) \
   float x0 = uintBitsToFloat(((lo) & 0xFFFFu) << 16u); \
   float x1 = uintBitsToFloat((lo) & 0xFFFF0000u); \
@@ -438,8 +344,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
   float x3 = uintBitsToFloat((hi) & 0xFFFF0000u); \
   input_sum += ((x0 + x1) + x2) + x3;
 #else
-// f32 x has nothing to round; the f32 quad sum is uncaptured,
-// so f32 keeps the float chain.
+// f32 has nothing to round, so the uncaptured quad sum keeps the float chain.
 #define Q4_QUAD_LOAD(base, unused) \
   float x0 = LOAD_VALUE(input_x.values[base]); \
   float x1 = LOAD_VALUE(input_x.values[(base) + 1u]); \
@@ -447,10 +352,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
   float x3 = LOAD_VALUE(input_x.values[(base) + 3u]); \
   input_sum += ((x0 + x1) + x2) + x3;
 #endif
-// Exact float(n) for a nibble n in [0, 15] without u32_to_f (an expensive
-// conversion op on AGX; the in-chain GEMV runs +3% without it): 2^23 + n is
-// exact in f32, so inserting the nibble into the exponent word of 2^23 and
-// subtracting 2^23 returns n exactly.
+// Exact float(n) for a nibble: insert it into the exponent word of 2^23 and subtract 2^23, exact in f32.
 #define Q4_NIB(p, shift) \
   (uintBitsToFloat((((p) >> (shift)) & 0xfu) | 0x4B000000u) - 8388608.0)
 #define Q4_QUAD(packed, a, b) { \
@@ -477,10 +379,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
   Q4_QUAD(word_value >> 16u, quad_base + 4u, 0u) \
 }
 #endif
-// Block epilogue: result += fma(scale, dot, sum * bias) with the group
-// of word w (every word of a lane's block sits in one group). S and B
-// name the scale and bias buffers so the multi-weight variant can
-// instantiate the same chain per weight.
+// The block epilogue adds fma(scale, dot, sum * bias); S and B let the multi-weight variant instantiate per weight.
 #define Q4_BLOCK_FINISH(w, S, B) { \
   uint group = (w) / 8u; \
   float scale = LOAD_VALUE(S.values[scale_base + group]); \
@@ -488,22 +387,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
   precise float bias_term = input_sum * bias; \
   accumulator += fma(scale, dot, bias_term); \
 }
-// One output column of one transposed 4-bit/group-64 weight, native qmv
-// arithmetic (metal/kernels/quantized.h qmv_impl / qmv_fast_impl +
-// load_vector + qdot, T=half, U=float): a lane owns one word (two when
-// K % 512 == 0 and N % 8 == 0, the qmv_fast tile) per 256- or 512-wide
-// block. Per block it forms the half-precision chain sum of each x
-// quad, accumulates those in float, and the dot against the nibbles in
-// source order, then result += fma(scale, dot, sum * bias). Metal
-// compiles with -fno-fast-math: it contracts scale * accum + sum * bias
-// into that fma, leaves sum * bias separate, and keeps every add in
-// source order. Honeykrisp's NIR reassociates add chains into fma
-// ladders unless the ops are exact, so accumulator, dot, and input_sum
-// are precise (receipts/2026-09-09-q4-gemv-order). Straight-line
-// bodies: the qmv_fast tile and the qmv tile each get their own loop so
-// no runtime-count inner loop sits between the loads and the math.
-// Expects w_base, scale_base, bias_base, x_row, words_per_row, n and
-// lane_in_slot in scope and accumulates into `accumulator`.
+// One column, native qmv order: half quad sums, float dot, fma(scale, dot, sum * bias); precise ops pin the order.
 #define Q4_ROW(W, S, B) { \
   if (params.matrix_k % 512u == 0u && n % 8u == 0u) { \
     for (uint w = lane_in_slot * 2u; w < words_per_row; \
@@ -524,14 +408,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
   } \
 }
 #if ROWS_PER_SLOT > 1
-// Multi-row form of Q4_ROW: ROWS_PER_SLOT rows starting at `column`
-// (rows past n are clamped to row n - 1 and their results discarded, so
-// every load stays in bounds without a branch). Per row the chain is
-// exactly Q4_ROW's: the same quads in the same order into dot, the same
-// block epilogue; the x quads and input_sum are shared because they do
-// not depend on the row. Expects the batch bases w_base, s_base, b_base
-// (0 for the multi-weight kernel), x_row, words_per_row, groups_per_row,
-// n, column and lane_in_slot in scope; accumulates into acc[ROWS_PER_SLOT].
+// Multi-row Q4_ROW: rows clamp to n - 1 so loads stay in bounds; per row the chain matches Q4_ROW exactly, x shared.
 #define Q4_QUAD_ROWS(P_EXPR, a, b) { \
   Q4_QUAD_LOAD(a, b) \
   for (uint r = 0u; r < uint(ROWS_PER_SLOT); ++r) { \
@@ -564,14 +441,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
   } \
 }
 #if QBITS == 8
-// 8-bit twin of Q4_ROWS in native qmv_fast order (metal quantized.h,
-// bits == 8: values_per_thread = 8, block_size = 256): a lane owns one
-// eight-value step (two weight words, bytes low first) per 256-wide
-// block, load_vector forms sum += x[i] in float over the eight values,
-// qdot forms accum += x[i] * w[i] as one fma ladder, and the block
-// epilogue is Q4_ROWS_FINISH's. w counts eight-value steps, so the x
-// address and the group index are Q4_ROWS'; the weight row is row_words
-// wide.
+// 8-bit twin of Q4_ROWS in native qmv_fast order: one eight-value step per lane, float load sum, one fma ladder.
 #ifdef USE_FP16
 #define Q8_X8(xw) \
   float x0 = float(unpackFloat2x16((xw).x).x); \
@@ -665,15 +535,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
   } \
 }
 #endif
-// Multi-token (verify / small-batch) forms: the token (query-row)
-// dimension sits INSIDE the k walk so one weight-word load feeds every
-// token. Per token and slot column the chain is instruction-for-
-// instruction Q4_ROWS': same quad order into dot, same per-column
-// input_sum chain, same block epilogue fma, same subgroupAdd tree, same
-// rounding - so each row's result is bit-identical to that row computed
-// alone. params.matrix_m carries the live token count (1..M_TOKENS);
-// rows at or past it do no work (loads and stores are guarded, not
-// clamped). bf16 only: x quad words widen exactly like Q4_QUAD_LOAD_T.
+// Multi-token forms put the token dimension inside the k walk; each row's chain matches single-token bit for bit.
 #define Q4_QUAD_LOAD_T(a, b, isum) \
   float x0 = uintBitsToFloat(((a) & 0xFFFFu) << 16u); \
   float x1 = uintBitsToFloat((a) & 0xFFFF0000u); \
@@ -685,10 +547,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
       fma(x2, Q4_NIB(p, 8u), \
           fma(x1, Q4_NIB(p, 4u), \
               x0 * Q4_NIB(p, 0u))))
-// One block (one or two weight words per lane step) for all tokens:
-// weight words load once, x quads load once per token and are shared by
-// every slot column; dot and input_sum accumulate per (column, token)
-// exactly as the single-token kernel's per-column chain does.
+// One block serves all tokens: weights load once, x quads once per token; dot and input_sum run per column and token.
 #define Q4_TOK_BLOCK(W, S, B, words_this_step) { \
   uint wa[ROWS_PER_SLOT]; \
   uint wb[ROWS_PER_SLOT]; \
@@ -748,18 +607,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
 #endif
 
 #ifdef QMM_VEC_MULTI
-// Multi-weight main: workgroup ranges [0, g0), [g0, g0 + g1), [.., + g2),
-// and the rest select weight 0, 1, 2, 3; the selection is uniform per workgroup so
-// the barrier rounds of the tree reduction stay uniform. Each weight's
-// column runs the same Q4_ROW chain the single kernel runs for that
-// weight alone (n is that weight's N, so the qmv_fast tile choice is
-// the same). The epilogue must add the STORED value: the per-node Add
-// reads the rounded output back from memory. A float16_t round trip
-// in registers does not survive the AGX compiler (the epilogue then
-// added the unrounded total; 270 of 896 sums differed on the M1), so
-// the rounding goes through integer packing, as fused_chain.comp
-// does, and both the output and the sum derive from that rounded
-// value (converting an f16-representable float to float16_t is exact).
+// Multi-weight main: each workgroup range picks one weight so barriers stay uniform; the epilogue adds the stored sum.
 #ifdef USE_FP16
 #define ROUND_STORAGE(f) (unpackHalf2x16(packHalf2x16(vec2(f, 0.0))).x)
 #elif defined(USE_BF16)
@@ -767,10 +615,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
 #else
 #define ROUND_STORAGE(f) (f)
 #endif
-// Workgroup reduction of `accumulator` into `total`, both flavors.
-// The paired SwiGLU epilogue (flags bit 16) runs it twice per
-// workgroup (gate, then up); the barrier rounds stay uniform because
-// the fold flag is workgroup-uniform.
+// Workgroup reduction of accumulator into total, both flavors; SwiGLU's epilogue runs it twice with uniform barriers.
 #ifdef USE_SUBGROUP
 #define Q4_REDUCE(total) { (total) = subgroupAdd(accumulator); }
 #else
@@ -804,13 +649,7 @@ uint q6_at(uint e, uint c0, uint c1, uint c2) {
   } \
 }
 #if defined(QMM_VEC_TOKENS)
-// Multi-token main: same workgroup -> weight partition, fold contract
-// and reduction structure as the single-token main, with the token
-// dimension inside the k walk (see Q4_TOK_BLOCK). Output and Add-
-// epilogue rows are strided by the weight's n; the epilogue addend row
-// stride arrives via params.in_strides[which] (n for a full addend, 0
-// for a row-broadcast bias). The kv-window and out-gate folds are not
-// built here (host never selects them for rows > 1).
+// Multi-token main: the single-token partition, fold contract and reduction with the token dimension inside the k walk.
 #if !defined(USE_BF16) || defined(USE_FP16) || \
     !defined(QMM_VEC_Q4_WORD) || !defined(QMM_VEC_MULTI) || \
     ROWS_PER_SLOT != 2 || defined(QMM_VEC_OUTGATE) || !defined(M_TOKENS)
@@ -821,10 +660,7 @@ void main() {
   uint column_slot = lane / LANES;
   uint lane_in_slot = lane % LANES;
   uint token_count = params.matrix_m;
-  // Two-pass rows 9..16: out_strides[0] is this pass's first token row
-  // (0 for rows 0..7, 8 for rows 8..15); each pass runs the identical
-  // token8 chain over its own half, so per-row bit-identity holds and
-  // the token16 unroll is never compiled into the shipped path.
+  // Two-pass rows 9..16: each pass runs the identical token8 chain over its own half, so per-row bit-identity holds.
   uint row0 = params.out_strides[0];
   uint n0 = params.shape[0];
   uint n1 = params.shape[1];
@@ -881,9 +717,7 @@ void main() {
     } \
   }
 #else
-// The plain build's five-round shared tree per (token, column), the same
-// order Q4_REDUCE runs for the single-token column; the slot lead lane
-// holds the total exactly like the single-token store contract.
+// The plain build's five-round shared tree per token and column, the same order Q4_REDUCE runs for one column.
 #define Q4_TOK_REDUCE() { \
     for (uint m = 0u; m < M_TOKENS; ++m) { \
       for (uint r = 0u; r < uint(ROWS_PER_SLOT); ++r) { \
@@ -915,9 +749,7 @@ void main() {
     } \
   }
   if ((params.flags & 65536u) != 0u) {
-    // SwiGLU store epilogue: weight 0 is the gate, weight 1 the up; the
-    // product row is silu(gate)*up rounded through ROUND_STORAGE exactly
-    // as the single-token path and swiglu.comp round it.
+    // SwiGLU store epilogue: weight 0 the gate, weight 1 the up; the product rounds through ROUND_STORAGE as elsewhere.
     float gate_rounded[M_TOKENS][ROWS_PER_SLOT];
     Q4_TOK_ROWS(input_w0, scales0, biases0)
     Q4_TOK_REDUCE()
@@ -981,10 +813,7 @@ void main() {
             output3.values[out_index] = STORE_VALUE(rounded);
           }
           if ((params.flags & (256u << which)) != 0u) {
-            // Add epilogue: sum = rounded output + addend; the addend
-            // row stride is params.in_strides[which] (n for a full
-            // (tokens, n) addend, 0 for a broadcast bias vector). The
-            // stored value is read back exactly like Q4_MULTI_STORE.
+            // Add epilogue: sum = rounded output + addend; the addend row stride rides params.in_strides[which].
             uint addend_index = m * params.in_strides[which] + column_r;
             if (which == 0u) {
               sum0.values[out_index] = STORE_VALUE(
@@ -1006,9 +835,7 @@ void main() {
   }
 }
 #elif ROWS_PER_SLOT > 1
-// Multi-row main: same workgroup -> weight partition and fold contract as
-// the single-row main below (COLUMNS_PER_GROUP now spans every slot's
-// rows), each slot owning ROWS_PER_SLOT consecutive columns.
+// Multi-row main: the single-row partition and fold contract, each slot owning ROWS_PER_SLOT consecutive columns.
 #define Q4_ROWS_REDUCE(total) { \
   for (uint r = 0u; r < uint(ROWS_PER_SLOT); ++r) { \
     (total)[r] = subgroupAdd(acc[r]); \
@@ -1138,19 +965,7 @@ void main() {
   uint which;
   uint n;
   if ((params.flags & 65536u) != 0u) {
-    // SwiGLU store epilogue (fold path, flags bit 16): weight 0 is
-    // the gate projection, weight 1 the up projection, and the host
-    // guarantees n0 == n1 and dispatches exactly groups0 workgroups.
-    // Every workgroup computes the SAME column slice of both weights
-    // (same Q4_ROW chain and reduction the weight-partitioned layout
-    // runs — same words per lane, same pairing order, so both dots
-    // are bit-identical to the standalone stores) and then applies
-    // the fused_chain swiglu program statement-for-statement:
-    // sig = sigmoid(gate); silu = gate * sig; out = silu * up, every
-    // intermediate rounded through ROUND_STORAGE exactly as
-    // shaders/swiglu.comp rounds the values it loads back from
-    // memory. Only the swiglu product is stored; gate and up stay in
-    // registers, so the standalone swiglu dispatch is deleted.
+    // SwiGLU fold path: each workgroup takes one column slice of gate and up, then rounds exactly as swiglu.comp does.
     which = 0u;
     n = n0;
   } else if (workgroup < groups0) {
@@ -1242,40 +1057,7 @@ void main() {
 }
 #endif
 #elif defined(QMM_VEC_GREEDY)
-// Greedy-argmax head: the token argmax(logits - logsumexp(logits)) picks
-// for one bf16 x row (K = 2048: one 64-wide group per subgroup lane)
-// against a transposed 4-bit/group-64 weight, without evaluating the rows
-// that provably cannot hold it. One dispatch per stage (params.operation),
-// full barriers between them. Proof: receipts/2026-09-23-vocab-prune.md.
-//   0 prologue: X_g = sum x and L1_g = sum |x| per group; refuses (full
-//     path) any |x| > 2^20 or NaN.
-//   1 bounds: the plane packs a = q >> 1 (3 bits, 64 codes per 6 words
-//     per group). With q = 2a + l, l in {0, 1}, the exact logit is
-//     C + sum_g s_g sum (l - 1/2) x, C = sum_g 2 s_g sum a x +
-//     (s_g / 2 + b_g) X_g, so it lies within C +- sum_g |s_g| L1_g / 2;
-//     A 2^-12 (A = sum_g (16|s_g| + |b_g|) L1_g) covers the float rounding
-//     here and in the full GEMV. Stores UB per row and each workgroup's
-//     largest-C row as a candidate.
-//   2 candidates: exact logits of the candidates; LB* = their max, an
-//     actual bf16 logit, so the max logit m >= LB*.
-//   3 compact: a row survives unless LB* - UB > G + |UB| 2^-7,
-//     G = 0.13 + max(|LB*|, |UBmax|) / 12800: a pruned row's bf16 logit
-//     sits more than G below m, so the logprob rounding cannot merge it
-//     with the max either.
-//   4 exact: survivors through Q4_ROW + subgroupAdd + bf16 store, the
-//     QmmVecQ4WordSubgroupBF16 column itself.
-//   5 select: first index of the max over survivors; hands over to the
-//     full path when a smaller-index survivor sits within G of the max
-//     (the only case where logits - logsumexp rounding can merge two
-//     rows), on NaN, or on a prologue refusal.
-//   6, 7 full path, flagged tokens only: every row's logit, then
-//     LogSumExpBF16, the bf16 subtract, and ArgMaxBF16 statement for
-//     statement (logsumexp_suffix.comp, binary_vec.comp,
-//     argreduce_suffix.comp).
-// stats: rows evaluated exactly, 1 when the full path decided, and the
-// float bits of the max logit (pruned path) or of the bf16 logsumexp (full
-// path), for bitwise qualification against the composed ops.
-// flags bit 0 forces the full path, bit 1 keeps every row (qualification).
+// Greedy-argmax head: one stage per dispatch prunes rows that cannot hold the argmax; survivors take the exact GEMV.
 const uint GREEDY_ROWS_PER_SLOT = 16u;
 const uint STATE_LB = 64u;
 const uint STATE_UB = 65u;
@@ -1308,8 +1090,7 @@ float order_value(uint key) {
   xr[8u * (i) + 6u] = uintBitsToFloat((xw.w & 0xFFFFu) << 16u); \
   xr[8u * (i) + 7u] = uintBitsToFloat(xw.w & 0xFFFF0000u); \
 }
-// Code e of the group sits at bit 3e of the six plane words; four codes
-// straddle a word boundary. All shifts are compile-time constants.
+// Code e of the group sits at bit 3e of the six plane words; four codes straddle a word boundary.
 #define GREEDY_A(e) ((((e) * 3u) % 32u <= 29u) \
   ? ((pw[((e) * 3u) / 32u] >> (((e) * 3u) % 32u)) & 7u) \
   : (((pw[((e) * 3u) / 32u] >> (((e) * 3u) % 32u)) | \
@@ -1458,8 +1239,7 @@ void main() {
         ubs = greedy_values[8u + k] > ubs ? greedy_values[8u + k] : ubs;
         nans |= greedy_rows[8u + k];
       }
-      // Candidates ride the survivor buffer; stage 3 overwrites them
-      // after stage 2 has read them.
+      // Candidates ride the survivor buffer; stage 3 overwrites them after stage 2 has read them.
       survivors.values[gl_WorkGroupID.x] = row;
       atomicMax(state.values[STATE_UB], order_key(ubs));
       if (nans != 0u) {
@@ -1502,8 +1282,7 @@ void main() {
     return;
   }
   if (stage == 4u || stage == 6u) {
-    // Stage 4 walks the survivor list, stage 6 (flagged only) every row;
-    // each subgroup owns one column at a time, exactly as the full GEMV.
+    // Stage 4 walks the survivor list, stage 6 (flagged only) every row; each subgroup owns one column at a time.
     bool full = stage == 6u;
     if (full && state.values[STATE_FULL] == 0u) {
       return;
@@ -1575,8 +1354,7 @@ void main() {
     }
     return;
   }
-  // Stage 7, flagged only: LogSumExpBF16 over the stage-6 logits, then
-  // the bf16 subtract and ArgMaxBF16, each as its own kernel computes.
+  // Stage 7, flagged only: LogSumExpBF16 over the stage-6 logits, then the bf16 subtract and ArgMaxBF16.
   if (state.values[STATE_FULL] == 0u) {
     return;
   }
@@ -1646,26 +1424,13 @@ void main() {
   }
 }
 #else
-// Weight layout routing mirrors qmm.comp. Transposed (flags bit 0
-// clear): w batch slice [N, Kp], groups along K, scale [n][k / gs].
-// Non-transposed (bit 0 set): w batch slice [K, Np], packed N per row,
-// groups along N, scale [k][n / gs]. shape[0] carries the batch count
-// B and the per-slot work runs once per batch slice; each thread's
-// lane nibble and scale column stay fixed for the whole reduction.
-// FP_MODE dispatches only a single x row against a 2D w (batch = 1).
+// Weight layout routing mirrors qmm.comp; transposed and non-transposed layouts differ in w, groups and scale shapes.
 #if ROWS_PER_SLOT > 1
 #ifndef QMM_VEC_Q4_WORD
 #error "ROWS_PER_SLOT > 1 builds on QMM_VEC_Q4_WORD"
 #endif
 #if defined(QMM_VEC_BATCH)
-// Batch-shared form (MLX_OMARCHY_QMV_BATCH, default on): params.shape[0] = B <=
-// QMM_VEC_BATCH x rows against ONE 2D weight (no per-batch weight or param
-// stride). Each block loads its weight words, scales and biases once and runs
-// every row's chain on them. Per row that chain is Q4_ROWS exactly: the same
-// quads in the same order into dot, the same input_sum, the same block
-// epilogue and the same subgroup reduction, so each row matches the
-// batch-outer main below bit for bit while the weight bytes are read once
-// instead of B times.
+// Batch-shared form: B rows against one 2D weight; per row the chain matches the batch-outer main bit for bit.
 #define Q4_ROWS_BATCH_ROW(w, X_WORDS) { \
   uint x_row = params.lhs_offset + bt * params.matrix_k; \
   precise float dot[ROWS_PER_SLOT]; \
@@ -1767,9 +1532,7 @@ void main() {
   }
 }
 #else
-// Multi-row form of the Q4 word main: same batch walk and bases as the
-// single-row main below, each slot owning ROWS_PER_SLOT consecutive
-// columns (see Q4_ROWS).
+// Multi-row Q4 word main: the single-row main's batch walk and bases, slots owning ROWS_PER_SLOT columns each.
 void main() {
   uint lane = gl_LocalInvocationID.x;
   uint column_slot = lane / LANES;
@@ -1830,15 +1593,11 @@ void main() {
     if (column_active) {
       uint w_row = params.rhs_offset + b * w_batch_words;
       uint p_base = params.aux_offset + b * param_batch;
-      // Runtime trip count and runtime shift/mask: lane-uniform per
-      // step, never unrolled, so the unpack state stays out of
-      // registers.
+      // Runtime trip count and shift or mask: lane-uniform, never unrolled, so unpack state stays out of registers.
 #ifdef FP_MODE
       uint fp_pack_factor = (bits == 8u) ? 1u : 2u;
       if (non_transposed) {
-        // FP_MODE non-transposed: w [K, Np] with fp bytes packed along
-        // N (2 nibbles per byte little-endian), scale bytes
-        // [k][column / group_size]. Fixed column per lane, walk k.
+        // FP_MODE non-transposed: w [K, Np] with bytes along N, scale bytes [k][column / group_size], fixed column.
         uint n_bytes_per_row = params.matrix_n * bits / 8u;
         uint col_byte = column / fp_pack_factor;
         uint col_group = column / group_size;
@@ -1866,8 +1625,7 @@ void main() {
           accumulator += x_value * (scale * value);
         }
       } else {
-        // FP_MODE transposed: w [N, Kp], scale bytes
-        // [column][k / group_size].
+        // FP_MODE transposed: w [N, Kp], scale bytes [column][k / group_size].
         uint groups_per_row = params.matrix_k / group_size;
         uint w_base =
             w_row + column * (params.matrix_k / (fp_pack_factor * 4u));
@@ -1913,9 +1671,7 @@ void main() {
       uint bytes_per_pack = is_byte_bits ? (bits == 5u ? 5u : 3u) : 1u;
       uint value_mask = (1u << bits) - 1u;
       if (non_transposed) {
-        // Non-transposed: fixed lane nibble and fixed scale column per
-        // lane, walking the k rows. Byte bits decode the lane from the
-        // byte packs in the w row; word bits keep the fixed lane shift.
+        // Non-transposed: fixed lane nibble and scale column per lane walking the k rows; byte bits decode the lane.
         uint n_bytes_per_row = params.matrix_n * bits / 8u;
         uint n_words_per_row = params.matrix_n * bits / 32u;
         uint group_bytes = (group_size / pack_factor) * bytes_per_pack;
@@ -2010,27 +1766,16 @@ void main() {
 #endif
 #endif
     }
-    // Every lane reaches the reduction, including inactive slots
-    // (accumulator 0), so the barriers stay uniform across the
-    // workgroup.
+    // Every lane reaches the reduction, including inactive slots at zero, so the barriers stay workgroup-uniform.
 #ifdef USE_SUBGROUP
-    // Subgroup reduction path. Each 32-lane slot is one hardware
-    // subgroup; subgroupAdd folds the per-lane accumulators inside the
-    // subgroup without shared-memory scratch or barriers, pairing lanes
-    // stride 1 first (see the header). Every lane reaches it (uniform
-    // control flow); the lane_in_slot == 0 thread of each slot owns
-    // that column's output.
+    // Subgroup path: each slot is one hardware subgroup; subgroupAdd folds without scratch or barriers, stride 1 first.
     float total = subgroupAdd(accumulator);
     if (lane_in_slot == 0u && column_active) {
       output_data.values[params.output_offset + b * params.matrix_n +
           column] = STORE_VALUE(total);
     }
 #else
-    // Tree reduction path (default). Five rounds of barrier-synchronized
-    // shared-memory adds fold the 32-lane per-slot accumulators in the
-    // same stride-1-first pairing as the hardware reduction; first lane
-    // of each slot owns the column output. Correct on any subgroup size
-    // because the lane split is plain workgroup arithmetic.
+    // Tree path (default): five barrier rounds fold per-slot accumulators in the same stride-1 pairing, any size.
     reduce_scratch[lane] = accumulator;
     barrier();
     for (uint offset = 1u; offset < LANES; offset <<= 1u) {
