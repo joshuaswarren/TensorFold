@@ -6,6 +6,7 @@
 //! failure. Env switches behave exactly as in the model probe.
 const std = @import("std");
 const q35v = @import("qwen35_vulkan");
+const vk = q35v.vk;
 const q35s = @import("qwen35_shaders");
 const mock = @import("mock_device");
 const probe = @import("probe");
@@ -32,7 +33,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const md = try mock.device(gpa, alignment);
     defer md.mock.deinit();
-    const rt = try gpa.create(q35v.vk.Runtime);
+    const rt = try gpa.create(vk.Runtime);
     rt.* = .{ .lib = undefined, .instance = null, .api = undefined };
 
     std.debug.print("DRYRUN engine load: {s} align={d} ids={d}\\n", .{ args[1], alignment, ids.len });
@@ -47,7 +48,7 @@ pub fn main(init: std.process.Init) !u8 {
     // deterministic) and feeds 0 on; numerics are not what it can see.
     var verdict_failures: u64 = 0;
     var feed: u32 = 0;
-    q35v.vk.orExit(engine.prefill(ids)) catch |err| {
+    vk.orExit(engine.prefill(ids)) catch |err| {
         std.debug.print("FAIL prefill: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -55,21 +56,21 @@ pub fn main(init: std.process.Init) !u8 {
     const load_b = md.mock.barrierCount();
     std.debug.print("DRYRUN prefill dispatches={d} barriers={d}\n", .{ load_d, load_b });
 
-    if (q35v.vk.orExit(engine.draw())) |id| {
+    if (vk.orExit(engine.draw())) |id| {
         feed = id;
     } else |_| {
         verdict_failures += 1;
-        try q35v.vk.orExit(engine.reset());
+        try vk.orExit(engine.reset());
         feed = 0;
     }
     var step: u64 = 0;
     while (step < 3) : (step += 1) {
-        if (q35v.vk.orExit(engine.decodeDraw(feed, null))) |id| {
+        if (vk.orExit(engine.decodeDraw(feed, null))) |id| {
             feed = id;
         } else |err| {
             std.debug.print("DRYRUN decode step failed: {s}\n", .{@errorName(err)});
             verdict_failures += 1;
-            try q35v.vk.orExit(engine.reset());
+            try vk.orExit(engine.reset());
             feed = 0;
         }
     }
