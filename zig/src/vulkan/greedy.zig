@@ -121,15 +121,9 @@ pub const Greedy = struct {
         g.results.deinit();
     }
 
-    /// The draw's GPU work into an already-begun command buffer `cmd`: the
-    /// per-call three-word reset, the ordering barrier and the finite ->
-    /// chunk -> combine dispatch sequence — exactly the kernels and order
-    /// of select, with no submit. Shared by the immediate and batched paths.
+    /// The draw GPU work into an already-begun `cmd`: three-word reset, barrier, finite -> chunk -> combine; no submit.
     fn recordKernels(g: *Greedy, cmd: c.VkCommandBuffer) Error!void {
-        // Per-call reset of all three words; the barrier orders the fills and
-        // the compute that reads or overwrites them. The index word resets to
-        // 0xffffffff, so a run whose combine never wrote is refused by
-        // decode() instead of passing a stale or zero token.
+        // Per-call reset of all three words; the barrier orders fills and compute; the index resets to 0xffffffff.
         try commands.recordFill(g.dev, cmd, g.results, 0, 4, 0);
         try commands.recordFill(g.dev, cmd, g.results, 4, 8, std.math.maxInt(u32));
         commands.barrier(g.dev, cmd, c.VK_PIPELINE_STAGE_TRANSFER_BIT, c.VK_ACCESS_TRANSFER_WRITE_BIT, fill_stages, fill_access);
@@ -157,12 +151,7 @@ pub const Greedy = struct {
         try g.combine.bind(&.{ .{ .buffer = &g.partials, .len = g.partials.len }, .{ .buffer = &g.results, .len = g.results.len } });
     }
 
-    /// One draw over `logits` (a bf16 view of exactly the init count; the view's
-    /// word-padding rule refuses odd counts before any dispatch). One compute
-    /// submission resets the three result words (the runtime's recordFill), then
-    /// runs finite_logits -> argreduce_chunk -> argreduce_combine behind
-    /// dispatch barriers; a second fenced submission stages the 12-byte readback.
-    /// Wrap in commands.orExit: on Timeout/InFlight nothing may be freed.
+    /// One draw over `logits`: one submission resets and runs the three kernels; a second fences the readback staging.
     pub fn select(g: *Greedy, cmds: *Commands, staging: Buffer, logits: View, timeout_ns: u64) Error!u32 {
         try g.bindAll(logits);
         const cmd = try cmds.begin();
@@ -173,12 +162,7 @@ pub const Greedy = struct {
         return g.decodeResult(out);
     }
 
-    /// The batched draw: records the SAME reset/fill/finite/chunk/combine
-    /// sequence and the 12-byte result copy into the OPEN batch command
-    /// buffer — immutable banked descriptor snapshots, no submit, no host
-    /// read. Returns the batch staging offset holding the Result; the
-    /// caller reads it only after the batch's fence (commands.readDown) and
-    /// decodes it with decodeResult.
+    /// The batched draw: same sequence and the result copy into the OPEN batch; returns the Result staging offset.
     pub fn recordInto(g: *Greedy, cmds: *Commands, logits: View) Error!u64 {
         try g.bindAll(logits);
         const cmd = try cmds.begin();
