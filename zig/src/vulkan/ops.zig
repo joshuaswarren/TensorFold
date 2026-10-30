@@ -10,6 +10,7 @@ const Device = device.Device;
 const Commands = commands.Commands;
 const Buffer = memory.Buffer;
 const Error = dispatch.Error;
+const ops_q4 = @import("ops_q4.zig");
 
 /// The compiled shader images Ops runs; every field is a real SPIR-V image of the named variant.
 pub const Shaders = struct {
@@ -22,6 +23,9 @@ pub const Shaders = struct {
     cast_f32_bf16: []align(4) const u8,
     copy_u32: []align(4) const u8,
     copy_u16: []align(4) const u8,
+    /// The decode subgroup qmv image (the probe's SG master); null in builds that do not ship it,
+    /// which keeps every qmm dispatch on the old kernel.
+    qmm_q4_sg: ?[]align(4) const u8 = null,
 };
 
 const dummy_bytes: u64 = 256;
@@ -83,6 +87,11 @@ pub const Ops = struct {
     cast_f32_bf16: dispatch.Pipeline,
     copy_u32: dispatch.Pipeline,
     copy_u16: dispatch.Pipeline,
+    /// The decode matmul's subgroup qmv pipeline when engine init built it; null keeps every
+    /// qmm dispatch on the old kernel, byte-for-byte.
+    qmm_q4_sg: ?dispatch.Pipeline,
+    /// Fixed once at init; the model probe reports it at ready.
+    qmm_path: ops_q4.QmmPath,
     /// Read-only stand-in for declared bindings a kernel never touches (cast 1, copy 1 and 3).
     dummy: Buffer,
 
@@ -100,6 +109,8 @@ pub const Ops = struct {
             .cast_f32_bf16 = undefined,
             .copy_u32 = undefined,
             .copy_u16 = undefined,
+            .qmm_q4_sg = null,
+            .qmm_path = .old_device,
             .dummy = try Buffer.init(dev, .device, dummy_bytes),
         };
         errdefer o.dummy.deinit();
@@ -120,6 +131,19 @@ pub const Ops = struct {
         o.copy_u32 = try dispatch.Pipeline.init(dev, shaders.copy_u32, .{ .bindings = 4, .push_bytes = params.push_bytes, .writes = 1 << 2 });
         errdefer o.copy_u32.deinit();
         o.copy_u16 = try dispatch.Pipeline.init(dev, shaders.copy_u16, .{ .bindings = 4, .push_bytes = params.push_bytes, .writes = 1 << 2 });
+        errdefer o.copy_u16.deinit();
+        // The decode kernel decision, read once here: TF_VK_QMM=old pins today's kernel for a
+        // same-binary A/B; otherwise the device's subgroup admits the SG kernel or it does not.
+        const env = std.c.getenv("TF_VK_QMM");
+        if (env != null and std.mem.eql(u8, std.mem.span(env.?), "old")) {
+            o.qmm_path = .old_env;
+        } else if (!ops_q4.sgDeviceOk(dev.v11.subgroupSize, dev.v11.subgroupSupportedOperations)) {
+            o.qmm_path = .old_device;
+        } else if (shaders.qmm_q4_sg) |img| {
+            o.qmm_q4_sg = try dispatch.Pipeline.init(dev, img, .{ .bindings = 5, .push_bytes = params.push_bytes, .writes = 1 << 4 });
+            o.qmm_path = .sg;
+        }
+        errdefer if (o.qmm_q4_sg) |*sg| sg.deinit();
         return o;
     }
 
@@ -134,11 +158,20 @@ pub const Ops = struct {
         o.cast_f32_bf16.deinit();
         o.copy_u32.deinit();
         o.copy_u16.deinit();
+        if (o.qmm_q4_sg) |*sg| sg.deinit();
         o.dummy.deinit();
     }
 
     pub fn dummyBinding(o: *const Ops) dispatch.Binding {
         return .{ .buffer = &o.dummy, .len = dummy_bytes };
+    }
+
+    /// The decode matmul's SG pipeline when this dispatch may use it: init built the pipeline
+    /// (the env and device gate) and the pure shape gate passes; null keeps the old kernel.
+    pub fn qmmDecodeSg(o: *Ops, k: u64, n: u64) ?*dispatch.Pipeline {
+        if (o.qmm_q4_sg == null) return null;
+        if (!ops_q4.useSubgroupQmv(1, k, n, .{ .subgroup_size = o.dev.v11.subgroupSize, .subgroup_ops = o.dev.v11.subgroupSupportedOperations })) return null;
+        return &o.qmm_q4_sg.?;
     }
 
     /// bf16 -> f32 (RNE-free widening) or f32 -> bf16 (RNE with NaN quiet bit), one dispatch.
