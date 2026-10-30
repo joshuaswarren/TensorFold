@@ -1,8 +1,7 @@
-// Reused from mlx-omarchy shaders/argreduce_combine.comp (MIT), comments condensed; driven at operation = 1 (max), one row, output_offset = 2.
 
-// Copyright © 2026 Joshua Warren / mlx-omarchy contributors.
-// SPDX-License-Identifier: MIT
-// ArgMin/ArgMax phase 2 of 2: one workgroup per row combines chunk.comp's (value, index) pairs (at most 256) by the same rule: strictly better wins, ties keep the lower index, first NaN wins; lanes past the count hold (infinity, 0).
+// Copyright © 2026 Joshua Warren / mlx-omarchy contributors; SPDX-License-Identifier: MIT
+
+// Phase 2/2 combines <=256 chunk pairs; ties keep lower index, first NaN wins; excess lanes hold (infinity, 0).
 #version 460
 
 #define ACC_LOWEST uintBitsToFloat(0xff800000u)
