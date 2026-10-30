@@ -36,7 +36,7 @@ pub const Params = extern struct {
 comptime {
     if (@sizeOf(Params) != 120) @compileError("qmm.comp push constants must stay 120 bytes");
 }
-fn depth(s: c.Shape) usize {
+pub fn depth(s: c.Shape) usize {
     return s.k + 2;
 }
 // Qwen3.5-2B's projection shapes (K 2048/6144, N 16 to 248320, M 1 to 32) and the small fixture shapes.
@@ -57,7 +57,7 @@ pub const spec: c.Spec = .{
 };
 
 /// The shared gate harness expects a rig object; as in HIP, it exposes bytes while the fixture owns device buffers.
-const Rig = struct {
+pub const Rig = struct {
     output: []const u8 = &.{},
     inputs: []const u8 = &.{},
     guards_ok: bool = false,
