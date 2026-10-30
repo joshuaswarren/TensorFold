@@ -51,7 +51,7 @@ pub fn convInplaceFromEnv(v: ?[*:0]const u8) bool {
     return !std.mem.eql(u8, std.mem.span(s), "0");
 }
 
-/// The qkv projection can write the conv window tail only for a decode row and when the prefix keeps the binding aligned.
+/// The qkv projection writes the conv window tail only for a decode row and a binding-aligned prefix.
 pub fn convInplaceAllowed(switch_on: bool, rows: usize, prefix_bytes: u64, alignment: u64) bool {
     return switch_on and rows == 1 and alignment != 0 and prefix_bytes % alignment == 0;
 }
@@ -349,6 +349,6 @@ test "the in-place conv window needs a decode row and a binding-aligned prefix" 
     try testing.expect(convInplaceAllowed(true, 1, prefix, 64));
     try testing.expect(!convInplaceAllowed(false, 1, prefix, 256)); // the switch is off
     try testing.expect(!convInplaceAllowed(true, 2, prefix, 256)); // prefill chunks keep the copy
-    try testing.expect(!convInplaceAllowed(true, 1, prefix, 8192)); // 36864 is 4.5 x 8192: an alignment the prefix does not meet
+    try testing.expect(!convInplaceAllowed(true, 1, prefix, 8192)); // 36864 is 4.5 x 8192: not aligned
     try testing.expect(!convInplaceAllowed(true, 1, prefix, 0)); // a device that reports nothing refuses
 }
