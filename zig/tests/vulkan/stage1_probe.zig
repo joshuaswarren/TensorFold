@@ -457,10 +457,7 @@ fn projectGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds
     return true;
 }
 
-/// Production shapes on random Q4 data: project() (the qmm_q4_pk parallel-K kernel) and a
-/// direct serial qmm_bf16 dispatch over the SAME bindings, each checked against the fixture's
-/// independent f64 reference under the unchanged contract budget. One up-projection decode
-/// shape and one down-projection 32-row prefill shape.
+/// Compare parallel-K and serial projections against f64 on decode and 32-row prefill shapes.
 fn qmmPkGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, o: *vk.ops.Ops, scratch: *vk.arena.Arena, timeout: u64) !bool {
     const shapes = [_]fx.Case{
         .{ .name = "pk vs serial up decode m1 n6144 k2048", .shape = .{ .rows = 1, .n = 6144, .k = 2048 } },
@@ -521,11 +518,7 @@ fn qmmPkGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: 
     return true;
 }
 
-/// N coverage for the parallel-K kernel: one workgroup with idle tail lanes, an in-group
-/// output tail, M 1 and 32, K 2048 and 6144, a multi-workgroup N, and the head's 248320 —
-/// every fixture-checked case through project() so the real routing, chunking and scatter
-/// run. The head is streamed (packed from per-column code streams, no codes array) and its
-/// f64 reference lands on a spread sample of columns; every column is still computed.
+/// Coverage spans idle lanes, output tails, row/K bounds, multi-workgroup N, and streamed head sampling.
 fn qmmPkCoverageGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, probe_staging: vk.Buffer, o: *vk.ops.Ops, scratch: *vk.arena.Arena, timeout: u64) !bool {
     _ = probe_staging; // the head's 254 MB of weights through the probe's 64 KiB staging would
     // be thousands of fence-bounded chunks; this gate streams through its own 8 MiB buffer.

@@ -1,39 +1,4 @@
-//! The Qwen3.5-2B Vulkan model probe: a real CLI greedy run of the first
-//! native model core against the frozen unchanged-Ash Metal oracle. In the
-//! default free-running mode exactly the oracle's drawn tokens are fed from
-//! the probe's own selections; --teacher-forced instead feeds each scored
-//! step's oracle id as the next input — a labelled per-step mode, never a
-//! free-running chain proof.
-//!
-//! Inputs: MODEL_DIR (the pinned Qwen3.5-2B checkpoint), INPUT_IDS.npy (u32
-//! rank 1), ORACLE_DIR (the oracle's token_ids.json + result.json +
-//! logits_bf16.bin), OUTPUT_DIR (must be new). Flags: --vendor ID (optional
-//! generic Vulkan vendor guard; no Apple PCI id is assumed), --timeout-ms
-//! MS, --context N (the KV capacity request, 1 to the backend's 7168;
-//! default 256) and --teacher-forced. --help exits 0 before any loader or
-//! device opens; bad usage or bad inputs exit 2; a failed run exits 1; a
-//! fence timeout exits 124 (inside the engine's orExit).
-//!
-//! The whole prompt is prefilled: planFor validates its full length and the
-//! generated steps against the requested context before any GPU work, and
-//! Engine.prefill splits it into canonical 32-row chunks internally.
-//!
-//! PASS requires the exact oracle IDs (strict lowest-index ties, no epsilon,
-//! no known-ID special case) on two fresh-cache runs — a real reset between
-//! them, both in the selected mode — with byte-identical logits rows within
-//! Vulkan. In teacher-forced mode that is the per-step agreement under golden
-//! inputs, not a free-running chain claim; the receipt's execution_mode
-//! names the mode. The full BF16 logit
-//! rows are preserved to OUTPUT_DIR/logits_bf16.bin for the receipt (the GPU
-//! greedy is the selector, never a CPU argmax); the raw logits are also
-//! compared element-wise against the oracle's file as a diagnostic only —
-//! cross-backend byte identity is not required and not claimed.
-//!
-//! Shader images come from the build-generated "qwen35_shaders" module: the
-//! stage-variant decl names of every field of engine.ShaderBundle (9 stage-1
-//! op variants, 4 norm/MLP, 3 attention, 7 GDN, 3 greedy). The build wires
-//! the module and the executable; this file owns no lab paths, ids or
-//! checkpoint hashes.
+//! Qwen3.5 Vulkan CLI probe runs greedy decoding against the frozen Metal oracle.
 const std = @import("std");
 const q35v = @import("qwen35_vulkan");
 const engine_mod = q35v.engine;
@@ -230,10 +195,7 @@ fn readOracleMeta(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, oracle_dir:
     };
 }
 
-/// The exact production bundle: the build-generated qwen35_shaders SPIR-V
-/// image for every field of engine.ShaderBundle (9 stage-1 ops, 4 norm/MLP,
-/// 3 attention, 7 GDN, 3 greedy), shared by the probe run and the opt-in
-/// load test so both exercise the shader set the server serves with.
+/// Production probe and load test share the generated shader bundle.
 fn bundle() engine_mod.ShaderBundle {
     return .{
         .ops = .{
