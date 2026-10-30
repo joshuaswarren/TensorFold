@@ -687,7 +687,12 @@ pub fn serverModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
 }
 
 /// Every image the bundle embeds: the real stage arrays, concatenated; names are what the adapter's bundle() reads.
-const server_shader_images = shader_variants ++ stage2_variants ++ stage3_variants ++ stage4_variants[0 .. stage4_variants.len - 1] ++ stage5_variants;
+/// The decode SG qmv (unit 12) appended last so the bundle before it stays byte-identical; one module added at the end.
+const sg_decode_variants = [_]ShaderVariant{
+    .{ .name = "qmm_q4_sg", .src = "zig/kernels/vulkan/qmm_q4_sg.comp", .defines = &.{} },
+};
+
+const server_shader_images = shader_variants ++ stage2_variants ++ stage3_variants ++ stage4_variants[0 .. stage4_variants.len - 1] ++ stage5_variants ++ sg_decode_variants;
 
 /// The house core module the family loader's config/shard imports resolve through, built exactly as cuda.zig builds it.
 fn coreModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) *std.Build.Module {
