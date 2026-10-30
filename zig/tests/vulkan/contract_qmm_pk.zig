@@ -610,10 +610,7 @@ test "the fixture keeps the qmm storage discipline: raw u16 poison, guards align
 }
 
 test "the shipped pk kernel keeps its per-element TwoSum, class fix and six tree levels" {
-    // A source-level pin: a later edit of qmm_q4_pk.comp must not silently drop the
-    // compensated per-element sum, the non-finite class fix at the high+low combine,
-    // the six tree levels (strides 32, 16, 8, 4, 2, 1), the ascending 8-element pack
-    // order or the one-64-lane-workgroup-per-output shape.
+    // Pin the source so edits retain the compensated sum, class fix, six-level tree, pack order and 64-lane geometry.
     const src = pk_src.qmm_q4_pk;
     try testing.expect(std.mem.indexOf(u8, src, "comp += (partial - t) + term;") != null);
     try testing.expect(std.mem.indexOf(u8, src, "comp += (term - t) + partial;") != null);
@@ -621,9 +618,7 @@ test "the shipped pk kernel keeps its per-element TwoSum, class fix and six tree
     try testing.expect(std.mem.indexOf(u8, src, "stride = 32u; stride >= 1u; stride >>= 1u") != null);
     try testing.expect(std.mem.indexOf(u8, src, "for (uint e = 0u; e < 8u; ++e)") != null);
     try testing.expect(std.mem.indexOf(u8, src, "layout(local_size_x = 64) in;") != null);
-    // The accumulators are precise: on the device compiler the pipelined body with plain accumulators
-    // differed from the old kernel on real activations (1 of 6144 outputs, one bf16 ulp, on all three chips);
-    // precise accumulators match it. A later edit must not drop the qualifier.
+    // Precise accumulators prevent one-ulp differences found in 1/6144 outputs on all three Apple chips.
     try testing.expect(std.mem.indexOf(u8, src, "precise float partial = 0.0;") != null);
     try testing.expect(std.mem.indexOf(u8, src, "precise float comp = 0.0;") != null);
 }

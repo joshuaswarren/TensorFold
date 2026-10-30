@@ -1,23 +1,6 @@
 #version 460
 
-// The qmm_q4_pk kernel with one planted fault per variant, for the Vulkan kernel contract's
-// controls: each control is this copy compiled with one define, and the shipped qmm_q4_pk.comp
-// stays untouched. The copy follows the kernel's software-pipelined loads (the next pack's
-// word, scale, bias and widened x elements issue one pack ahead) with the same arithmetic,
-// order, tree and store. Every variant reads the same bindings and push constants and evaluates
-// the same per-element expression as the kernel it copies; the fault is only the one the define
-// names, and the runner pushes the same flags (2: strided lanes, compensated sums) so each
-// fault lands on the path the real kernel takes.
-//
-//   TF_CTL_PK_DROP_TAIL   the last lane never walks the row's final pack: a tail the sums miss
-//   TF_CTL_PK_FP16        the lane sums accumulate in fp16
-//   TF_CTL_PK_SKIP_LEVEL  the lane tree starts one level down, so the upper half never folds in
-//   TF_CTL_PK_WRITE_W     lane 0 writes a fixed word just past the weights data after the walk
-//   TF_CTL_PK_WRITE_B     lane 0 writes a fixed element just past the biases data after the walk
-//
-// The two writes land past the data, where no workgroup reads, so the outputs stay correct and
-// only the gate 2 read-back of the inputs can see them; the fixture's buffers carry guard tails
-// past the data, as the qmm_bf16 fixture's do for its own input-write controls.
+// Five planted controls mirror the pipelined Q4 kernel; guard-tail writes alter inputs only.
 
 // Copyright © 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
 
@@ -119,7 +102,7 @@ void main() {
     uint last = contiguous ? first + chunk : packs;
     precise float partial = 0.0;
     precise float comp = 0.0;
-    // the pipeline's current pack, loaded before the loop (lanes with no packs stay at zeros)
+    // Load the current pack before the loop; idle lanes keep zero values.
     uint pack = first;
     float scale = 0.0;
     float bias = 0.0;
@@ -141,7 +124,7 @@ void main() {
       }
     }
     while (pack < last) {
-      // issue the next pack's loads now; this pack's arithmetic overlaps them
+      // Load the next pack while the current pack's arithmetic runs.
       uint next = pack + step;
       bool has_next = next < last;
       float n_scale = scale;
@@ -159,10 +142,10 @@ void main() {
           n_q[e] = float((n_word >> (e * 4u)) & 0xFu);
         }
       }
-      // the frozen per-element arithmetic, unchanged in value and order
+      // Keep the frozen per-element arithmetic and order.
       for (uint e = 0u; e < 8u; ++e) {
 #ifdef TF_CTL_PK_DROP_TAIL
-        // the fault: the last lane skips its row's final pack's arithmetic
+        // The tail fault skips the last lane's final pack.
         if (lane == 63u && pack + 1u == packs) break;
 #endif
         precise float term = bf16_load(xb[e]) *
