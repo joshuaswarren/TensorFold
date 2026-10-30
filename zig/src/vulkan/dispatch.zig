@@ -10,10 +10,7 @@ const check = runtime.check;
 
 pub const Error = runtime.Error || error{ BadSpirv, NoLocalSize, TooManyBindings, BadPushSize, BadWorkgroup, BadGroupCount, BadBindings, Aliased, BatchOverflow };
 
-/// Barrier elision: a dispatch's post-barrier is deferred and emitted only
-/// before a later dispatch (or command) that actually hazards against it.
-/// TF_VK_NOBAR=0 restores today's barrier after every dispatch for a
-/// same-binary A/B; any other value or unset elides.
+/// Barrier elision: a dispatch's post-barrier is deferred until something hazards; TF_VK_NOBAR=0 restores it.
 pub var elide_barriers: bool = true;
 
 pub fn elideFromEnv(v: ?[*:0]const u8) bool {
@@ -21,8 +18,7 @@ pub fn elideFromEnv(v: ?[*:0]const u8) bool {
     return !std.mem.eql(u8, std.mem.span(s), "0");
 }
 
-/// One buffer range a dispatch reads or writes: same underlying buffer and
-/// intersecting [offset, offset+len) is a hazard.
+/// One buffer range a dispatch reads or writes: same buffer and intersecting range is a hazard.
 pub const HazardRange = struct { buf: c.VkBuffer, offset: u64, len: u64 };
 
 pub const hazard_range_cap = 32;
@@ -31,10 +27,7 @@ fn rangesOverlap(a: HazardRange, b: HazardRange) bool {
     return a.buf == b.buf and a.offset < b.offset + b.len and b.offset < a.offset + a.len;
 }
 
-/// Would recording a dispatch with these ranges against the not-yet-
-/// barriered earlier work need the full barrier? RAW: the next reads what
-/// an earlier unsynchronised dispatch wrote. WAW: it writes it. WAR: it
-/// writes what an earlier one read. Pure and host-tested.
+/// Would this dispatch against unsynchronised work need the barrier? RAW, WAW or WAR do. Pure and host-tested.
 pub fn hazardNeeded(pending_writes: []const HazardRange, pending_reads: []const HazardRange, next_writes: []const HazardRange, next_reads: []const HazardRange) bool {
     for (pending_writes) |w| {
         for (next_reads) |r| if (rangesOverlap(w, r)) return true;
@@ -46,10 +39,7 @@ pub fn hazardNeeded(pending_writes: []const HazardRange, pending_reads: []const 
     return false;
 }
 
-/// The unsynchronised writes and reads accumulated since the last emitted
-/// barrier. Bounded: past the cap the set saturates and every hazard check
-/// orders, so elision degrades to today's behaviour instead of dropping a
-/// range.
+/// Unsynchronised writes and reads since the last barrier; past the cap it saturates and every check orders.
 pub const Hazard = struct {
     writes: [hazard_range_cap]HazardRange = undefined,
     reads: [hazard_range_cap]HazardRange = undefined,
@@ -94,13 +84,10 @@ pub const Hazard = struct {
     }
 };
 
-/// The one command buffer's pending barrier state; the engine is single-
-/// threaded and one command buffer is recorded at a time (the batch_open
-/// style).
+/// The one command buffer's pending barrier state; the engine is single-threaded, one buffer at a time.
 pub var hazard_pending: Hazard = .{};
 
-/// The barrier a deferred dispatch owes, emitted verbatim before the
-/// hazarding dispatch or command; then the set restarts.
+/// The barrier a deferred dispatch owes, emitted verbatim before the hazarding dispatch or command.
 pub fn flushHazard(dev: *const Device, cmd: c.VkCommandBuffer) void {
     if (hazard_pending.n_writes == 0 and hazard_pending.n_reads == 0 and !hazard_pending.saturated) return;
     const b: c.VkMemoryBarrier = .{
@@ -163,8 +150,7 @@ pub const Pipeline = struct {
     batch_epoch_seen: u32 = 0,
     stash: [max_bindings]Binding = undefined,
     stash_n: u32 = 0,
-    /// The bindings of the pending dispatch, kept for the barrier-elision
-    /// hazard check in record (both schedules: bind is the single door).
+    /// The pending dispatch's bindings, kept for the hazard check in record (bind is the single door).
     last_bindings: [max_bindings]Binding = undefined,
     last_n: u32 = 0,
 
@@ -377,11 +363,7 @@ pub const Pipeline = struct {
             }, 0, null, 0, null);
             return;
         }
-        // Elision: the deferred barrier of the earlier unsynchronised
-        // dispatches is owed before this one only when they actually hazard
-        // (RAW, WAW or WAR over the same underlying buffer ranges);
-        // otherwise this dispatch joins the unsynchronised set and the
-        // batch/submission end flushes what is left.
+        // The earlier unsynchronised dispatches' deferred barrier is owed here only on a real hazard.
         const bindings = p.last_bindings[0..p.last_n];
         var next_w: [max_bindings]HazardRange = undefined;
         var next_r: [max_bindings]HazardRange = undefined;
