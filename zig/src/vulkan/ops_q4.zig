@@ -32,17 +32,12 @@ pub fn chunkRows(l: Limits, k: u64, n: u64) Error!u64 {
     return (l.max_range / group_bytes) * step;
 }
 
-/// qmm_q4_pk arithmetic, read from the push flags: 0 = plain f32 partials (the frozen v0 candidate),
-/// bit 0 = contiguous lane ranges, bit 1 = Neumaier-compensated sums with a TwoSum tree. The CANDIDATE
-/// build is fixed at 2 (strided lanes, compensated); nothing selects it at run time.
+/// qmm_q4_pk flags define plain, contiguous, or compensated arithmetic; production fixes strided compensated mode.
 pub var pk_variant: u32 = 2;
 
 const Geometry = struct { m: u64, n: u64 };
 
-/// Workgroups for one qmm_q4_pk dispatch: one 64-lane workgroup per output, capped at the
-/// device's maxComputeWorkGroupCount[0] (the kernel grid-strides the rest, so the cap never
-/// drops work). Zero outputs cannot happen past the geometry checks but is refused, not
-/// dispatched as zero groups. Pure and host-tested.
+/// One 64-lane workgroup per output; cap the dispatch and grid-stride the rest; refuse zero groups.
 pub fn pkGroups(outputs: u64, max_groups: u32) Error!u32 {
     if (outputs == 0) return error.Invalid;
     const groups = std.math.cast(u32, outputs) orelse return error.TooLarge;
@@ -79,11 +74,7 @@ fn q4Push(m: u64, n: u64, k: u64) Error!params.Params {
     };
 }
 
-/// Q4 affine projection out[m, n] = x[m, k] . dequant(w, scales, biases)[n, k], group 64, transposed.
-/// One qmm_q4_pk dispatch (one 64-lane workgroup per output, parallel over K) when the w view fits
-/// maxStorageBufferRange; otherwise n-row chunks write packed blocks to `scratch` and a copy_general
-/// scatter places each block's columns. Every range and shape is validated before the first dispatch;
-/// x and out must each fit one binding.
+/// Q4 affine group-64 projection uses one parallel-K dispatch or validated chunk-and-scatter above binding limits.
 pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: View, biases: View, k: u64, scratch: *Arena, timeout_ns: u64) Error!void {
     const g = try projectGeometry(out, x, w, scales, biases, k);
     const limits = o.dev.properties.limits;

@@ -71,11 +71,9 @@ pub fn main(init: std.process.Init) !u8 {
     defer writes_b.deinit();
     writes_b.corrupt = 3;
 
-    // The one-row parallel-K kernel: its own pipeline (64 lanes a workgroup) and five planted
-    // controls compiled from contract_controls_pk.comp, a copy of the kernel with one fault each.
-    // The two input-write controls declare their writable input binding, so the checked disjoint
-    // binding rule sees what the fault writes.
-    var pk_pipeline = try vk.dispatch.Pipeline.init(&dev, &shaders.qmm_q4_pk, layout); defer pk_pipeline.deinit();
+    // Register the kernel and five planted controls, with writable masks for input-write faults.
+    var pk_pipeline = try vk.dispatch.Pipeline.init(&dev, &shaders.qmm_q4_pk, layout);
+    defer pk_pipeline.deinit();
     if (!std.mem.eql(u32, &pk_pipeline.local, &.{ fxpk.local_size_x, 1, 1 })) {
         std.debug.print("FAIL qmm_q4_pk: the pipeline's local size is {any}, the fixture states {d}\n", .{ pk_pipeline.local, fxpk.local_size_x });
         return 1;
@@ -83,12 +81,18 @@ pub fn main(init: std.process.Init) !u8 {
     const pk_control_layout: vk.dispatch.Layout = .{ .bindings = 5, .push_bytes = @sizeOf(fx.Params), .writes = 1 << 4 };
     const pk_writes_w_layout: vk.dispatch.Layout = .{ .bindings = 5, .push_bytes = @sizeOf(fx.Params), .writes = (1 << 4) | (1 << 1) };
     const pk_writes_b_layout: vk.dispatch.Layout = .{ .bindings = 5, .push_bytes = @sizeOf(fx.Params), .writes = (1 << 4) | (1 << 3) };
-    var p_pk_tail = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_drop_tail, pk_control_layout); defer p_pk_tail.deinit();
-    var p_pk_fp16 = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_fp16_accum, pk_control_layout); defer p_pk_fp16.deinit();
-    var p_pk_skip = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_skip_level, pk_control_layout); defer p_pk_skip.deinit();
-    var p_pk_write_w = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_write_weights, pk_writes_w_layout); defer p_pk_write_w.deinit();
-    var p_pk_write_b = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_write_biases, pk_writes_b_layout); defer p_pk_write_b.deinit();
-    var pk_fixture = fxpk.Fixture.init(init.gpa, &dev, &cmds, staging, &pk_pipeline); defer pk_fixture.deinit();
+    var p_pk_tail = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_drop_tail, pk_control_layout);
+    defer p_pk_tail.deinit();
+    var p_pk_fp16 = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_fp16_accum, pk_control_layout);
+    defer p_pk_fp16.deinit();
+    var p_pk_skip = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_skip_level, pk_control_layout);
+    defer p_pk_skip.deinit();
+    var p_pk_write_w = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_write_weights, pk_writes_w_layout);
+    defer p_pk_write_w.deinit();
+    var p_pk_write_b = try vk.dispatch.Pipeline.init(&dev, &shaders.pk_write_biases, pk_writes_b_layout);
+    defer p_pk_write_b.deinit();
+    var pk_fixture = fxpk.Fixture.init(init.gpa, &dev, &cmds, staging, &pk_pipeline);
+    defer pk_fixture.deinit();
     var pk_controls = [_]fxpk.Fixture{
         fxpk.Fixture.initControl(init.gpa, &dev, &cmds, staging, &p_pk_tail, .drop_tail),
         fxpk.Fixture.initControl(init.gpa, &dev, &cmds, staging, &p_pk_fp16, .fp16_accum),
