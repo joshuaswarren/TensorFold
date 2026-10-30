@@ -165,17 +165,12 @@ pub const Core = struct {
     pub fn mlp(c: *const Core, x: View, rows: usize, m: weights.DenseMlp, r_out: View) !void {
         const mark = c.scratch.mark();
         errdefer c.scratch.reset(mark) catch {};
-        // The decode row: gate and up read one x and become one dispatch;
-        // swiglu reads the two members as views of the shared output block.
-        // Candidate C, when switched on and the device admits the epilogue:
-        // the merged projection and the swiglu are one dispatch that writes
-        // only the activations.
+        // Decode row: gate and up are one dispatch; with the epilogue on, projection and swiglu are one dispatch.
         var gate: View = undefined;
         var up: View = undefined;
         var act: View = undefined;
         var one_dispatch = false;
-        // the hoisted decision keeps every path defined: a null group (FUSE=0)
-        // takes the separate branch, never an undefined view
+        // the hoisted decision keeps every path defined: a null group (FUSE=0) takes the separate branch
         const gate_up_group = if (rows == 1) m.gate_up else null;
         if (gate_up_group) |g| {
             if (c.acc.ops.fuse_swiglu and c.acc.ops.qmm_q4_sg_swiglu != null) {
@@ -183,7 +178,7 @@ pub const Core = struct {
                 if (vk.ops_q4.projectSwiglu(c.acc.ops, c.cmds, act, x, g.fused.w, g.fused.scales, g.fused.biases, g.fused.k, c.timeout_ns)) {
                     one_dispatch = true;
                 } else |err| switch (err) {
-                    error.Invalid, error.TooLarge => {}, // fall back to B's two dispatches
+                    error.Invalid, error.TooLarge => {}, // fall back to the merged gate|up dispatch plus the separate swiglu
                     else => return err,
                 }
             }
