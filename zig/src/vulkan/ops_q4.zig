@@ -38,23 +38,18 @@ pub var pk_variant: u32 = 2;
 /// The device subgroup facts the decode kernel choice reads (the 1.1 properties' two fields).
 pub const SubgroupCaps = struct { subgroup_size: u32, subgroup_ops: u32 };
 
-/// The same device gate the unit 11 probe's sgSubgroupOk applies: the subgroup kernel assumes a
-/// 32-lane subgroup and needs the arithmetic subgroup operations. Pure and host-tested.
+/// The device gate the subgroup qmv needs: a 32-lane subgroup with arithmetic ops. Pure and host-tested.
 pub fn sgDeviceOk(subgroup_size: u32, supported_ops: u32) bool {
     const arithmetic: u32 = 1 << 2; // VK_SUBGROUP_FEATURE_ARITHMETIC_BIT
     return subgroup_size == 32 and (supported_ops & arithmetic) != 0;
 }
 
-/// The decode matmul takes the omarchy-mlx subgroup qmv (the probe's SG master) exactly when it is
-/// one row and the shape fits the kernel's lane step (k in whole 512-element steps) and column
-/// width (n in whole 8-column slots), on a device whose subgroup sgDeviceOk admits. Pure and host-tested.
+/// The decode matmul takes the subgroup qmv when one row fits the lane step and column width on an admitted device.
 pub fn useSubgroupQmv(rows: u64, k: u64, n: u64, caps: SubgroupCaps) bool {
     return rows == 1 and k % 512 == 0 and n % 8 == 0 and sgDeviceOk(caps.subgroup_size, caps.subgroup_ops);
 }
 
-/// The decode dispatch's whole SG decision minus the pipeline lookup: the batch is one row, the
-/// shape fits the kernel's contract, the device subgroup admits it, and the engine built the
-/// pipeline. The kernel computes x row 0 only, so any m past 1 keeps the old kernel. Pure and host-tested.
+/// The SG decision minus the pipeline lookup: one row, shape fits, device admits, pipeline built; m past 1 keeps old.
 pub fn qmmDecodeSgAdmits(m: u64, k: u64, n: u64, caps: SubgroupCaps, have_pipeline: bool) bool {
     return have_pipeline and useSubgroupQmv(m, k, n, caps);
 }
@@ -109,8 +104,7 @@ pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: Vi
     if (x.byteLen() > lim.max_range or out.byteLen() > lim.max_range) return error.TooLarge;
     const rows = try chunkRows(lim, k, g.n);
     if (rows == 0) {
-        // Decode's single-row dispatch takes the probe's SG master kernel when the engine built
-        // it and the shape fits its contract; the old kernel otherwise, byte-for-byte as before.
+        // The single-row dispatch takes the SG master when built and the shape fits; the old kernel otherwise.
         if (o.qmmDecodeSg(g.m, k, g.n)) |sg| {
             try sg.bind(&.{ x.bind(), w.bind(), scales.bind(), biases.bind(), out.bind() });
             var p = try q4Push(g.m, g.n, k);
@@ -303,8 +297,7 @@ test "useSubgroupQmv admits exactly the decode shapes the SG kernel serves on a 
 
 test "qmmDecodeSgAdmits refuses every multi-row batch even with the pipeline built" {
     const ok: SubgroupCaps = .{ .subgroup_size = 32, .subgroup_ops = 1 << 2 }; // VK_SUBGROUP_FEATURE_ARITHMETIC_BIT
-    // batched prefill reaches project's single-binding branch with several rows; the kernel
-    // computes row 0 only, so any m past 1 must keep the old kernel
+    // Batched prefill hits the single-binding branch with several rows; the kernel computes row 0 only.
     try testing.expect(!qmmDecodeSgAdmits(2, 2048, 2048, ok, true));
     try testing.expect(!qmmDecodeSgAdmits(16, 6144, 2048, ok, true));
     try testing.expect(!qmmDecodeSgAdmits(319, 2048, 2048, ok, true));
