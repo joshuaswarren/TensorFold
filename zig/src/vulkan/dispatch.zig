@@ -12,19 +12,12 @@ pub const Error = runtime.Error || error{ BadSpirv, NoLocalSize, TooManyBindings
 
 pub const max_bindings = 10;
 
-/// The bounded per-pipeline bank of immutable descriptor snapshots for
-/// batched recording. 512 covers the worst token (489 dispatch records; no
-/// single pipeline exceeds that within one token). A snapshot set, once
-/// recorded, is never rewritten until the batch epoch advances, which
-/// happens only after the previous batch's fence has been waited — so the
-/// GPU never observes a set whose contents change under it.
+/// Bounded per-pipeline bank of immutable descriptor snapshots; never rewritten until the epoch advances.
 pub const batch_cap: u32 = 512;
 
-/// Batch session state shared by every pipeline; driven by commands.zig's
-/// beginBatch (batchBegin) and after the fence (batchEnd).
+/// Batch session state shared by every pipeline; driven by beginBatch (batchBegin) and after the fence (batchEnd).
 pub var batch_open: bool = false;
-/// Advances at every batch open; a pipeline whose seen epoch differs resets
-/// its bank cursor, reusing snapshots only after the previous fence.
+/// Advances at every batch open; a pipeline whose seen epoch differs resets its bank cursor.
 pub var batch_epoch: u32 = 0;
 
 pub fn batchBegin() void {
@@ -36,11 +29,7 @@ pub fn batchEnd() void {
     batch_open = false;
 }
 
-/// The next bank cursor for a pipeline whose snapshots were last reset at
-/// epoch `seen`: a new epoch resets to 0 (legal only because beginBatch runs
-/// after the previous batch's fence), and the bounded bank refuses past
-/// batch_cap instead of silently reusing a set the GPU is still reading.
-/// Pure and host-tested.
+/// Next bank cursor for a pipeline last reset at `seen`: a new epoch resets to 0; the bank refuses past batch_cap.
 pub fn nextBatchCursor(seen: u32, cursor: u32) Error!u32 {
     const next = if (seen != batch_epoch) 0 else cursor;
     if (next >= batch_cap) return error.BatchOverflow;
@@ -64,9 +53,7 @@ pub const Pipeline = struct {
     pool: c.VkDescriptorPool = null,
     set: c.VkDescriptorSet = null,
     bound: bool = false,
-    // Batched-recording bank: lazily created pool, allocated sets, the write
-    // cursor and the epoch it was last reset at. Bindings staged by bind()
-    // while a batch is open are snapshotted into the bank at record time.
+    // Batched-recording bank: lazy pool, sets, write cursor, epoch; staged bindings are snapshotted at record time.
     batch_pool: c.VkDescriptorPool = null,
     batch_sets: [batch_cap]c.VkDescriptorSet = undefined,
     batch_n: u32 = 0,
@@ -174,9 +161,7 @@ pub const Pipeline = struct {
     }
 
     /// Updates checked device-local bindings; call only when no submission using this descriptor set is pending.
-    /// While a batch is open the bindings are staged instead and snapshotted
-    /// into that dispatch's own banked set at record time — a batched token
-    /// never rewrites a set the GPU has been commanded to read.
+    /// While a batch is open the bindings are staged and snapshotted into the dispatch banked set at record time.
     pub fn bind(p: *Pipeline, bindings: []const Binding) Error!void {
         if (bindings.len != p.layout.bindings) return error.BadBindings;
         var infos: [max_bindings]c.VkDescriptorBufferInfo = undefined;
@@ -207,10 +192,7 @@ pub const Pipeline = struct {
         p.bound = true;
     }
 
-    /// The descriptor set this dispatch binds: the pipeline's live set on the
-    /// immediate schedule, or a fresh immutable bank snapshot per batched
-    /// dispatch (the staged bindings' vkUpdateDescriptorSets, counted by the
-    /// profiler, happens here).
+    /// The set this dispatch binds: the pipeline live set immediately, or a fresh bank snapshot per batched dispatch.
     fn snapshotSet(p: *Pipeline) Error!c.VkDescriptorSet {
         if (p.stash_n == 0) return p.set; // immediate schedule: bind already updated p.set
         const cursor = try nextBatchCursor(p.batch_epoch_seen, p.batch_cursor);
@@ -221,8 +203,7 @@ pub const Pipeline = struct {
         const api = &p.dev.api;
         const h = p.dev.handle;
         if (p.batch_pool == null) {
-            // First batched use of this pipeline: the persistent bounded
-            // bank. First-use cost only; later tokens reuse the sets.
+            // First batched use: the persistent bounded bank; first-use cost only, later tokens reuse the sets.
             const size: c.VkDescriptorPoolSize = .{ .type = c.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = batch_cap * p.layout.bindings };
             const pool_info: c.VkDescriptorPoolCreateInfo = .{
                 .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -283,8 +264,7 @@ pub const Pipeline = struct {
     }
 
     /// One dispatch in its own submission; wrap it in commands.orExit, which ends the process on error.Timeout.
-    /// Inside an open batch the begin/submit pair is the session's no-op and
-    /// the dispatch only records into the packed command buffer.
+    /// Inside an open batch begin/submit are the session no-op and the dispatch only records into the buffer.
     pub fn run(p: *Pipeline, cmds: *commands.Commands, push: []const u8, groups: [3]u32, timeout_ns: u64) Error!void {
         try p.record(try cmds.begin(), push, groups);
         try cmds.submit(timeout_ns);
