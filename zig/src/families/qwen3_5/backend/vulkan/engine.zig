@@ -137,7 +137,6 @@ pub const Engine = struct {
         context: usize,
         timeout_ns: u64,
     ) !*Engine {
-        const cap = try state.capacityFor(context);
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
         e.gpa = gpa;
@@ -152,6 +151,30 @@ pub const Engine = struct {
         errdefer gpa.destroy(e.dev);
         e.dev.* = try vk.Device.open(e.rt, .{ .features = .{ .storage16 = true, .int16 = true } });
         errdefer e.dev.close();
+        return initOnDevice(gpa, io, bundle, model_dir, context, timeout_ns, e.dev, e.rt, e);
+    }
+
+    /// Everything after device creation; the dry-run harness calls this with
+    /// a mock device and never touches the loader. The product path is init.
+    pub fn initOnDevice(
+        gpa: Allocator,
+        io: std.Io,
+        bundle: ShaderBundle,
+        model_dir: []const u8,
+        context: usize,
+        timeout_ns: u64,
+        dev: *vk.Device,
+        rt: *vk.Runtime,
+        reuse: ?*Engine,
+    ) !*Engine {
+        const cap = try state.capacityFor(context);
+        const e = reuse orelse try gpa.create(Engine);
+        errdefer gpa.destroy(e);
+        e.gpa = gpa;
+        e.timeout_ns = timeout_ns;
+        e.poisoned = false;
+        e.rt = rt;
+        e.dev = dev;
         e.cmds = try gpa.create(vk.Commands);
         errdefer gpa.destroy(e.cmds);
         e.cmds.* = try vk.Commands.init(e.dev);
