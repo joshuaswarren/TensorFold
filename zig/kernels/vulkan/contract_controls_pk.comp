@@ -1,6 +1,22 @@
 #version 460
 
-// Five planted controls mirror the pipelined Q4 kernel; guard-tail writes alter inputs only.
+// The qmm_q4_pk kernel with one planted fault per variant, for the Vulkan kernel contract's
+// controls: each control is this copy compiled with one define, and the shipped qmm_q4_pk.comp
+// stays untouched. The copy follows the kernel's pack-level compensation (8 plain adds per
+// packed word, one Neumaier fold per pack) with the same order, tree and store. Every variant reads the same bindings and push constants and evaluates
+// the same per-element expression as the kernel it copies; the fault is only the one the define
+// names, and the runner pushes the same flags (2: strided lanes, compensated sums) so each
+// fault lands on the path the real kernel takes.
+//
+//   TF_CTL_PK_DROP_TAIL   the last lane never walks the row's final pack: a tail the sums miss
+//   TF_CTL_PK_FP16        the lane sums accumulate in fp16
+//   TF_CTL_PK_SKIP_LEVEL  the lane tree starts one level down, so the upper half never folds in
+//   TF_CTL_PK_WRITE_W     lane 0 writes a fixed word just past the weights data after the walk
+//   TF_CTL_PK_WRITE_B     lane 0 writes a fixed element just past the biases data after the walk
+//
+// The two writes land past the data, where no workgroup reads, so the outputs stay correct and
+// only the gate 2 read-back of the inputs can see them; the fixture's buffers carry guard tails
+// past the data, as the qmm_bf16 fixture's do for its own input-write controls.
 
 // Copyright © 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
 
@@ -102,79 +118,38 @@ void main() {
     uint last = contiguous ? first + chunk : packs;
     precise float partial = 0.0;
     precise float comp = 0.0;
-    // Load the current pack before the loop; idle lanes keep zero values.
-    uint pack = first;
-    float scale = 0.0;
-    float bias = 0.0;
-    uint word = 0u;
-    uint16_t xb[8];
-    float q[8];
-    for (uint e = 0u; e < 8u; ++e) {
-      xb[e] = uint16_t(0u);
-      q[e] = 0.0;
-    }
-    if (pack < last) {
-      scale = bf16_load(scales.values[column * groups_per_row + pack / 8u]);
-      bias = bf16_load(biases.values[column * groups_per_row + pack / 8u]);
-      word = input_w.values[w_base + pack];
-      uint k_base = pack * 8u;
-      for (uint e = 0u; e < 8u; ++e) {
-        xb[e] = input_x.values[x_base + k_base + e];
-        q[e] = float((word >> (e * 4u)) & 0xFu); // exact, so hoisting changes no value
-      }
-    }
-    while (pack < last) {
-      // Load the next pack while the current pack's arithmetic runs.
-      uint next = pack + step;
-      bool has_next = next < last;
-      float n_scale = scale;
-      float n_bias = bias;
-      uint n_word = word;
-      uint16_t n_xb[8];
-      float n_q[8];
-      if (has_next) {
-        n_scale = bf16_load(scales.values[column * groups_per_row + next / 8u]);
-        n_bias = bf16_load(biases.values[column * groups_per_row + next / 8u]);
-        n_word = input_w.values[w_base + next];
-        uint n_k_base = next * 8u;
-        for (uint e = 0u; e < 8u; ++e) {
-          n_xb[e] = input_x.values[x_base + n_k_base + e];
-          n_q[e] = float((n_word >> (e * 4u)) & 0xFu);
-        }
-      }
-      // Same per-element arithmetic and order as the split-K kernel.
-      for (uint e = 0u; e < 8u; ++e) {
+    for (uint pack = first; pack < last; pack += step) {
 #ifdef TF_CTL_PK_DROP_TAIL
-        // The tail fault skips the last lane's final pack.
-        if (lane == 63u && pack + 1u == packs) break;
+      // the fault: the last lane skips its row's final pack
+      if (lane == 63u && pack + 1u == packs) break;
 #endif
-        precise float term = bf16_load(xb[e]) *
-            (scale * q[e] + bias);
-#ifdef TF_CTL_PK_FP16
-        // the fault: the running sum keeps fp16 precision
-        partial = float(float16_t(partial) + float16_t(term));
-#else
-        if (compensated) {
-          precise float t = partial + term;
-          if (abs(partial) >= abs(term)) {
-            comp += (partial - t) + term;
-          } else {
-            comp += (term - t) + partial;
-          }
-          partial = t;
-        } else {
-          partial += term;
-        }
-#endif
-      }
-      pack = next;
-      scale = n_scale;
-      bias = n_bias;
-      word = n_word;
+      float scale = bf16_load(scales.values[column * groups_per_row + pack / 8u]);
+      float bias = bf16_load(biases.values[column * groups_per_row + pack / 8u]);
+      uint word = input_w.values[w_base + pack];
+      uint k_base = pack * 8u;
+      precise float psum = 0.0;
       for (uint e = 0u; e < 8u; ++e) {
-        xb[e] = n_xb[e];
-        q[e] = n_q[e];
+        float q = float((word >> (e * 4u)) & 0xFu);
+#ifdef TF_CTL_PK_FP16
+        // the fault: the in-pack sum keeps fp16 precision
+        psum = float(float16_t(psum) + float16_t(bf16_load(input_x.values[x_base + k_base + e]) * (scale * q + bias)));
+#else
+        psum += bf16_load(input_x.values[x_base + k_base + e]) *
+            (scale * q + bias);
+#endif
       }
+#ifdef TF_CTL_PK_FP16
+      // the fault: the lane sum keeps fp16 precision, no compensation
+      partial = float(float16_t(partial) + float16_t(psum));
+#else
+      precise float t = partial + psum;
+      if (abs(partial) >= abs(psum)) {
+        comp += (partial - t) + psum;
+      } else {
+        comp += (psum - t) + partial;
+      }
+      partial = t;
+#endif
     }
     tree[lane] = partial;
     tree_lo[lane] = comp;
