@@ -129,15 +129,34 @@ pub const Core = struct {
         var a: View = undefined;
         var b: View = undefined;
         const qkvzab_group = if (rows == 1) layer.qkvzab else null;
+        // Decode row: the qkv projection writes the conv window tail (3 state rows in front), so the window copy is skipped.
+        const window_prefix: u64 = state.conv_rows * pinned.conv_dim;
+        const limits = c.acc.ops.dev.properties.limits;
+        const in_place = vk.fuse.convInplaceAllowed(c.acc.ops.conv_inplace, rows, window_prefix * 2, limits.minStorageBufferOffsetAlignment) and
+            (if (qkvzab_group) |g| g.starts[0] == 0 else true);
+        var window: ?View = null;
         if (qkvzab_group) |g| {
-            const block = try c.scratch.alloc(.bf16, g.fused.n);
-            try c.project(block, x, g.fused);
-            qkv = try block.slice(g.starts[0], pinned.conv_dim);
-            z = try block.slice(g.starts[1], dim);
-            a = try block.slice(g.starts[2], pinned.linear_heads);
-            b = try block.slice(g.starts[3], pinned.linear_heads);
+            if (in_place) {
+                const block = try c.scratch.alloc(.bf16, window_prefix + g.fused.n);
+                window = try block.slice(0, window_prefix + pinned.conv_dim);
+                try c.project(try block.slice(window_prefix, g.fused.n), x, g.fused);
+                qkv = try block.slice(window_prefix, pinned.conv_dim);
+                z = try block.slice(window_prefix + g.starts[1], dim);
+                a = try block.slice(window_prefix + g.starts[2], pinned.linear_heads);
+                b = try block.slice(window_prefix + g.starts[3], pinned.linear_heads);
+            } else {
+                const block = try c.scratch.alloc(.bf16, g.fused.n);
+                try c.project(block, x, g.fused);
+                qkv = try block.slice(g.starts[0], pinned.conv_dim);
+                z = try block.slice(g.starts[1], dim);
+                a = try block.slice(g.starts[2], pinned.linear_heads);
+                b = try block.slice(g.starts[3], pinned.linear_heads);
+            }
         } else {
-            qkv = try c.scratch.alloc(.bf16, rows * pinned.conv_dim);
+            if (in_place) {
+                window = try c.scratch.alloc(.bf16, (rows + state.conv_rows) * pinned.conv_dim);
+                qkv = try window.?.slice(window_prefix, pinned.conv_dim);
+            } else qkv = try c.scratch.alloc(.bf16, rows * pinned.conv_dim);
             try c.project(qkv, x, layer.qkv);
             z = try c.scratch.alloc(.bf16, rows * dim);
             try c.project(z, x, layer.z);
@@ -150,7 +169,7 @@ pub const Core = struct {
         const g = try c.scratch.alloc(.f32, rows * pinned.linear_heads);
         const beta = try c.scratch.alloc(.bf16, rows * pinned.linear_heads);
         const conv_out = try c.scratch.alloc(.bf16, rows * pinned.conv_dim);
-        const conv_in = try c.scratch.alloc(.bf16, (rows + state.conv_rows) * pinned.conv_dim);
+        const conv_in = window orelse try c.scratch.alloc(.bf16, (rows + state.conv_rows) * pinned.conv_dim);
         try vk.orExit(c.acc.gdn.convPrefill(c.cmds, soa, g, beta, conv_out, conv_in, s.convInput(slot), qkv, layer.conv, a, b, layer.a_log, layer.dt_bias, s.convOutput(slot), rows, c.timeout_ns));
         const y = try c.scratch.alloc(.bf16, rows * dim);
         try vk.orExit(c.acc.gdn.prefillRecur(c.cmds, soa, g, beta, s.gdnInput(slot), y, s.gdnOutput(slot), null, rows, @min(rows, max_gdn_chunk), c.timeout_ns));

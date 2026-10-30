@@ -97,6 +97,8 @@ pub const Ops = struct {
     qmm_path: ops_q4.QmmPath,
     /// TF_VK_FUSE_SWIGLU's init-time decision; the model probe reports it at ready.
     fuse_swiglu: bool,
+    /// TF_VK_CONV_INPLACE's init-time decision: the decode qkv projection writes the conv window tail.
+    conv_inplace: bool,
     /// Read-only stand-in for declared bindings a kernel never touches (cast 1, copy 1 and 3).
     dummy: Buffer,
 
@@ -118,6 +120,7 @@ pub const Ops = struct {
             .qmm_q4_sg_swiglu = null,
             .qmm_path = .old_device,
             .fuse_swiglu = false,
+            .conv_inplace = false,
             .dummy = try Buffer.init(dev, .device, dummy_bytes),
         };
         errdefer o.dummy.deinit();
@@ -152,6 +155,7 @@ pub const Ops = struct {
         errdefer if (o.qmm_q4_sg) |*sg| sg.deinit();
         // Candidate C's switch, read once at engine init: TF_VK_FUSE_SWIGLU=0 keeps B's merged dispatch plus swiglu.
         o.fuse_swiglu = fuse.swigluFromEnv(std.c.getenv("TF_VK_FUSE_SWIGLU"));
+        o.conv_inplace = fuse.convInplaceFromEnv(std.c.getenv("TF_VK_CONV_INPLACE"));
         if (o.fuse_swiglu) {
             if (shaders.qmm_q4_sg_swiglu) |img| {
                 o.qmm_q4_sg_swiglu = try dispatch.Pipeline.init(dev, img, .{ .bindings = 5, .push_bytes = params.push_bytes, .writes = 1 << 4 });
