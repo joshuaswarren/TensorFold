@@ -82,6 +82,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 - Vulkan Q4 group-64 projections now use one 64-lane workgroup per output with a fixed reduction tree; the engine chunks prefill rows at 32, and the contract covers decode, prefill and five planted faults. (#PR_TBD). Thanks to @joshuawarren.
 
+- Vulkan Q4 projections load the next pack while processing the current one. Precise accumulators preserve output bits; plain accumulators changed 1 of 6,144 outputs by one bf16 ULP on all three Apple chips (#PR_TBD). Thanks to @joshuawarren.
+
 ## 1.1.9
 
 - Kolibri-1 on CUDA, and Drama 3 with prompt chunks of more than one row (`TF_DRAMA_PREFILL_ROWS`): the block-FP8 routed experts' prompt kernels copy their weights into shared memory in stored order, so each 32-byte sector is read from L2 once instead of twice (#1460). The matrix multiplies read the same values in the same order, so outputs are the same bytes. On a GB10, Kolibri-1's prompts ran 13% faster at 2k tokens and 3 to 4% faster from 8k to 64k, with the same tokens. The kernel contract now records the register and shared-memory limits of Kolibri-1's three prompt launches. Thanks to @jschmied.
