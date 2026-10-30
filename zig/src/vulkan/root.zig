@@ -21,6 +21,7 @@ pub const zero = commands.zero;
 pub const recordFill = commands.recordFill;
 pub const orExit = commands.orExit;
 pub const dispatch = @import("dispatch.zig");
+pub const fuse = @import("fuse.zig");
 pub const params = @import("stage1_params");
 pub const tensor = @import("tensor.zig");
 pub const arena = @import("arena.zig");
@@ -36,6 +37,6 @@ pub const Greedy = greedy.Greedy;
 
 test {
     const std = @import("std");
-    inline for (.{ runtime, Runtime, device, Device, memory, Buffer, commands, Commands, dispatch, dispatch.Pipeline, params, tensor, tensor.View, arena, ops, ops_q4, norm_mlp, norm_mlp.NormMlp, attention, Attention, gdn, Gdn, greedy, Greedy }) |T|
+    inline for (.{ runtime, Runtime, device, Device, memory, Buffer, commands, Commands, dispatch, dispatch.Pipeline, fuse, params, tensor, tensor.View, arena, ops, ops_q4, norm_mlp, norm_mlp.NormMlp, attention, Attention, gdn, Gdn, greedy, Greedy }) |T|
         std.testing.refAllDecls(T);
 }
