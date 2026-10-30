@@ -1,6 +1,4 @@
-// Native Vulkan Qwen3.5-2B engine: heap-stable object runs single-sequence prefill chunks, decode, and greedy draws.
-// Safety: gates (bf16, SDPA shmem, GDN subgroup) + admission precede weights; state last; child ptrs heap-owned first
-// `vk.orExit` exits 124 on Timeout and 1 on InFlight. Post-write failures poison until reset; no rollback.
+// Admission precedes weights, state allocates last, and post-write failures poison until reset; no rollback.
 const std = @import("std");
 const vk = @import("vulkan");
 const pinned = @import("../../config.zig");
