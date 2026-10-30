@@ -1,17 +1,11 @@
-//! Decode group fusion (m1max-gap-prereg candidate B): several independent
-//! single-row qmm projections reading one activation become one dispatch
-//! over the members' weight rows concatenated at load time. This file is the
-//! pure half — the group plan (padded row starts keeping every binding on an
-//! aligned byte), the byte assembly and the env switch — host-tested with
-//! synthetic tensors. The device path is the existing `project` on the fused
-//! views; row independence of the SG kernel makes it bit-identical.
+//! Decode group fusion: independent qmm projections of one activation run as one dispatch; pure plan.
 
 const std = @import("std");
 const ops_q4 = @import("ops_q4.zig");
 const dispatch = @import("dispatch.zig");
 const Error = dispatch.Error;
 
-/// TF_VK_FUSE=0 loads exactly as today; any other value or unset fuses.
+/// TF_VK_FUSE=0 loads exactly as before; any other value or unset fuses.
 pub fn fuseFromEnv(v: ?[*:0]const u8) bool {
     const s = v orelse return true;
     return !std.mem.eql(u8, std.mem.span(s), "0");
@@ -19,9 +13,7 @@ pub fn fuseFromEnv(v: ?[*:0]const u8) bool {
 
 pub const max_members = 4;
 
-/// One member's place in the fused buffers: `rows` own rows beginning at
-/// `start`, a row index chosen so the member's weight, scale, bias and
-/// output binding offsets are all device-aligned.
+/// One member's place in the fused buffers: `rows` rows from `start`, chosen so its binding offsets are all aligned.
 pub const MemberPlan = struct { rows: u64, start: u64 };
 
 pub const GroupPlan = struct {
@@ -32,12 +24,7 @@ pub const GroupPlan = struct {
     params_bytes: u64 = 0,
 };
 
-/// The fused layout of `member_rows` members of one k: pad before each member
-/// so its start byte is aligned for the weights (k/2 B rows), the scales and
-/// biases (k/32 B rows) and the bf16 output (2 B rows) alike — the binding
-/// alignment is the device's minStorageBufferOffsetAlignment, checked by
-/// Buffer.descriptor. A buffer past the device's maxStorageBufferRange
-/// refuses: the caller falls back to separate dispatches. Pure and host-tested.
+/// The fused layout of `member_rows` members of one k: pad before each so every binding start aligns; refuses past it.
 pub fn planGroup(k: u64, member_rows: []const u64, lim: ops_q4.Limits) Error!GroupPlan {
     if (member_rows.len == 0 or member_rows.len > max_members) return error.Invalid;
     if (k == 0 or k % ops_q4.group_size != 0) return error.Invalid;
@@ -67,9 +54,7 @@ pub fn planGroup(k: u64, member_rows: []const u64, lim: ops_q4.Limits) Error!Gro
     return plan;
 }
 
-/// Would one dispatch over the fused group take the SG decode kernel within
-/// the device's ranges? The caller falls back to separate member dispatches
-/// (the member views work unchanged) when this is false. Pure and host-tested.
+/// Would one dispatch over the fused group take the SG decode kernel within the device ranges? Else members run apart.
 pub fn groupAdmits(plan: GroupPlan, k: u64, caps: ops_q4.SubgroupCaps, have_sg: bool, lim: ops_q4.Limits, max_groups: u32) bool {
     if (plan.n == 0 or plan.w_bytes > lim.max_range or plan.params_bytes > lim.max_range) return false;
     if (!ops_q4.qmmDecodeSgAdmits(1, k, plan.total_rows, caps, have_sg)) return false;
@@ -77,8 +62,7 @@ pub fn groupAdmits(plan: GroupPlan, k: u64, caps: ops_q4.SubgroupCaps, have_sg: 
     return true;
 }
 
-/// The fused tensor's bytes: pad rows zero, member i's rows at its start.
-/// Pure and host-tested; the loader plays the same layout through uploads.
+/// The fused tensor's bytes: pad rows zero, member i's rows at its start; pure and host-tested.
 pub fn assemble(comptime T: type, dest: []T, row_elems: u64, plan: GroupPlan, members: []const []const T) void {
     @memset(dest, 0);
     for (members, 0..) |m, i| {
@@ -99,8 +83,7 @@ test "envOne's sibling: fuseFromEnv turns off only for the exact 0" {
 }
 
 test "the group planner pads the real 2B decode groups to aligned starts" {
-    // GDN: qkv 6144, z 2048, a 16, b 16 — only a pads (b's output would land
-    // 32 bytes past an aligned start)
+    // GDN: qkv 6144, z 2048, a 16, b 16: only b pads, 112 rows, because a ends 32 bytes past an aligned output start
     const gdn = try planGroup(2048, &.{ 6144, 2048, 16, 16 }, align256);
     try testing.expectEqual(@as(u32, 4), gdn.n);
     try testing.expectEqual([_]u64{ 0, 6144, 8192, 8320 }, [_]u64{ gdn.members[0].start, gdn.members[1].start, gdn.members[2].start, gdn.members[3].start });
@@ -110,11 +93,11 @@ test "the group planner pads the real 2B decode groups to aligned starts" {
         try testing.expectEqual(@as(u64, 0), gdn.members[i].start * 64 % 256); // scale and bias bindings
         try testing.expectEqual(@as(u64, 0), gdn.members[i].start * 1024 % 256); // weight binding
     }
-    // full attention: q (the interleaved q|gate rows) 4096, k 512, v 512 — no pad
+    // full attention: q (the interleaved q|gate rows) 4096, k 512, v 512, no pad
     const attn = try planGroup(2048, &.{ 4096, 512, 512 }, align256);
     try testing.expectEqual([_]u64{ 0, 4096, 4608 }, [_]u64{ attn.members[0].start, attn.members[1].start, attn.members[2].start });
     try testing.expectEqual(@as(u64, 5120), attn.total_rows);
-    // dense MLP: gate 6144, up 6144 — no pad
+    // dense MLP: gate 6144, up 6144, no pad
     const mlp = try planGroup(2048, &.{ 6144, 6144 }, align256);
     try testing.expectEqual([_]u64{ 0, 6144 }, [_]u64{ mlp.members[0].start, mlp.members[1].start });
     try testing.expectEqual(@as(u64, 12288), mlp.total_rows);
@@ -150,9 +133,7 @@ test "assembling the fused bytes keeps member rows and zeroes pads" {
     try testing.expectEqualSlices(u32, &m2, w[plan.members[2].start * row_words ..][0..m2.len]);
 }
 
-/// The single-row qmm chain on the host, over packed words exactly as
-/// uploaded (the affine_fixture replay's in-order acc += x * (s q + b),
-/// bf16 params widened exactly): one output element per weight row.
+/// The host single-row qmm chain over packed words as uploaded (in-order acc += x * (s q + b)): one output per row.
 fn replayRow(x: []const f32, w: []const u32, scales: []const u16, biases: []const u16, w_row_words: u64, param_row_groups: u64, row: u64, k: u64) f32 {
     var acc: f32 = 0;
     const s_at = row * param_row_groups;
@@ -220,9 +201,7 @@ test "a row replayed from the fused bytes equals the member replayed alone, bit 
 }
 
 test "the real 2B tower fuses 90 of its 490 decode dispatches away" {
-    // qmm dispatches per decode token: 18 linear layers x (qkv,z,a,b,out)
-    // + 6 full layers x (q,k,v,o) + 24 MLPs x (gate,up,down) + the head = 187;
-    // the other 303 dispatches (norms, rope, sdpa, conv, gathers, copies) stay.
+    // qmm dispatches per decode token: 18 x (qkv,z,a,b,out) + 6 x (q,k,v,o) + 24 x (gate,up,down) + head = 187.
     var qmm: u64 = 1; // the head
     var saved: u64 = 0;
     for (0..24) |i| {
