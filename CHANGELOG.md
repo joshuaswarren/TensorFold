@@ -80,6 +80,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 - Vulkan decode: each steady token now records in one command buffer with one submit and one fence instead of about 496 separate submits, including the fed token upload, embed, all 24 layers, head, GPU greedy draw, 12-byte chosen-ID copy and optional 496,640-byte logits row. Immutable descriptor snapshots use a bounded 512-set per-pipeline bank, with per-batch staging slices. Median steady-token wall time improves 29.4% on M1, 40.4% on M1 Max and 63.5% on M2 Max, with byte-identical ids and logits; shaders, dispatch order, barriers and arithmetic are unchanged (#PR_TBD). Thanks to @joshuawarren.
 
+- Vulkan Q4 group-64 projections now use one 64-lane workgroup per output with a fixed reduction tree; the engine chunks prefill rows at 32, and the contract covers decode, prefill and five planted faults. (#PR_TBD). Thanks to @joshuawarren.
+
 ## 1.1.9
 
 - Kolibri-1 on CUDA, and Drama 3 with prompt chunks of more than one row (`TF_DRAMA_PREFILL_ROWS`): the block-FP8 routed experts' prompt kernels copy their weights into shared memory in stored order, so each 32-byte sector is read from L2 once instead of twice (#1460). The matrix multiplies read the same values in the same order, so outputs are the same bytes. On a GB10, Kolibri-1's prompts ran 13% faster at 2k tokens and 3 to 4% faster from 8k to 64k, with the same tokens. The kernel contract now records the register and shared-memory limits of Kolibri-1's three prompt launches. Thanks to @jschmied.
