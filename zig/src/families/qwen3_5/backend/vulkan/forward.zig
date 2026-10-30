@@ -116,7 +116,8 @@ pub const Core = struct {
         var qraw: View = undefined;
         var k: View = undefined;
         var v: View = undefined;
-        if (layer.qkv) |g| if (rows == 1) {
+        const qkv_group = if (rows == 1) layer.qkv else null;
+        if (qkv_group) |g| {
             const block = try c.scratch.alloc(.bf16, g.fused.n);
             try c.project(block, x, g.fused);
             qraw = try block.slice(g.starts[0], 2 * pinned.query_heads * pinned.head_dim);
@@ -129,7 +130,7 @@ pub const Core = struct {
             try c.project(k, x, layer.k);
             v = try c.scratch.alloc(.bf16, rows * pinned.kv_heads * pinned.head_dim);
             try c.project(v, x, layer.v);
-        };
+        }
         const q = try c.scratch.alloc(.bf16, rows * pinned.query_heads * pinned.head_dim);
         try c.extractQueries(q, qraw, rows);
         const qn = try c.scratch.alloc(.bf16, q.elements);
@@ -165,7 +166,8 @@ pub const Core = struct {
         var z: View = undefined;
         var a: View = undefined;
         var b: View = undefined;
-        if (layer.qkvzab) |g| if (rows == 1) {
+        const qkvzab_group = if (rows == 1) layer.qkvzab else null;
+        if (qkvzab_group) |g| {
             const block = try c.scratch.alloc(.bf16, g.fused.n);
             try c.project(block, x, g.fused);
             qkv = try block.slice(g.starts[0], pinned.conv_dim);
@@ -181,7 +183,7 @@ pub const Core = struct {
             try c.project(a, x, layer.a);
             b = try c.scratch.alloc(.bf16, rows * pinned.linear_heads);
             try c.project(b, x, layer.b);
-        };
+        }
         const soa = try c.scratch.alloc(.bf16, rows * 3 * dim);
         const g = try c.scratch.alloc(.f32, rows * pinned.linear_heads);
         const beta = try c.scratch.alloc(.bf16, rows * pinned.linear_heads);
@@ -206,7 +208,8 @@ pub const Core = struct {
         // swiglu reads the two members as views of the shared output block.
         var gate: View = undefined;
         var up: View = undefined;
-        if (m.gate_up) |g| if (rows == 1) {
+        const gate_up_group = if (rows == 1) m.gate_up else null;
+        if (gate_up_group) |g| {
             const block = try c.scratch.alloc(.bf16, g.fused.n);
             try c.project(block, x, g.fused);
             gate = try block.slice(g.starts[0], pinned.intermediate);
@@ -216,7 +219,7 @@ pub const Core = struct {
             try c.project(gate, x, m.gate);
             up = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
             try c.project(up, x, m.up);
-        };
+        }
         const act = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
         try vk.orExit(c.acc.norm.swiglu(c.cmds, act, gate, up, c.timeout_ns));
         try c.project(r_out, act, m.down);

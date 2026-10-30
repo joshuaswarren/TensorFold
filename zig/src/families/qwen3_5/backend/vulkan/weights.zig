@@ -380,11 +380,17 @@ const Builder = struct {
             };
             var done = false;
             if (b.fuse_groups) {
+                // one key buffer per member: shared buffers alias earlier
+                // slices with later (shorter) writes — in_proj_bkv
+                var kb0: [192]u8 = undefined;
+                var kb1: [192]u8 = undefined;
+                var kb2: [192]u8 = undefined;
+                var kb3: [192]u8 = undefined;
                 if (b.groupQuant(&.{
-                    .{ .name = try key(&buf, "{s}in_proj_qkv", .{lin}), .rows = 3 * pinned.linear_heads * pinned.linear_dim },
-                    .{ .name = try key(&buf, "{s}in_proj_z", .{lin}), .rows = pinned.linear_heads * pinned.linear_dim },
-                    .{ .name = try key(&buf, "{s}in_proj_a", .{lin}), .rows = pinned.linear_heads },
-                    .{ .name = try key(&buf, "{s}in_proj_b", .{lin}), .rows = pinned.linear_heads },
+                    .{ .name = try key(&kb0, "{s}in_proj_qkv", .{lin}), .rows = 3 * pinned.linear_heads * pinned.linear_dim },
+                    .{ .name = try key(&kb1, "{s}in_proj_z", .{lin}), .rows = pinned.linear_heads * pinned.linear_dim },
+                    .{ .name = try key(&kb2, "{s}in_proj_a", .{lin}), .rows = pinned.linear_heads },
+                    .{ .name = try key(&kb3, "{s}in_proj_b", .{lin}), .rows = pinned.linear_heads },
                 }, pinned.hidden)) |g| {
                     l.qkv = try g.member(0, 3 * pinned.linear_heads * pinned.linear_dim);
                     l.z = try g.member(1, pinned.linear_heads * pinned.linear_dim);
@@ -419,10 +425,13 @@ const Builder = struct {
         };
         var done = false;
         if (b.fuse_groups) {
+            var kb0: [192]u8 = undefined;
+            var kb1: [192]u8 = undefined;
+            var kb2: [192]u8 = undefined;
             if (b.groupQuant(&.{
-                .{ .name = try key(&buf, "{s}q_proj", .{attn}), .rows = 2 * pinned.query_heads * pinned.head_dim },
-                .{ .name = try key(&buf, "{s}k_proj", .{attn}), .rows = pinned.kv_heads * pinned.head_dim },
-                .{ .name = try key(&buf, "{s}v_proj", .{attn}), .rows = pinned.kv_heads * pinned.head_dim },
+                .{ .name = try key(&kb0, "{s}q_proj", .{attn}), .rows = 2 * pinned.query_heads * pinned.head_dim },
+                .{ .name = try key(&kb1, "{s}k_proj", .{attn}), .rows = pinned.kv_heads * pinned.head_dim },
+                .{ .name = try key(&kb2, "{s}v_proj", .{attn}), .rows = pinned.kv_heads * pinned.head_dim },
             }, pinned.hidden)) |g| {
                 f.q = try g.member(0, 2 * pinned.query_heads * pinned.head_dim);
                 f.k = try g.member(1, pinned.kv_heads * pinned.head_dim);
@@ -558,6 +567,186 @@ pub const Model = struct {
 };
 
 const testing = std.testing;
+
+/// One tensor the loader will request: name, dtype and shape, all checkable
+/// against a safetensors header without a GPU.
+pub const Request = struct { name: []const u8, dtype: loader.table.DType, shape: [4]usize, rank: usize };
+
+/// The layer prefix's tensor name, formatted into `buf` (the Builder's key).
+pub fn formatKey(buf: *[192]u8, comptime fmt: []const u8, args: anytype) Error![]const u8 {
+    var scratch: [192]u8 = undefined;
+    const name = std.fmt.bufPrint(&scratch, fmt, args) catch return error.UnsupportedModel;
+    @memcpy(buf[0..name.len], name);
+    return buf[0..name.len];
+}
+
+const QuantShape = struct { w: [2]usize, p: [2]usize };
+
+fn quantShape(rows: usize, k: usize) QuantShape {
+    return .{ .w = .{ rows, k / 8 }, .p = .{ rows, k / 64 } };
+}
+
+fn pushQuant(gpa: Allocator, out: *std.ArrayList(Request), name: []const u8, rows: usize, k: usize) Error!void {
+    const s = quantShape(rows, k);
+    try out.append(gpa, .{ .name = try std.fmt.allocPrint(gpa, "{s}.weight", .{name}), .dtype = .u32, .shape = .{ s.w[0], s.w[1], 0, 0 }, .rank = 2 });
+    try out.append(gpa, .{ .name = try std.fmt.allocPrint(gpa, "{s}.scales", .{name}), .dtype = .bf16, .shape = .{ s.p[0], s.p[1], 0, 0 }, .rank = 2 });
+    try out.append(gpa, .{ .name = try std.fmt.allocPrint(gpa, "{s}.biases", .{name}), .dtype = .bf16, .shape = .{ s.p[0], s.p[1], 0, 0 }, .rank = 2 });
+}
+
+fn addRequest(gpa: Allocator, out: *std.ArrayList(Request), buf: *[192]u8, comptime fmt: []const u8, args: anytype, dtype: loader.table.DType, shape: [4]usize, rank: usize) Error!void {
+    try out.append(gpa, .{ .name = try gpa.dupe(u8, try formatKey(buf, fmt, args)), .dtype = dtype, .shape = shape, .rank = rank });
+}
+
+/// Every tensor the loader requests for layer `index`: names, dtypes,
+/// shapes. Names are heap copies, so the list outlives this call. The caller
+/// frees.
+pub fn layerRequests(gpa: Allocator, index: usize) Error![]Request {
+    var out: std.ArrayList(Request) = .empty;
+    errdefer out.deinit(gpa);
+    var buf: [192]u8 = undefined;
+    const base = try formatKey(&buf, prefix ++ "layers.{d}.", .{index});
+    {
+        var nb: [192]u8 = undefined;
+        try addRequest(gpa, &out, &nb, "{s}input_layernorm.weight", .{base}, .bf16, .{ pinned.hidden, 0, 0, 0 }, 1);
+        try addRequest(gpa, &out, &nb, "{s}post_attention_layernorm.weight", .{base}, .bf16, .{ pinned.hidden, 0, 0, 0 }, 1);
+    }
+    {
+        var b0: [192]u8 = undefined;
+        var b1: [192]u8 = undefined;
+        var b2: [192]u8 = undefined;
+        const gate = try formatKey(&b0, "{s}mlp.gate_proj", .{base});
+        const up = try formatKey(&b1, "{s}mlp.up_proj", .{base});
+        const down = try formatKey(&b2, "{s}mlp.down_proj", .{base});
+        try pushQuant(gpa, &out, gate, pinned.intermediate, pinned.hidden);
+        try pushQuant(gpa, &out, up, pinned.intermediate, pinned.hidden);
+        try pushQuant(gpa, &out, down, pinned.hidden, pinned.intermediate);
+    }
+    if (pinned.linear(index)) {
+        var lb: [192]u8 = undefined;
+        const lin = try formatKey(&lb, "{s}linear_attn.", .{base});
+        var kb: [192]u8 = undefined;
+        try pushQuant(gpa, &out, try formatKey(&kb, "{s}out_proj", .{lin}), pinned.hidden, pinned.linear_heads * pinned.linear_dim);
+        {
+            var nb: [192]u8 = undefined;
+            try addRequest(gpa, &out, &nb, "{s}norm.weight", .{lin}, .bf16, .{ pinned.linear_dim, 0, 0, 0 }, 1);
+        }
+        {
+            var nb: [192]u8 = undefined;
+            try addRequest(gpa, &out, &nb, "{s}conv1d.weight", .{lin}, .bf16, .{ pinned.conv_dim, pinned.conv_taps, 1, 0 }, 3);
+            try addRequest(gpa, &out, &nb, "{s}A_log", .{lin}, .f32, .{ pinned.linear_heads, 0, 0, 0 }, 1);
+            try addRequest(gpa, &out, &nb, "{s}dt_bias", .{lin}, .bf16, .{ pinned.linear_heads, 0, 0, 0 }, 1);
+        }
+        // the fused arm's four members each get their OWN key buffer: the
+        // loader's group spec held four slices of one buffer, and the last
+        // (shortest) write left stale tails the earlier slices read back as
+        // in_proj_bkv
+        var kb0: [192]u8 = undefined;
+        var kb1: [192]u8 = undefined;
+        var kb2: [192]u8 = undefined;
+        var kb3: [192]u8 = undefined;
+        const qkv = try formatKey(&kb0, "{s}in_proj_qkv", .{lin});
+        const z = try formatKey(&kb1, "{s}in_proj_z", .{lin});
+        const a = try formatKey(&kb2, "{s}in_proj_a", .{lin});
+        const b = try formatKey(&kb3, "{s}in_proj_b", .{lin});
+        try pushQuant(gpa, &out, qkv, 3 * pinned.linear_heads * pinned.linear_dim, pinned.hidden);
+        try pushQuant(gpa, &out, z, pinned.linear_heads * pinned.linear_dim, pinned.hidden);
+        try pushQuant(gpa, &out, a, pinned.linear_heads, pinned.hidden);
+        try pushQuant(gpa, &out, b, pinned.linear_heads, pinned.hidden);
+    } else {
+        var ab: [192]u8 = undefined;
+        const attn = try formatKey(&ab, "{s}self_attn.", .{base});
+        var qb: [192]u8 = undefined;
+        var kbb: [192]u8 = undefined;
+        var vb: [192]u8 = undefined;
+        const q = try formatKey(&qb, "{s}q_proj", .{attn});
+        const k = try formatKey(&kbb, "{s}k_proj", .{attn});
+        const v = try formatKey(&vb, "{s}v_proj", .{attn});
+        try pushQuant(gpa, &out, q, 2 * pinned.query_heads * pinned.head_dim, pinned.hidden);
+        try pushQuant(gpa, &out, k, pinned.kv_heads * pinned.head_dim, pinned.hidden);
+        try pushQuant(gpa, &out, v, pinned.kv_heads * pinned.head_dim, pinned.hidden);
+        {
+            var nb: [192]u8 = undefined;
+            try addRequest(gpa, &out, &nb, "{s}q_norm.weight", .{attn}, .bf16, .{ pinned.head_dim, 0, 0, 0 }, 1);
+            try addRequest(gpa, &out, &nb, "{s}k_norm.weight", .{attn}, .bf16, .{ pinned.head_dim, 0, 0, 0 }, 1);
+        }
+        try pushQuant(gpa, &out, try formatKey(&ab, "{s}o_proj", .{attn}), pinned.hidden, pinned.query_heads * pinned.head_dim);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "the fused GDN group resolves every member name against a shared key buffer" {
+    // the loader's group spec holds four names built into one buffer; the
+    // member the loader touches first must read back as in_proj_qkv, not a
+    // stale-tail mash like in_proj_bkv
+    const a = testing.allocator;
+    const reqs = try layerRequests(a, 0);
+    defer {
+        for (reqs) |r| a.free(r.name);
+        a.free(reqs);
+    }
+    var qkv_seen = false;
+    for (reqs) |r| {
+        if (std.mem.indexOf(u8, r.name, "in_proj_") != null and std.mem.endsWith(u8, r.name, ".weight")) {
+            const ok = std.mem.endsWith(u8, r.name, "in_proj_qkv.weight") or
+                std.mem.endsWith(u8, r.name, "in_proj_z.weight") or
+                std.mem.endsWith(u8, r.name, "in_proj_a.weight") or
+                std.mem.endsWith(u8, r.name, "in_proj_b.weight");
+            if (!ok) std.debug.print("BAD fused member name: {s}\n", .{r.name});
+            try testing.expect(ok);
+            if (std.mem.endsWith(u8, r.name, "in_proj_qkv.weight")) qkv_seen = true;
+        }
+    }
+    try testing.expect(qkv_seen);
+}
+
+
+test "every requested tensor resolves against the real checkpoint header, both arms" {
+    const path_env: ?[*:0]const u8 = std.c.getenv("TF_TEST_CHECKPOINT");
+    const path: []const u8 = if (path_env) |p| std.mem.span(p) else
+        "/home/joshuawarren/scratch/egpu-b60/tensorfold-models/Qwen3.5-2B-MLX-4bit/model.safetensors";
+    const file = std.Io.Dir.cwd().openFile(std.testing.io, path, .{}) catch |err| {
+        std.debug.print("SKIP real-checkpoint header test: no checkpoint at {s} ({s}); set TF_TEST_CHECKPOINT\n", .{ path, @errorName(err) });
+        return;
+    };
+    defer file.close(std.testing.io);
+    var len_bytes: [8]u8 = undefined;
+    _ = try file.readPositionalAll(std.testing.io, &len_bytes, 0);
+    const header_len = std.mem.readInt(u64, &len_bytes, .little);
+    if (header_len > 64 << 20) return error.UnsupportedModel;
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const header = try arena.alloc(u8, header_len);
+    _ = try file.readPositionalAll(std.testing.io, header, 8);
+    const doc = try std.json.parseFromSliceLeaky(std.json.Value, arena, header, .{});
+    for ([_]bool{ false, true }) |fuse| {
+        for (0..pinned.layers) |i| {
+            const reqs = try layerRequests(arena, i);
+            for (reqs) |r| {
+                const entry = doc.object.get(r.name) orelse {
+                    std.debug.print("MISSING tensor (fuse={}): {s}\n", .{ fuse, r.name });
+                    return error.TestUnexpectedResult;
+                };
+                const dt = entry.object.get("dtype").?.string;
+                const shape = entry.object.get("shape").?.array;
+                const want_dt: []const u8 = switch (r.dtype) {
+                    .bf16 => "BF16",
+                    .f32 => "F32",
+                    .u32 => "U32",
+                    else => "OTHER",
+                };
+                try testing.expectEqualStrings(want_dt, dt);
+                try testing.expectEqual(@as(usize, r.rank), shape.items.len);
+                for (r.shape[0..r.rank], 0..) |want, d| try testing.expectEqual(want, @as(usize, @intCast(shape.items[d].integer)));
+            }
+        }
+    }
+    // the head tensors, both arms (tied head: no lm_head request)
+    for ([_][]const u8{ prefix ++ "embed_tokens.weight", prefix ++ "embed_tokens.scales", prefix ++ "embed_tokens.biases", prefix ++ "norm.weight" }) |name| {
+        try testing.expect(doc.object.get(name) != null);
+    }
+}
 
 test "kindOf maps exactly the dtypes the views carry" {
     try testing.expectEqual(@as(?vk.tensor.Kind, .f32), kindOf(.f32));
