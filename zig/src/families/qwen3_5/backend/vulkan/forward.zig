@@ -71,9 +71,7 @@ pub const Core = struct {
         const mark = c.scratch.mark();
         errdefer c.scratch.reset(mark) catch {};
         const hidden = pinned.hidden;
-        // The decode row: q, k and v read one x and become one dispatch over
-        // the fused weights; q keeps its interleaved gate half, k and v are
-        // member views of the shared output block.
+        // Decode row: q, k, v read one x, run as one fused dispatch; q keeps its gate half, k and v are output views.
         var qraw: View = undefined;
         var k: View = undefined;
         var v: View = undefined;
@@ -94,7 +92,7 @@ pub const Core = struct {
             kn = try c.scratch.alloc(.bf16, k.elements);
             try vk.orExit(c.acc.norm.rmsNorm(c.cmds, kn, k, layer.k_norm, rows * pinned.kv_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
         } else {
-            // FUSE=0 keeps unit 12's interleaved order exactly.
+            // FUSE=0 keeps the unfused interleaved order exactly.
             qraw = try c.scratch.alloc(.bf16, rows * 2 * pinned.query_heads * pinned.head_dim);
             try c.project(qraw, x, layer.q);
             q = try c.scratch.alloc(.bf16, rows * pinned.query_heads * pinned.head_dim);
@@ -125,10 +123,7 @@ pub const Core = struct {
         const mark = c.scratch.mark();
         errdefer c.scratch.reset(mark) catch {};
         const dim = pinned.linear_heads * pinned.linear_dim;
-        // The decode row: the four independent projections read one x and
-        // become one dispatch over the fused weights; every consumer reads
-        // its member as a view of the shared output block. The pad rows
-        // between members are zero weights and are never read.
+        // Decode row: four projections as one fused dispatch; consumers read member views; pad rows are never read.
         var qkv: View = undefined;
         var z: View = undefined;
         var a: View = undefined;
@@ -170,8 +165,7 @@ pub const Core = struct {
     pub fn mlp(c: *const Core, x: View, rows: usize, m: weights.DenseMlp, r_out: View) !void {
         const mark = c.scratch.mark();
         errdefer c.scratch.reset(mark) catch {};
-        // The decode row: gate and up read one x and become one dispatch;
-        // swiglu reads the two members as views of the shared output block.
+        // Decode row: gate and up read one x and run as one dispatch; swiglu reads the two members as output views.
         var gate: View = undefined;
         var up: View = undefined;
         const gate_up_group = if (rows == 1) m.gate_up else null;
