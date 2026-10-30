@@ -30,7 +30,35 @@ pub fn steps(
     }) });
     b.step("vulkan-model-probe-build", "Build zig-out/bin/tf-qwen35-model without running GPU work").dependOn(&b.addInstallArtifact(probe, .{}).step);
 
-    // (b) Server entry point, checkpoint CLI and factory engine_api over Vulkan engines.
+    // (a2) the dry-run harness: the whole engine over a mock device, host only.
+    const dryrun = b.addExecutable(.{ .name = "tf-qwen35-dryrun", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/dryrun_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "qwen35_vulkan", .module = m.qwen35_vulkan },
+            .{ .name = "qwen35_shaders", .module = m.qwen35_shaders },
+            .{ .name = "core", .module = m.core },
+            .{ .name = "probe", .module = blk: {
+                const pm = b.createModule(.{ .root_source_file = b.path("zig/tests/vulkan/qwen35_model_probe.zig"), .target = target, .optimize = optimize, .link_libc = true });
+                pm.addImport("qwen35_vulkan", m.qwen35_vulkan);
+                pm.addImport("qwen35_shaders", m.qwen35_shaders);
+                pm.addImport("core", m.core);
+                break :blk pm;
+            } },
+            .{ .name = "mock_device", .module = blk: {
+                const mm = b.createModule(.{ .root_source_file = b.path("zig/tests/vulkan/mock_device.zig"), .target = target, .optimize = optimize, .link_libc = true });
+                mm.addImport("vulkan", m.qwen35_vulkan.import_table.get("vulkan").?);
+                break :blk mm;
+            } },
+        },
+    }) });
+    b.step("dryrun-build", "Build zig-out/bin/tf-qwen35-dryrun without running GPU work").dependOn(&b.addInstallArtifact(dryrun, .{}).step);
+
+    // (b) the server over the Vulkan engines: the same entry point and checkpoint CLI the
+    // CUDA native server uses, with the factory's engine_api/core instances (type identity).
+>>>>>>> theirs
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const server = b.addExecutable(.{ .name = "tensorfold-native-vulkan", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/server/main.zig"),
