@@ -167,10 +167,10 @@ pub const Ops = struct {
     }
 
     /// The decode matmul's SG pipeline when this dispatch may use it: init built the pipeline
-    /// (the env and device gate) and the pure shape gate passes; null keeps the old kernel.
-    pub fn qmmDecodeSg(o: *Ops, k: u64, n: u64) ?*dispatch.Pipeline {
-        if (o.qmm_q4_sg == null) return null;
-        if (!ops_q4.useSubgroupQmv(1, k, n, .{ .subgroup_size = o.dev.v11.subgroupSize, .subgroup_ops = o.dev.v11.subgroupSupportedOperations })) return null;
+    /// (the env and device gate) and the batch's real row count with its shape passes the pure
+    /// gate; null keeps the old kernel.
+    pub fn qmmDecodeSg(o: *Ops, m: u64, k: u64, n: u64) ?*dispatch.Pipeline {
+        if (!ops_q4.qmmDecodeSgAdmits(m, k, n, .{ .subgroup_size = o.dev.v11.subgroupSize, .subgroup_ops = o.dev.v11.subgroupSupportedOperations }, o.qmm_q4_sg != null)) return null;
         return &o.qmm_q4_sg.?;
     }
 
