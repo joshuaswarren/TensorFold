@@ -71,18 +71,43 @@ pub const Core = struct {
         const mark = c.scratch.mark();
         errdefer c.scratch.reset(mark) catch {};
         const hidden = pinned.hidden;
-        const qraw = try c.scratch.alloc(.bf16, rows * 2 * pinned.query_heads * pinned.head_dim);
-        try c.project(qraw, x, layer.q);
-        const q = try c.scratch.alloc(.bf16, rows * pinned.query_heads * pinned.head_dim);
-        try c.extractQueries(q, qraw, rows);
-        const qn = try c.scratch.alloc(.bf16, q.elements);
-        try vk.orExit(c.acc.norm.rmsNorm(c.cmds, qn, q, layer.q_norm, rows * pinned.query_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
-        const k = try c.scratch.alloc(.bf16, rows * pinned.kv_heads * pinned.head_dim);
-        try c.project(k, x, layer.k);
-        const kn = try c.scratch.alloc(.bf16, k.elements);
-        try vk.orExit(c.acc.norm.rmsNorm(c.cmds, kn, k, layer.k_norm, rows * pinned.kv_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
-        const v = try c.scratch.alloc(.bf16, k.elements);
-        try c.project(v, x, layer.v);
+        // The decode row: q, k and v read one x and become one dispatch over
+        // the fused weights; q keeps its interleaved gate half, k and v are
+        // member views of the shared output block.
+        var qraw: View = undefined;
+        var k: View = undefined;
+        var v: View = undefined;
+        const qkv_group = if (rows == 1) layer.qkv else null;
+        var q: View = undefined;
+        var qn: View = undefined;
+        var kn: View = undefined;
+        if (qkv_group) |g| {
+            const block = try c.scratch.alloc(.bf16, g.fused.n);
+            try c.project(block, x, g.fused);
+            qraw = try block.slice(g.starts[0], 2 * pinned.query_heads * pinned.head_dim);
+            k = try block.slice(g.starts[1], pinned.kv_heads * pinned.head_dim);
+            v = try block.slice(g.starts[2], pinned.kv_heads * pinned.head_dim);
+            q = try c.scratch.alloc(.bf16, rows * pinned.query_heads * pinned.head_dim);
+            try c.extractQueries(q, qraw, rows);
+            qn = try c.scratch.alloc(.bf16, q.elements);
+            try vk.orExit(c.acc.norm.rmsNorm(c.cmds, qn, q, layer.q_norm, rows * pinned.query_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
+            kn = try c.scratch.alloc(.bf16, k.elements);
+            try vk.orExit(c.acc.norm.rmsNorm(c.cmds, kn, k, layer.k_norm, rows * pinned.kv_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
+        } else {
+            // FUSE=0 keeps unit 12's interleaved order exactly.
+            qraw = try c.scratch.alloc(.bf16, rows * 2 * pinned.query_heads * pinned.head_dim);
+            try c.project(qraw, x, layer.q);
+            q = try c.scratch.alloc(.bf16, rows * pinned.query_heads * pinned.head_dim);
+            try c.extractQueries(q, qraw, rows);
+            qn = try c.scratch.alloc(.bf16, q.elements);
+            try vk.orExit(c.acc.norm.rmsNorm(c.cmds, qn, q, layer.q_norm, rows * pinned.query_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
+            k = try c.scratch.alloc(.bf16, rows * pinned.kv_heads * pinned.head_dim);
+            try c.project(k, x, layer.k);
+            kn = try c.scratch.alloc(.bf16, k.elements);
+            try vk.orExit(c.acc.norm.rmsNorm(c.cmds, kn, k, layer.k_norm, rows * pinned.kv_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
+            v = try c.scratch.alloc(.bf16, rows * pinned.kv_heads * pinned.head_dim);
+            try c.project(v, x, layer.v);
+        }
         const queries = try c.scratch.alloc(.bf16, q.elements);
         try vk.orExit(c.acc.attn.setBasePosition(c.cmds, c.staging, @intCast(base), c.timeout_ns));
         try vk.orExit(c.acc.attn.ropeQueries(c.cmds, queries, qn, rows, c.timeout_ns));
@@ -100,14 +125,32 @@ pub const Core = struct {
         const mark = c.scratch.mark();
         errdefer c.scratch.reset(mark) catch {};
         const dim = pinned.linear_heads * pinned.linear_dim;
-        const qkv = try c.scratch.alloc(.bf16, rows * pinned.conv_dim);
-        try c.project(qkv, x, layer.qkv);
-        const z = try c.scratch.alloc(.bf16, rows * dim);
-        try c.project(z, x, layer.z);
-        const a = try c.scratch.alloc(.bf16, rows * pinned.linear_heads);
-        try c.project(a, x, layer.a);
-        const b = try c.scratch.alloc(.bf16, rows * pinned.linear_heads);
-        try c.project(b, x, layer.b);
+        // The decode row: the four independent projections read one x and
+        // become one dispatch over the fused weights; every consumer reads
+        // its member as a view of the shared output block. The pad rows
+        // between members are zero weights and are never read.
+        var qkv: View = undefined;
+        var z: View = undefined;
+        var a: View = undefined;
+        var b: View = undefined;
+        const qkvzab_group = if (rows == 1) layer.qkvzab else null;
+        if (qkvzab_group) |g| {
+            const block = try c.scratch.alloc(.bf16, g.fused.n);
+            try c.project(block, x, g.fused);
+            qkv = try block.slice(g.starts[0], pinned.conv_dim);
+            z = try block.slice(g.starts[1], dim);
+            a = try block.slice(g.starts[2], pinned.linear_heads);
+            b = try block.slice(g.starts[3], pinned.linear_heads);
+        } else {
+            qkv = try c.scratch.alloc(.bf16, rows * pinned.conv_dim);
+            try c.project(qkv, x, layer.qkv);
+            z = try c.scratch.alloc(.bf16, rows * dim);
+            try c.project(z, x, layer.z);
+            a = try c.scratch.alloc(.bf16, rows * pinned.linear_heads);
+            try c.project(a, x, layer.a);
+            b = try c.scratch.alloc(.bf16, rows * pinned.linear_heads);
+            try c.project(b, x, layer.b);
+        }
         const soa = try c.scratch.alloc(.bf16, rows * 3 * dim);
         const g = try c.scratch.alloc(.f32, rows * pinned.linear_heads);
         const beta = try c.scratch.alloc(.bf16, rows * pinned.linear_heads);
@@ -127,10 +170,22 @@ pub const Core = struct {
     pub fn mlp(c: *const Core, x: View, rows: usize, m: weights.DenseMlp, r_out: View) !void {
         const mark = c.scratch.mark();
         errdefer c.scratch.reset(mark) catch {};
-        const gate = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
-        try c.project(gate, x, m.gate);
-        const up = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
-        try c.project(up, x, m.up);
+        // The decode row: gate and up read one x and become one dispatch;
+        // swiglu reads the two members as views of the shared output block.
+        var gate: View = undefined;
+        var up: View = undefined;
+        const gate_up_group = if (rows == 1) m.gate_up else null;
+        if (gate_up_group) |g| {
+            const block = try c.scratch.alloc(.bf16, g.fused.n);
+            try c.project(block, x, g.fused);
+            gate = try block.slice(g.starts[0], pinned.intermediate);
+            up = try block.slice(g.starts[1], pinned.intermediate);
+        } else {
+            gate = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
+            try c.project(gate, x, m.gate);
+            up = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
+            try c.project(up, x, m.up);
+        }
         const act = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
         try vk.orExit(c.acc.norm.swiglu(c.cmds, act, gate, up, c.timeout_ns));
         try c.project(r_out, act, m.down);
