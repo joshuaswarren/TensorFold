@@ -37,6 +37,12 @@ pub fn main(init: std.process.Init) !u8 {
     rt.* = .{ .lib = undefined, .instance = null, .api = undefined };
 
     std.debug.print("DRYRUN engine load: {s} align={d} ids={d}\\n", .{ args[1], alignment, ids.len });
+    if (std.c.getenv("TF_DRYRUN_DUMP") != null) {
+        inline for (comptime std.meta.declarations(q35s)) |decl| {
+            const img = &@field(q35s, decl);
+            std.debug.print("DRYRUN shader {x} {s}" ++ "\n", .{ std.hash.Wyhash.hash(0, img), decl });
+        }
+    }
     const engine_ptr = try q35v.engine.Engine.initOnDevice(gpa, io, bundle(), args[1], 256, 30_000_000_000, md.dev, rt, null);
     // no engine.deinit(): the mock runtime's library handle is a dummy and
     // teardown would close it; the process exit frees everything.

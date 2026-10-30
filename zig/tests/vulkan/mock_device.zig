@@ -95,7 +95,6 @@ pub const Mock = struct {
         const dump = std.c.getenv("TF_DRYRUN_DUMP") != null;
         var ords: std.AutoHashMapUnmanaged(u64, u64) = .empty;
         defer ords.deinit(m.gpa);
-        const dump = std.c.getenv("TF_DRYRUN_DUMP") != null;
         for (m.entries.items) |e| {
             const W = struct {
                 fn f(l: *std.ArrayList(u8), al: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
@@ -104,7 +103,7 @@ pub const Mock = struct {
             }.f;
             const G = m.gpa;
             switch (e) {
-                .dispatch => |d| try W(&bytes, G, "D {d} {d},{d},{d}\n", .{ m.ord(&ords, d.pipeline), d.groups[0], d.groups[1], d.groups[2] }),
+                .dispatch => |d| try W(&bytes, G, "D {d} {x} {d},{d},{d}\n", .{ m.ord(&ords, d.pipeline), m.pipeline_shader.get(d.pipeline) orelse 0, d.groups[0], d.groups[1], d.groups[2] }),
                 .barrier => try W(&bytes, G, "B\n", .{}),
                 .copy => |cp| try W(&bytes, G, "C {d} {d} {d} {d} {d}\n", .{ m.ord(&ords, cp.src_buf), m.ord(&ords, cp.dst_buf), cp.src_off, cp.dst_off, cp.bytes }),
                 .fill => |f| try W(&bytes, G, "F {d} {d} {d} {d}\n", .{ m.ord(&ords, f.buf), f.offset, f.bytes, f.value }),
