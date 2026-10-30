@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Vulkan: the native dense Qwen3.5-2B greedy engine and its operator gates behind `-Dvulkan=true`: checked BF16 tensor operations, the norm/MLP, attention (RoPE, causal GQA SDPA, output gate) and GatedDeltaNet gates, one GDN path for prefill and decode, prefill chunked within the context ceiling, and the kernel contract extended to every operator's SPIR-V through gates 1 to 4 with planted controls and recorded device findings (residual denormals, the preserve-add subnormal flush, the gated norm at the production per-head geometry). `zig build vulkan-kernel-contract -Dvulkan=true` runs it; default builds are unchanged (#1544).
+
 - Qwen3.8-27B on two Macs, first step: the pair seam's Metal kernels, which exchange whole output rows between the two Macs as bf16 copies, so every sum stays on one Mac and no partial sum crosses the link, plus a one-Mac loopback peer and six kernel-contract controls that each go red as planted (#1432). Nothing serves through it yet, and one Mac's projections keep the same reduction order, so replies are byte-identical. Thanks to @akol1.
 
 - CUDA: with DFlash2 beside the dense Qwen3.8-27B, a context copy now needs 20 matching tokens instead of 5, so short matches no longer take the place of DFlash2's drafts. On an RTX 3090 Ti with the MLX 4-bit 27B, decode after two long prompts is up 12.8% sampled and 18.5% greedy, and up to 6.3% on the code and chat cells; replies are token-identical to before and to `"draft": false`. Without a draft model the 27B keeps 5 and runs as before (#1477). Thanks to @diwakergupta.
