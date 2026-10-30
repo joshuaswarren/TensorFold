@@ -78,36 +78,26 @@ pub const Core = struct {
         var k: View = undefined;
         var v: View = undefined;
         const qkv_group = if (rows == 1) layer.qkv else null;
-        var q: View = undefined;
-        var qn: View = undefined;
-        var kn: View = undefined;
         if (qkv_group) |g| {
             const block = try c.scratch.alloc(.bf16, g.fused.n);
             try c.project(block, x, g.fused);
             qraw = try block.slice(g.starts[0], 2 * pinned.query_heads * pinned.head_dim);
             k = try block.slice(g.starts[1], pinned.kv_heads * pinned.head_dim);
             v = try block.slice(g.starts[2], pinned.kv_heads * pinned.head_dim);
-            q = try c.scratch.alloc(.bf16, rows * pinned.query_heads * pinned.head_dim);
-            try c.extractQueries(q, qraw, rows);
-            qn = try c.scratch.alloc(.bf16, q.elements);
-            try vk.orExit(c.acc.norm.rmsNorm(c.cmds, qn, q, layer.q_norm, rows * pinned.query_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
-            kn = try c.scratch.alloc(.bf16, k.elements);
-            try vk.orExit(c.acc.norm.rmsNorm(c.cmds, kn, k, layer.k_norm, rows * pinned.kv_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
         } else {
-            // FUSE=0 keeps unit 12's interleaved order exactly.
             qraw = try c.scratch.alloc(.bf16, rows * 2 * pinned.query_heads * pinned.head_dim);
             try c.project(qraw, x, layer.q);
-            q = try c.scratch.alloc(.bf16, rows * pinned.query_heads * pinned.head_dim);
-            try c.extractQueries(q, qraw, rows);
-            qn = try c.scratch.alloc(.bf16, q.elements);
-            try vk.orExit(c.acc.norm.rmsNorm(c.cmds, qn, q, layer.q_norm, rows * pinned.query_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
             k = try c.scratch.alloc(.bf16, rows * pinned.kv_heads * pinned.head_dim);
             try c.project(k, x, layer.k);
-            kn = try c.scratch.alloc(.bf16, k.elements);
-            try vk.orExit(c.acc.norm.rmsNorm(c.cmds, kn, k, layer.k_norm, rows * pinned.kv_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
             v = try c.scratch.alloc(.bf16, rows * pinned.kv_heads * pinned.head_dim);
             try c.project(v, x, layer.v);
         }
+        const q = try c.scratch.alloc(.bf16, rows * pinned.query_heads * pinned.head_dim);
+        try c.extractQueries(q, qraw, rows);
+        const qn = try c.scratch.alloc(.bf16, q.elements);
+        try vk.orExit(c.acc.norm.rmsNorm(c.cmds, qn, q, layer.q_norm, rows * pinned.query_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
+        const kn = try c.scratch.alloc(.bf16, k.elements);
+        try vk.orExit(c.acc.norm.rmsNorm(c.cmds, kn, k, layer.k_norm, rows * pinned.kv_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
         const queries = try c.scratch.alloc(.bf16, q.elements);
         try vk.orExit(c.acc.attn.setBasePosition(c.cmds, c.staging, @intCast(base), c.timeout_ns));
         try vk.orExit(c.acc.attn.ropeQueries(c.cmds, queries, qn, rows, c.timeout_ns));
@@ -172,22 +162,42 @@ pub const Core = struct {
         errdefer c.scratch.reset(mark) catch {};
         // The decode row: gate and up read one x and become one dispatch;
         // swiglu reads the two members as views of the shared output block.
+        // Candidate C, when switched on and the device admits the epilogue:
+        // the merged projection and the swiglu are one dispatch that writes
+        // only the activations.
         var gate: View = undefined;
         var up: View = undefined;
+        var act: View = undefined;
+        var one_dispatch = false;
+        // the hoisted decision keeps every path defined: a null group (FUSE=0)
+        // takes the separate branch, never an undefined view
         const gate_up_group = if (rows == 1) m.gate_up else null;
         if (gate_up_group) |g| {
-            const block = try c.scratch.alloc(.bf16, g.fused.n);
-            try c.project(block, x, g.fused);
-            gate = try block.slice(g.starts[0], pinned.intermediate);
-            up = try block.slice(g.starts[1], pinned.intermediate);
+            if (c.acc.ops.fuse_swiglu and c.acc.ops.qmm_q4_sg_swiglu != null) {
+                act = try c.scratch.alloc(.bf16, pinned.intermediate);
+                if (vk.ops_q4.projectSwiglu(c.acc.ops, c.cmds, act, x, g.fused.w, g.fused.scales, g.fused.biases, g.fused.k, c.timeout_ns)) {
+                    one_dispatch = true;
+                } else |err| switch (err) {
+                    error.Invalid, error.TooLarge => {}, // fall back to B's two dispatches
+                    else => return err,
+                }
+            }
+            if (!one_dispatch) {
+                const block = try c.scratch.alloc(.bf16, g.fused.n);
+                try c.project(block, x, g.fused);
+                gate = try block.slice(g.starts[0], pinned.intermediate);
+                up = try block.slice(g.starts[1], pinned.intermediate);
+            }
         } else {
             gate = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
             try c.project(gate, x, m.gate);
             up = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
             try c.project(up, x, m.up);
         }
-        const act = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
-        try vk.orExit(c.acc.norm.swiglu(c.cmds, act, gate, up, c.timeout_ns));
+        if (!one_dispatch) {
+            act = try c.scratch.alloc(.bf16, rows * pinned.intermediate);
+            try vk.orExit(c.acc.norm.swiglu(c.cmds, act, gate, up, c.timeout_ns));
+        }
         try c.project(r_out, act, m.down);
         c.scratch.reset(mark) catch {};
     }
