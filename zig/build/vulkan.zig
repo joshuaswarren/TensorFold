@@ -402,7 +402,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         },
     });
     host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = contract_fixture })).step);
-    // The parallel-K fixture's host proofs: stated depth, one-row routing, its controls' checkers, and the shipped kernel source pinned.
+    // The Q4 fixture checks host proofs and pins the shipped kernel source.
     const pk_src_files = b.addWriteFiles();
     _ = pk_src_files.addCopyFile(b.path("zig/kernels/vulkan/qmm_q4_pk.comp"), "qmm_q4_pk.comp");
     const contract_pk_fixture = b.createModule(.{
