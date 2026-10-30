@@ -377,8 +377,7 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("FAIL receipt: cannot write logits_bf16.bin: {s}\n", .{@errorName(e)});
         return 1;
     };
-    // per-token timing of the steady tokens (index s feeds draw s-1 and yields draw s): written after
-    // both runs, never inside a timed sample
+    // per-token timing of steady tokens (s feeds draw s-1, yields s): written after both runs, never inside a sample
     {
         var sw: std.Io.Writer.Allocating = .init(a);
         defer sw.deinit();
@@ -393,7 +392,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         out.writeFile(io, .{ .sub_path = "steady_samples.jsonl", .data = sw.written() }) catch |e| {
-            std.debug.print("FAIL receipt: cannot write steady_samples.jsonl: {s}\n", .{@errorName(e)});
+            std.debug.print("FAIL: cannot write steady_samples.jsonl: {s}\n", .{@errorName(e)});
             return 1;
         };
     }
@@ -441,18 +440,7 @@ pub fn main(init: std.process.Init) !u8 {
     return if (match_a and match_b and ids_equal and logits_equal) 0 else 1;
 }
 
-/// One greedy run over the fresh state: whole-prompt prefill (the engine
-/// chunks it canonically into 32-row pieces; --sequential-prefill instead
-/// issues one Engine.prefill call per prompt token for the boundary
-/// evidence), then exactly `ids_out.len` draws, every id selected by the GPU
-/// argreduce and recorded as drawn. Free-running (the default and the
-/// anchor) feeds each draw back; the teacher-forced mode feeds the oracle's
-/// own id for the step just scored as the next input — a labelled per-step
-/// check, never a free-running chain proof.
-/// One steady token's wall time. The sample covers the whole token: the clock starts before the
-/// first host action of the fed token and stops only after the chosen id AND the full logits row
-/// are in host memory. An engine with the combined `decodeDraw` runs it as one submit; one without
-/// runs its separate decode, GPU draw and logits readback inside the same timed span.
+/// Greedy run: prefill and argmax draws; steady samples time each fed token through id and logits readback.
 pub const SteadySample = struct {
     s: u64, // steady sample index 1..N-1
     fed_index: u64, // the drawn id fed back: s-1
@@ -486,14 +474,7 @@ fn steadyToken(io: std.Io, e: *Engine, s: u64, token: u32, row: []u8) !SteadySam
     };
 }
 
-/// One greedy run over the fresh state: whole-prompt prefill (the engine
-/// chunks it canonically into 32-row pieces; --sequential-prefill instead
-/// issues one Engine.prefill call per prompt token for the boundary
-/// evidence), then the first draw and its logits row, then `ids_out.len - 1` timed steady tokens, every
-/// id selected by the GPU argreduce and recorded as drawn. Free-running (the default and the
-/// anchor) feeds each draw back; the teacher-forced mode feeds the oracle's
-/// own id for the step just scored as the next input - a labelled per-step
-/// check, never a free-running chain proof.
+/// One greedy run: prefill, first draw and logits row, then the timed steady tokens; teacher-forced is per-step.
 fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const u32, expected: []const u32, ids_out: []u32, rows_out: []u8, row_len: usize, samples_out: []SteadySample, io: std.Io) !void {
     if (samples_out.len != ids_out.len - 1) return error.Invalid;
     if (sequential) {

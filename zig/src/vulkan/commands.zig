@@ -14,12 +14,7 @@ pub const Commands = struct {
     pool: c.VkCommandPool,
     cmd: c.VkCommandBuffer,
     fence: c.VkFence,
-    // Batch session: when `session` is set, begin() hands out the already
-    // open command buffer and submit() is a no-op, so every op wrapper only
-    // records; endBatch performs the one flush/submit/fence cycle. Staging
-    // slices are bump-allocated per batch (never offset 0 twice) and every
-    // recorded readback lands in its own down slice, read only after the
-    // batch's fence.
+    // Batch session: begin() hands out the open buffer, submit() is a no-op, endBatch does the one flush/submit/fence.
     session: bool = false,
     lifecycle: BatchLifecycle = .{},
     ledger: BatchLedger = .{},
@@ -56,9 +51,7 @@ pub const Commands = struct {
         self.* = undefined;
     }
 
-    /// The command buffer, reset and begun for one submission. Inside an
-    /// open batch this is the batch's already-begun command buffer: no reset,
-    /// no second begin, no second packed record.
+    /// The command buffer, reset and begun for one submission; in an open batch it is the batch's already-begun buffer.
     pub fn begin(self: *Commands) Error!c.VkCommandBuffer {
         if (self.session) return self.cmd;
         try check(self.dev.api.vkResetCommandBuffer(self.cmd, 0));
@@ -71,15 +64,13 @@ pub const Commands = struct {
     }
 
     /// Finite fence wait; Timeout/InFlight require orExit to avoid freeing resources the GPU may still use.
-    /// Inside an open batch this records nothing and submits nothing: the
-    /// batch's endBatch performs the single physical submit and fence wait.
+    /// Inside an open batch this records and submits nothing; endBatch makes the single submit and fence wait.
     pub fn submit(self: *Commands, timeout_ns: u64) Error!void {
         if (self.session) return;
         try self.submitAndWait(timeout_ns);
     }
 
-    /// The physical submission path: end, one vkQueueSubmit, one finite
-    /// fence wait, fence reset. Only ever called with no batch session open.
+    /// Physical submission: end, one vkQueueSubmit, one finite fence wait, fence reset; only with no batch open.
     fn submitAndWait(self: *Commands, timeout_ns: u64) Error!void {
         const api = &self.dev.api;
         try check(api.vkEndCommandBuffer(self.cmd));
@@ -103,13 +94,7 @@ pub const Commands = struct {
 
     // ------------------------------------------------ batch session
 
-    /// Opens a batch: one reset+begin and fresh staging ledgers against `staging`. Nested batches
-    /// are refused. The physical reset+begin happens BEFORE the session and
-    /// the global batch contexts are considered open, and any begin failure
-    /// rolls those contexts back, so recording never rides a stale command
-    /// buffer. Batched descriptor banks key on the new epoch, so every
-    /// pipeline's snapshot cursor restarts only here — always after the
-    /// previous batch's fence has been waited.
+    /// Opens a batch: one reset+begin and fresh staging ledgers; nesting refused; failure rolls the contexts back.
     pub fn beginBatch(self: *Commands, staging: Buffer) Error!void {
         if (self.session) return error.Invalid;
         if (staging.dev != self.dev or staging.kind != .staging or staging.mapped == null) return error.Invalid;
@@ -131,13 +116,7 @@ pub const Commands = struct {
         self.batch_staging = staging;
     }
 
-    /// Records the one physical submission of the open batch: the staging
-    /// flush, one end/submit/fence-wait cycle for the whole token, then the
-    /// staging invalidate so the host can read the down slices. The batch
-    /// contexts close on EVERY path — a pre-submit flush/end/submit failure
-    /// unconditionally closes them, so the next call starts clean; the fence
-    /// discipline is unchanged (Timeout/InFlight still demand orExit at the
-    /// call site).
+    /// The batch's one submission: staging flush, one end/submit/fence cycle, invalidate; contexts close on every path.
     pub fn endBatch(self: *Commands, timeout_ns: u64) Error!void {
         if (!self.session) return error.Invalid;
         self.session = false;
@@ -148,11 +127,7 @@ pub const Commands = struct {
         try self.batch_staging.invalidate(); // device writes visible to the host, after the fence
     }
 
-    /// Abandons an open batch after a pre-submit recording error: nothing
-    /// was submitted, so a discard is clean. The next begin resets the
-    /// command buffer anyway; the ledger restarts at the next beginBatch.
-    /// The engine's poison rule (a failure after the first state write is
-    /// never reused without a real reset) is unchanged and caller-owned.
+    /// Abandons an open batch after a pre-submit recording error: nothing was submitted, so the discard is clean.
     pub fn abortBatch(self: *Commands) void {
         if (!self.session) return;
         self.session = false;
@@ -160,11 +135,7 @@ pub const Commands = struct {
         self.lifecycle.finish();
     }
 
-    /// The host side of a recorded down slice: copy `out.len` bytes from the
-    /// batch staging at `at` after endBatch's fence. Only a slice a
-    /// batchDownload recorded in THIS batch, at exactly its recorded offset
-    /// and length, is readable — anything else refuses before the mapping is
-    /// touched, so a stale or torn host read is impossible by construction.
+    /// Only a batchDownload slice recorded in this batch, at its exact offset and length, is readable after the fence.
     pub fn readDown(self: *Commands, at: u64, out: []u8) Error!void {
         if (self.session) return error.Invalid; // never read staging mid-batch
         for (self.ledger.downs[0..self.ledger.down_n]) |d| {
@@ -176,10 +147,7 @@ pub const Commands = struct {
     }
 };
 
-/// The pure ordering contract of a batch's lifecycle, host-tested: the
-/// physical command-buffer begin happens at most once per batch and never
-/// zero times before recording, nesting refuses, and every path out of the
-/// batch clears the open/begun state so the next batch starts clean.
+/// Pure ordering contract of a batch lifecycle, host-tested: begin at most once, never zero times, nesting refuses.
 pub const BatchLifecycle = struct {
     open: bool = false,
     begun: bool = false,
@@ -203,9 +171,7 @@ pub const BatchLifecycle = struct {
     }
 };
 
-/// The pure ledger behind a batch's staging slices: every upload and every
-/// recorded readback gets its own immutable slice, in order, never
-/// overlapping, never past the staging buffer. Pure and host-tested.
+/// Pure ledger for batch staging slices: each upload and readback gets an immutable, nonoverlapping slice.
 pub const max_batch_downs: u32 = 4;
 
 pub const BatchSlice = struct { at: u64, len: u64 };
@@ -216,8 +182,7 @@ pub const BatchLedger = struct {
     downs: [max_batch_downs]BatchSlice = undefined,
     down_n: u32 = 0,
 
-    /// Reserves the next upload slice at the bump cursor; a range past the
-    /// staging buffer refuses before any host write.
+    /// Reserves the next upload slice at the bump cursor; a range past the staging buffer refuses before a host write.
     pub fn reserveUp(self: *BatchLedger, len: u64) Error!u64 {
         try memory.span(self.capacity, self.up, len);
         const at = self.up;
@@ -225,8 +190,7 @@ pub const BatchLedger = struct {
         return at;
     }
 
-    /// Reserves the next readback slice, distinct from every other slice in
-    /// the batch; refuses when the batch needs more than max_batch_downs.
+    /// Reserves the next readback slice, distinct from every other slice in the batch; refuses past max_batch_downs.
     pub fn reserveDown(self: *BatchLedger, len: u64) Error!u64 {
         if (self.down_n >= max_batch_downs) return error.OutOfRange;
         const at = try self.reserveUp(len);
@@ -317,9 +281,7 @@ pub fn operands(dev: *const Device, buf: Buffer, staging: Buffer, offset: u64, n
 }
 
 /// `bytes` into `dst` at `offset` through `staging`, a chunk a submission; later dispatches and copies see them.
-/// Inside an open batch the bytes go into a fresh immutable staging slice
-/// (never offset 0 twice) and only the copy is recorded — the batch's
-/// single submit moves them all at once.
+/// Inside an open batch the bytes go into a fresh immutable staging slice and only the copy is recorded.
 pub fn upload(cmds: *Commands, dst: Buffer, offset: u64, staging: Buffer, bytes: []const u8, timeout_ns: u64) Error!void {
     try operands(cmds.dev, dst, staging, offset, bytes.len);
     const host = try staging.bytes();
@@ -350,10 +312,7 @@ pub fn upload(cmds: *Commands, dst: Buffer, offset: u64, staging: Buffer, bytes:
     }
 }
 
-/// Records, into the OPEN batch, a copy of `len` bytes of `src` at `src_offset`
-/// into a fresh immutable staging slice, with the download's existing barrier
-/// to the host stage. No submit here; the host reads the returned offset only
-/// after endBatch's fence, through readDown.
+/// Records into the OPEN batch a copy of `len` bytes of `src` into a fresh staging slice; read it via readDown.
 pub fn batchDownload(cmds: *Commands, src: Buffer, src_offset: u64, len: u64) Error!u64 {
     if (!cmds.session) return error.Invalid;
     try operands(cmds.dev, src, cmds.batch_staging, src_offset, len);
@@ -367,9 +326,7 @@ pub fn batchDownload(cmds: *Commands, src: Buffer, src_offset: u64, len: u64) Er
 }
 
 /// `out.len` bytes of `src` from `offset` through `staging`, after every earlier dispatch or copy that wrote them.
-/// Refused inside an open batch: its submit would be a no-op and the copy
-/// below would read stale bytes — a batched token reads its recorded down
-/// slices only after endBatch's fence, through readDown.
+/// Refused inside an open batch: its submit would be a no-op and the copy would read stale bytes.
 pub fn download(cmds: *Commands, src: Buffer, offset: u64, staging: Buffer, out: []u8, timeout_ns: u64) Error!void {
     if (cmds.session) return error.Invalid;
     try operands(cmds.dev, src, staging, offset, out.len);
@@ -496,8 +453,7 @@ test "a synchronous download refuses inside an open batch and readDown takes onl
     try std.testing.expectEqual(@as(u64, 0), at);
     try std.testing.expectError(error.Invalid, cmds.readDown(4, &out)); // wrong offset
     try std.testing.expectError(error.Invalid, cmds.readDown(0, out[0..11])); // wrong length
-    // the exact recorded slice passes the ledger gate (then fails on the
-    // unmapped fake staging, proving the guard is what let it through)
+    // the recorded slice passes the ledger gate, then fails on the unmapped fake staging: the guard let it through
     cmds.batch_staging = .{ .dev = undefined, .handle = null, .memory = null, .len = 64, .kind = .staging, .mapped = null, .coherent = false };
     try std.testing.expectError(error.NotMapped, cmds.readDown(0, &out));
 }
