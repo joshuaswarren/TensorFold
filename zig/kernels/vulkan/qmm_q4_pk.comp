@@ -1,18 +1,8 @@
 #version 460
 
-// Q4 projection, one 64-lane workgroup per output (row, column), parallel over K. Lane l walks the row's
-// packed words l, l+64, ... in ascending order. The 8 elements of one packed word are summed with plain
-// left-associated f32 adds (psum += x * (scale * q + bias), precise: the order is as written, no fused
-// multiply-add); ONE Neumaier fold per pack carries the pack sum into the lane's (hi, lo) pair; a fixed
-// shared-memory tree of TwoSum merges folds the 64 lanes (strides 32, 16, 8, 4, 2, 1, a barrier between
-// levels, no subgroup ops, no atomics); lane 0 adds low to high once and stores with the repo's bf16
-// RNE. The grid-stride over outputs keeps every barrier in uniform control flow.
-//
-// Not bit-identical to the previous kernel (which compensated every element): the in-pack sum is plain,
-// so each pack sum carries up to 7 ordinary f32 roundings (about 1e-7 relative) that the per-element
-// chain caught. The contract states this kernel's depth as 8 * ceil(k / 512) + 17 roundings (49 at K 2048).
+// Q4, 64 lanes per output: plain in-pack f32 adds, one Neumaier fold per pack, fixed TwoSum tree, bf16 RNE store.
 
-// Copyright (c) 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
+// Copyright © 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
 
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require

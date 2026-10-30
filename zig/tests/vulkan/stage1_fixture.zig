@@ -266,12 +266,7 @@ fn packFoldLane(sums: []const f32) f32 {
     return partial + comp;
 }
 
-/// The qmm_q4_pk kernel's exact host association for output (r, j): lane l walks the row's packs l, l+64, ...;
-/// the 8 elements of a pack are summed with plain f32 adds in ascending order (the qmm.comp expression for
-/// each term), ONE Neumaier fold per pack goes into the lane's (hi, lo); the shared-memory tree folds the 64
-/// pairs at strides 32, 16, 8, 4, 2, 1 with TwoSum; lane 0 adds low to high (a non-finite high keeps its
-/// class) and returns the bf16 bits it stores. Reads the fixture's uploaded bindings at their offsets, so a
-/// row's value depends only on that row's x and its column's w, never on the batch's m.
+/// Host association for output (r, j): plain in-pack sums, one fold per pack, TwoSum tree, bf16 store.
 pub fn pkOutput(f: Fixture, r: usize, j: usize) u16 {
     const s = f.case.shape;
     var hi: [64]f32 = @splat(0);
@@ -546,8 +541,7 @@ test "pk compensation: the end guard keeps the float64 class at every non-finite
 }
 
 test "the pk host emulation follows the pack-level compensation, not the plain chain" {
-    // three pack sums 1e8, 1, -1e8: the plain chain loses the 1 against 1e8 and ends at 0, the fold keeps
-    // the lost low part and ends at the exact 1.
+    // three pack sums 1e8, 1, -1e8: the plain chain ends at 0, the fold keeps the exact 1.
     const sums = [_]f32{ 1.0e8, 1.0, -1.0e8 };
     try testing.expectEqual(@as(f32, 0.0), plainPkLane(&sums));
     try testing.expectEqual(@as(f32, 1.0), packFoldLane(&sums));
