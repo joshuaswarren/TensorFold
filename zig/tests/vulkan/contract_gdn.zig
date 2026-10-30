@@ -1,4 +1,4 @@
-//! Stage 4 tests use Qwen3.5 (16 heads, head_dim 128, 6144 channels, 4 taps), f32 state, snapshots, 130-rounding depth.
+// Stage 4 Qwen3.5: 16 heads, dk 128, 6144 ch, 4 taps; f32 state; snapshots only for chunks>1; ~130 rounds/token.
 const std = @import("std");
 const vk = @import("vulkan");
 const contract = @import("contract");
@@ -34,14 +34,14 @@ fn gateDepth(_: c.Shape) usize {
 fn tapsDepth(_: c.Shape) usize {
     return taps;
 }
-/// Recurrence depth adds about 130 f32 roundings per token plus one output-dot depth; stage 4 derives 130 per update.
+// Recurrence depth adds about 130 f32 roundings per token plus one output-dot depth; stage 4 derives 130 per update.
 fn recurYDepth(s: c.Shape) usize {
     return s.rows * 130 + 130;
 }
 fn recurStateDepth(s: c.Shape) usize {
     return s.rows * 130 + 2;
 }
-/// Decode repeats prefill per-token depth; each 130-rounding step includes the 4-op raw-gates prologue.
+// Decode repeats prefill per-token depth; each 130-rounding step includes the 4-op raw-gates prologue.
 fn decodeYDepth(s: c.Shape) usize {
     return s.rows * 260 + 130;
 }
@@ -173,7 +173,7 @@ fn putF32(pairs: []u16, word: usize, v: f32) void {
     pairs[2 * word + 1] = @truncate(bits >> 16);
 }
 
-/// `walk` uses f64 for null `acc`; it writes y/state, snapshots at `(t+1)/chunk-1`, and tracks pre-update `max_state`.
+// `walk` matches fx.RecurWalk/fx.Decode bitwise (null `acc`=f64); writes y/state, snapshots, pre-update `max_state`.
 pub fn walk(
     tokens: usize,
     soa_bits: []const u16,
@@ -233,7 +233,7 @@ fn seq(terms: []const f64) f64 {
     return sum;
 }
 
-/// Split bounds use `want/mag`: soa then beta; mag is row `vmax^2` for soa and `|want|` for beta.
+// Split bounds use `want/mag`: soa then beta; mag is row `vmax^2` for soa and `|want|` for beta.
 pub fn splitReference(
     tokens: usize,
     conv_out_bits: []const u16,
@@ -276,7 +276,7 @@ pub fn splitReference(
     }
 }
 
-/// Conv uses `in_word` on state then projection rows; it writes T rows and shifted carry when `want_state` is set.
+// Conv uses `in_word` on state then projection rows; it writes T rows and shifted carry when `want_state` is set.
 pub fn convReference(
     tokens: usize,
     weight_bits: []const u16,
@@ -447,7 +447,7 @@ pub const Gdn = struct {
         return f.arena.allocator().alloc(f64, n);
     }
 
-    /// `devBuf` uploads input `bytes` or poisons output `poison_bytes`, registers cleanup, and returns its index.
+    // `devBuf` uploads input `bytes` or poisons output `poison_bytes`, registers cleanup, and returns its index.
     fn devBuf(f: *Gdn, bytes: []const u8) !usize {
         const b = try vk.Buffer.init(f.dev, .device, bytes.len);
         f.bufs[f.made] = b;
@@ -473,7 +473,7 @@ pub const Gdn = struct {
         }
     }
 
-    /// Gate 1 plants NaN and ±inf in token row 1; finite per-head `a_log`/`dt`/`weight` stop one class masking outputs.
+    // Gate 1 plants NaN and ±inf in token row 1; finite per-head `a_log`/`dt`/`weight` stop one class masking outputs.
     fn plantNonfinite(f: *Gdn, rng: std.Random) !void {
         const T = f.tokens;
         const word = [_]u16{ 0x7fc0, 0x7f80, 0xff80 }; // NaN, +inf, -inf
@@ -524,7 +524,7 @@ pub const Gdn = struct {
         _ = rng;
     }
 
-    /// F32 dyadic sums are order-exact below 2^24; fp16 misses by thousands, while bf16 `v` pins state with tiny delta.
+    // F32 dyadic sums are order-exact below 2^24; fp16 misses by thousands, while bf16 `v` pins state with tiny delta.
     fn fillStress(f: *Gdn) void {
         const T = f.tokens;
         switch (f.which) {
@@ -610,7 +610,7 @@ pub const Gdn = struct {
         }
     }
 
-    /// `prepareHost` refuses shapes, generates fills, and computes references without a device for host tests.
+    // `prepareHost` refuses shapes, generates fills, and computes references without a device for host tests.
     fn prepareHost(f: *Gdn, shape: c.Shape, fill: g.Fill, seed: u64) !?usize {
         if (shape.rows == 0 or shape.n != heads or shape.k != dk or shape.rows > max_tokens) return null;
         f.reset();
@@ -824,14 +824,14 @@ pub const Gdn = struct {
         }
     }
 
-    /// `outWords` uses fetched outputs' `out` slice or poison scratch; bad bounds report gate errors, not panics.
+    // `outWords` uses fetched outputs' `out` slice or poison scratch; bad bounds report gate errors, not panics.
     fn outWords(f: *Gdn, checked: bool, start: usize, words: usize) ![]u16 {
         if (!checked) return f.allocU16(words, poison);
         if (start > f.out_words or words > f.out_words - start) return error.OutputRegionOutOfRange;
         return f.out[start .. start + words];
     }
 
-    /// `uploadWords` orders input bits/output poison; checked outputs use sized `out`, others fresh scratch.
+    // `uploadWords` orders input bits/output poison; checked outputs use sized `out`, others fresh scratch.
     fn uploadWords(f: *Gdn, buf: *[16][]u16) !usize {
         const T = f.tokens;
         var n: usize = 0;
@@ -890,14 +890,14 @@ pub const Gdn = struct {
         return n;
     }
 
-    /// `uploadWords`/`run` share indices; `out` poison catches dead stores, and other outputs use fresh scratch.
+    // `uploadWords`/`run` share indices; `out` poison catches dead stores, and other outputs use fresh scratch.
     fn uploadBuffers(f: *Gdn) !void {
         var words: [16][]u16 = undefined;
         const n = try f.uploadWords(&words);
         for (words[0..n]) |w| _ = try f.devBuf(std.mem.sliceAsBytes(w));
     }
 
-    /// `computeWant` builds f64 `want/mag` from bits before device work; `reference()` returns the prepared copy.
+    // `computeWant` builds f64 `want/mag` from bits before device work; `reference()` returns the prepared copy.
     fn computeWant(f: *Gdn) !void {
         const T = f.tokens;
         switch (f.which) {
@@ -1047,7 +1047,7 @@ pub const Gdn = struct {
         return soa_v.slice(t * 3 * linear_dim, 3 * linear_dim);
     }
 
-    /// Fetch checked outputs, reread inputs for unchanged checks, then verify guard words.
+    // Fetch checked outputs, reread inputs for unchanged checks, then verify guard words.
     fn fetchOutputs(f: *Gdn) !void {
         const T = f.tokens;
         switch (f.which) {
@@ -1126,7 +1126,7 @@ pub const Gdn = struct {
         }
     }
 
-    /// Gate 4 replays each dot in `accum`/`order`, sums other ops in f64, and writes `out` in `reference()` layout.
+    // Gate 4 replays each dot in `accum`/`order`, sums other ops in f64, and writes `out` in `reference()` layout.
     pub fn simulate(f: *Gdn, accum: c.Accum, order: g.Order, out: []f64) !void {
         const T = f.tokens;
         switch (f.which) {
@@ -1210,7 +1210,7 @@ pub const Gdn = struct {
         }
     }
 
-    /// Bounds use stage 4 depth/ops/mids and magnitude scales: `max_state`, row `vmax^2`, `|acc|`, and `|want|`.
+    // Bounds use stage 4 depth/ops/mids and magnitude scales: `max_state`, row `vmax^2`, `|acc|`, and `|want|`.
     pub fn bounds(f: *Gdn, want: []const f64, mag: []const f64, allow: []f64) !void {
         switch (f.which) {
             .split_soa => for (want, mag, allow) |w, m, *l| {
@@ -1249,7 +1249,7 @@ pub const Gdn = struct {
 
 const testing = std.testing;
 
-/// Host fixtures need a real allocator; device fields stay untouched because host tests never call `uploadBuffers`.
+// Host fixtures need a real allocator; device fields stay untouched because host tests never call `uploadBuffers`.
 fn hostFixture(which: Which) Gdn {
     return Gdn.init(testing.allocator, undefined, undefined, undefined, undefined, which);
 }
@@ -1536,7 +1536,7 @@ test "gdn contract stress keeps f32 sums exact and makes fp16 miss by over 100x"
     try testing.expect(worst >= 100);
 }
 
-/// Buffer `i` takes `out` words iff a checked output is fetched there.
+// Buffer `i` takes `out` words iff a checked output is fetched there.
 fn expectOut(which: Which, i: usize, chunks: usize) bool {
     return switch (which) {
         .split_soa => i == 5 or i == 7,

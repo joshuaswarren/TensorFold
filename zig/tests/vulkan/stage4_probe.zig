@@ -1,4 +1,4 @@
-// Stage 4 bring-up: GatedDeltaNet (conv prefill, gate split, recurrence, raw-gates decode, gated RMSNorm) via Gdn.
+// Stage 4: GatedDeltaNet (conv prefill, gate split, recurrence, raw-gates decode, RMSNorm) via Gdn; exits 0/1/2/124.
 const std = @import("std");
 const vk = @import("vulkan");
 const shaders = @import("stage4_shaders");
@@ -179,7 +179,7 @@ fn plantRefuse2(f: anytype, good: []const u16, extra: []const u16, name: []const
     return true;
 }
 
-// convPrefill: the conv input (state then qkv) and the state carry-out are BIT-EXACT; the split's soa/g/beta vs f64.
+// convPrefill: conv input + state carry-out BIT-EXACT; conv output and split soa/g/beta vs f64; repeats and refusals.
 fn convSplitGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, m: *vk.Gdn, timeout: u64) !bool {
     const T = fx.tokens;
     const C: u64 = fx.Model.conv_channels;
@@ -726,7 +726,7 @@ fn printRecurInputs(f: fx.Split, v: fx.Violation, final_token: u64) void {
     printGateInputs(f.a_bits, f.b_bits, f.a_log_bits, f.dt_bits, token * 16 + head);
 }
 
-// The compound convDecodeStep gate: one token's concat(state, x) 4-tap conv vs an f64 reference; carry-out bit-exact.
+// convDecodeStep: 4-tap conv vs f64 (raw store; split owns SiLU); carry-out bit-exact; split ACTUAL bits vs SplitOne.
 fn convDecodeGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, m: *vk.Gdn, timeout: u64) !bool {
     const C: u64 = fx.Model.conv_channels;
     const linear: u64 = fx.Model.linear_dim;

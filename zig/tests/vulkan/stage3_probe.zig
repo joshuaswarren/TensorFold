@@ -1,4 +1,4 @@
-//! Stage 3 tests GPU RoPE, flat KV, causal GQA SDPA, and Attention; it exits 0/1/2/124 and makes no model claims.
+// Stage 3 GPU bring-up: RoPE/KV/GQA SDPA/gate; exits 0/1/2/124; no model, perf or cross-backend bitexact claim.
 const std = @import("std");
 const vk = @import("vulkan");
 const shaders = @import("stage3_shaders");
@@ -22,7 +22,7 @@ const Elapsed = struct {
 };
 
 const repeats = 3;
-/// Large FINITE bf16 (≈ max) poisons non-visible keys; uncausal reads produce ±inf/huge and fail checks.
+// Large FINITE bf16 (≈ max) poisons non-visible keys; uncausal reads produce ±inf/huge and fail checks.
 const finite_poison: u16 = 0x7f7f;
 
 pub fn main(init: std.process.Init) !u8 {
@@ -126,7 +126,7 @@ fn unchanged(a: std.mem.Allocator, cmds: *vk.Commands, staging: vk.Buffer, shell
     return std.mem.indexOfDiff(u16, shell, back) == null;
 }
 
-/// Rope checks dispatch, 3 bit-identical repeats, f64 reference, wrong-finite/nonfinite refusals, and unchanged input.
+// Rope checks dispatch, 3 bit-identical repeats, f64 reference, wrong-finite/nonfinite refusals, and unchanged input.
 fn ropeGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, attn: *vk.Attention, case: fx.RopeCase, timeout: u64) !bool {
     const f = try fx.Rope.init(a, case, 0x57a3);
     defer f.deinit();
@@ -181,7 +181,7 @@ fn ropeGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *
     return true;
 }
 
-/// Poison a downloaded GOOD copy with wrong finite then nan/+inf/-inf at the first finite-want element; refuse all.
+// Poison a downloaded GOOD copy with wrong finite then nan/+inf/-inf at the first finite-want element; refuse all.
 fn plantRefuse(f: anytype, good: []const u16, name: []const u8, gate: []const u8) !bool {
     const mutated = try f.a.dupe(u16, good);
     defer f.a.free(mutated);
@@ -208,7 +208,7 @@ fn plantRefuse(f: anytype, good: []const u16, name: []const u8, gate: []const u8
     return true;
 }
 
-/// CacheKV checks f64 rope/V bits; SDPA checks counts, NaN/finite/zero causality, repeats, refusals, unchanged inputs.
+// CacheKV checks f64 rope/V bits; SDPA checks counts, NaN/finite/zero causality, repeats, refusals, unchanged inputs.
 fn attendGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, attn: *vk.Attention, timeout: u64) !bool {
     const ac = fx.attend_case;
     const cc = fx.cache_case;
@@ -349,7 +349,7 @@ fn attendGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds:
     return true;
 }
 
-/// Interleaved output repeats 3 times, matches f64, refuses plants, and leaves both inputs unchanged.
+// Interleaved output repeats 3 times, matches f64, refuses plants, and leaves both inputs unchanged.
 fn gateGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, attn: *vk.Attention, timeout: u64) !bool {
     const case = fx.gate_case;
     const f = try fx.Gate.init(a, case, 0x57a6);

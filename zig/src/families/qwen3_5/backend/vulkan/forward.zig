@@ -1,4 +1,4 @@
-//! Single-sequence Qwen3.5-2B Vulkan matches Ash8c Metal: 24 layers (18 GatedDeltaNet, 6 full attention every 4th).
+// Single-sequence Qwen3.5-2B Vulkan matches Ash8c Metal (24 layers: 18 GDN, 6 attention); GPU calls via vk.orExit.
 const std = @import("std");
 const vk = @import("vulkan");
 const pinned = @import("../../config.zig");
@@ -8,7 +8,7 @@ const state = @import("state.zig");
 const Arena = vk.arena.Arena;
 const View = vk.tensor.View;
 
-/// Whole-prompt rows are split into dispatch chunks capped here; persistent windows use this cap.
+// Whole-prompt rows are split into dispatch chunks capped here; persistent windows use this cap.
 pub const max_prefill_rows: usize = 32;
 /// The GDN prefill scan's chunk cap (chunks of 1 when a prefill fits one).
 pub const max_gdn_chunk: u64 = 32;
@@ -28,7 +28,7 @@ pub const Acc = struct {
     gdn: *vk.Gdn,
 };
 
-/// `Core` borrows commands, staging, operators, scratch and fence timeout; the owner owns the arena and every view.
+// `Core` borrows commands, staging, operators, scratch and fence timeout; the owner owns the arena and every view.
 pub const Core = struct {
     cmds: *vk.Commands,
     staging: vk.Buffer,
@@ -41,7 +41,7 @@ pub const Core = struct {
         try vk.orExit(vk.ops_q4.project(c.acc.ops, c.cmds, out, x, q.w, q.scales, q.biases, q.k, c.scratch, c.timeout_ns));
     }
 
-    /// Fused norm rounds the bf16 residual add (`h = bf16(H + R)`) before raw-gain RMSNorm into `out`.
+    // Fused norm: bf16 residual add (`h = bf16(H + R)`) out of place into `sum`, then raw-gain RMSNorm into `out`.
     pub fn addNorm(c: *const Core, out: View, sum: View, h: View, r: View, gain: View, rows: usize) !void {
         try vk.orExit(c.acc.norm.add(c.cmds, sum, h, r, c.timeout_ns));
         try vk.orExit(c.acc.norm.rmsNorm(c.cmds, out, sum, gain, rows, pinned.hidden, pinned.eps, c.timeout_ns));
@@ -52,7 +52,7 @@ pub const Core = struct {
         try vk.orExit(c.acc.norm.rmsNorm(c.cmds, out, h, gain, rows, pinned.hidden, pinned.eps, c.timeout_ns));
     }
 
-    /// `extractQueries` reads `qraw[d + k * 512]`, `k = row * 8 + head`, matching `qwen35_head_norm` source indexing.
+    // `extractQueries` reads `qraw[d + k * 512]`, `k = row * 8 + head`, matching `qwen35_head_norm` source indexing.
     pub fn extractQueries(c: *const Core, q_out: View, qraw: View, rows: usize) !void {
         const plan = extractQPlan(rows, q_out.elements, qraw.elements) orelse return error.Invalid;
         try c.acc.ops.copy_u16.bind(&.{ qraw.bind(), c.acc.ops.dummyBinding(), q_out.bind(), c.acc.ops.dummyBinding() });
@@ -66,7 +66,7 @@ pub const Core = struct {
         try vk.orExit(c.acc.ops.copy_u16.run(c.cmds, std.mem.asBytes(&p), vk.ops.dispatchGroups(plan.count, c.acc.ops.copy_u16.local[0]), c.timeout_ns));
     }
 
-    /// Attention uses Q/K/V, gamma (256), RoPE, KV at `base`, causal GQA SDPA and gate/O; `r_out` cannot alias reads.
+    // Attention uses Q/K/V, gamma (256), RoPE, KV at `base`, causal GQA SDPA and gate/O; `r_out` cannot alias reads.
     pub fn fullLayer(c: *const Core, x: View, layer: weights.FullLayer, s: *state.State, slot: usize, rows: usize, r_out: View, base: u64) !void {
         const mark = c.scratch.mark();
         errdefer c.scratch.reset(mark) catch {};
@@ -95,7 +95,7 @@ pub const Core = struct {
         c.scratch.reset(mark) catch {};
     }
 
-    /// GatedDeltaNet runs qkv/z/a/b, raw-BF16 conv, gates and recurrence; one-row prefill preserves decode rounding.
+    // GDN runs qkv/z/a/b, raw-BF16 conv, gates/recurrence; one-row prefill preserves rounding; slot flips after writes.
     pub fn linearLayer(c: *const Core, x: View, layer: weights.LinearLayer, s: *state.State, slot: usize, rows: usize, r_out: View) !void {
         const mark = c.scratch.mark();
         errdefer c.scratch.reset(mark) catch {};
@@ -123,7 +123,7 @@ pub const Core = struct {
         c.scratch.reset(mark) catch {};
     }
 
-    /// The dense MLP: Q4 gate and up projections, the ASH single-round SwiGLU, and the Q4 down projection into `r_out`.
+    // The dense MLP: Q4 gate and up projections, the ASH single-round SwiGLU, and the Q4 down projection into `r_out`.
     pub fn mlp(c: *const Core, x: View, rows: usize, m: weights.DenseMlp, r_out: View) !void {
         const mark = c.scratch.mark();
         errdefer c.scratch.reset(mark) catch {};
@@ -137,7 +137,7 @@ pub const Core = struct {
         c.scratch.reset(mark) catch {};
     }
 
-    /// The last row gets residual add, raw-gain norm, and tied embedding or separate `lm_head` for greedy draw.
+    // The last row gets residual add, raw-gain norm, and tied embedding or separate `lm_head` for greedy draw.
     pub fn finish(c: *const Core, sum: View, h: View, r: View, x: View, final_norm: View, head: weights.Quant, logits: View, rows: usize) !void {
         try vk.orExit(c.acc.norm.add(c.cmds, sum, h, r, c.timeout_ns));
         const last = (rows - 1) * pinned.hidden;
@@ -149,7 +149,7 @@ pub const Core = struct {
     }
 };
 
-/// `extractQPlan` is null on torn views; `dim=head_dim`, `heads_rows=rows*query_heads`, `in_head_stride=2*head_dim.
+// `extractQPlan` is null on torn views; pure, host-tested; `heads_rows=rows*query_heads`, `in_head_stride=2*head_dim`.
 pub const ExtractQPlan = struct { count: u32, dim: u32, heads_rows: u32, in_head_stride: u32 };
 
 pub fn extractQPlan(rows: usize, out_elements: u64, in_elements: u64) ?ExtractQPlan {

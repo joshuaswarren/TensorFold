@@ -9,7 +9,7 @@ const fx = @import("contract_gdn.zig");
 const g = core.gates;
 const records = core.vulkan_records;
 
-// Shared: conv 0, conv decode 256*4, split 32*4, prefill [2][DK] 6*128*4, decode 3*128*4+32*129*4, norm 1KiB, copy 0.
+// Shared bytes as each shader source declares (stage 4 doc block + prefill [2][DK] staging); values on the next line
 const shared_bytes = [7]u64{ 0, 1024, 128, 3072, 3 * 128 * 4 + 32 * 129 * 4, 1024, 0 };
 const shared_names = [7][]const u8{ "copy_u16", "conv_dw1d_bf16", "gdn_conv_decode_bf16", "gdn_split_bf16", "prefill_recur_bf16", "gated_delta_decode_bf16", "fast_norm_gated_bf16" };
 

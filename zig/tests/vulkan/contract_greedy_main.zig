@@ -1,4 +1,4 @@
-// tf-vulkan-greedy-contract tests gates 1-4 on the composed draw; its .nonfinite control must go red; exit 0/1/2/124.
+// Greedy: gates 1-4 on the composed draw; .nonfinite control (HIP tf_ctl_fmax_max mirror) must go red; exit 0/1/2/124.
 const std = @import("std");
 const vk = @import("vulkan");
 const contract = @import("contract");

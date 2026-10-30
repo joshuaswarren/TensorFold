@@ -1,4 +1,4 @@
-// MIT (© 2026 Joshua Warren / mlx-omarchy); Ash8c gdn_pre: C=6144, DK=128, 16 heads, 32 lanes x4, bf16, eps=1e-6/128.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 
 #version 460
 

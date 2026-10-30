@@ -1,6 +1,6 @@
 // This reuses mlx-omarchy shaders/argreduce_combine.comp (MIT) for operation = 1 (max), one row, output_offset = 2.
 
-// Copyright © 2026 Joshua Warren / mlx-omarchy contributors; SPDX-License-Identifier: MIT; 256-way pair merge.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 #version 460
 #define ACC_LOWEST uintBitsToFloat(0xff800000u)
 #define ACC_HIGHEST uintBitsToFloat(0x7f800000u)

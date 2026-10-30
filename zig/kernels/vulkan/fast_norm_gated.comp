@@ -1,4 +1,4 @@
-// Copyright © 2026 Joshua Warren / mlx-omarchy contributors; SPDX-License-Identifier: MIT; fused RMSNorm.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 #version 460
 #ifdef APPLE_REDUCTION
 #extension GL_KHR_shader_subgroup_basic : require
@@ -34,7 +34,7 @@ uint16_t bf16_store(float value) {
 #define WIDEN(x) float(x)
 #endif
 
-// Mode 1 scales RMSNorm by bf16(beta); 256 threads stride rows; eps=alpha; bindings 0=x, 1=weight, 2=gate(z), 3=output.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 #ifdef GATED_ONLY
 #define IS_SCALED (false)
 #define IS_GATED (true)

@@ -1,4 +1,4 @@
-// Copyright © 2026 Joshua Warren / mlx-omarchy contributors; SPDX-License-Identifier: MIT; SwiGLU rounds per op.
+// Four-wide SwiGLU rounds each op; aligned host inputs; optional materialize writes sig/silu buffers.
 
 #version 460
 

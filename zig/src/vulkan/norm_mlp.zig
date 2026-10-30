@@ -1,4 +1,4 @@
-//! BF16 Vulkan RMSNorm/add/SwiGLU use -DUSE_BF16; binary_vec uses defaults, and runtime has no CPU fallback.
+// Norm/SwiGLU build with -DUSE_BF16; binary_vec is bf16 by default (no defines); runtime has no CPU fallback.
 const std = @import("std");
 const dispatch = @import("dispatch.zig");
 const memory = @import("memory.zig");
@@ -10,7 +10,7 @@ const Buffer = memory.Buffer;
 const Error = dispatch.Error;
 const View = tensor.View;
 
-/// SPIR-V: -DUSE_BF16; -DASH_QWEN35 selects Ash8c (default MLX); -DPRESERVE_F32 requires shaderDenormPreserveFloat32.
+// norm/SwiGLU: -DUSE_BF16; -DASH_QWEN35=Ash8c (build-time); -DPRESERVE_F32 needs shaderDenormPreserveFloat32.
 pub const Shaders = struct {
     norm_bf16: []align(4) const u8,
     add_bf16: []align(4) const u8,
@@ -43,7 +43,7 @@ pub const NormMlp = struct {
     norm_bf16: dispatch.Pipeline,
     add_bf16: dispatch.Pipeline,
     swiglu_bf16: dispatch.Pipeline,
-    /// Dummy bindings cover unused fast_norm bias 2 and unmaterialized SwiGLU sigmoid/silu 3,4.
+    // Dummy bindings cover unused fast_norm bias 2 and unmaterialized SwiGLU sigmoid/silu 3,4.
     dummy: Buffer,
 
     /// Builds the three pipelines; the device must have storage16 and int16 for the bf16 paths.
@@ -94,7 +94,7 @@ pub const NormMlp = struct {
         try m.norm_bf16.run(cmds, std.mem.asBytes(&p)[0..norm_push_bytes], g, timeout_ns);
     }
 
-    /// bf16 add is out-of-place; binary_vec loads 4 elements/8 bytes, so count and operands must be divisible by 4.
+    // bf16 add is out-of-place; binary_vec loads 4 elements/8 bytes, so count and operands must be divisible by 4.
     pub fn add(m: *NormMlp, cmds: *Commands, out: View, a: View, b: View, timeout_ns: u64) Error!void {
         if (out.kind != .bf16 or a.kind != .bf16 or b.kind != .bf16) return error.Invalid;
         if (out.elements != a.elements or a.elements != b.elements) return error.Invalid;
@@ -109,7 +109,7 @@ pub const NormMlp = struct {
         try m.add_bf16.run(cmds, std.mem.asBytes(&p)[0..add_push_bytes], try groups(p.count, m.add_bf16.local[0], m.dev.properties.limits.maxComputeWorkGroupCount[0]), timeout_ns);
     }
 
-    /// SwiGLU is 4-wide/out-of-place; bindings 3/4 use materialize=0; ASH_QWEN35 rounds once, MLX fused_chain 3 times.
+    // SwiGLU is 4-wide/out-of-place; bindings 3/4 use materialize=0; ASH_QWEN35 rounds once, MLX fused_chain 3 times.
     pub fn swiglu(m: *NormMlp, cmds: *Commands, out: View, gate: View, up: View, timeout_ns: u64) Error!void {
         if (out.kind != .bf16 or gate.kind != .bf16 or up.kind != .bf16) return error.Invalid;
         if (out.elements != gate.elements or gate.elements != up.elements) return error.Invalid;

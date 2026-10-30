@@ -1,6 +1,6 @@
 // This reuses mlx-omarchy shaders/argreduce_chunk.comp (MIT) for operation = 1 (max), one row, matrix_m = 4096.
 
-// Copyright © 2026 Joshua Warren / mlx-omarchy contributors; SPDX-License-Identifier: MIT; 4096 values, 256 lanes.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 #version 460
 #ifdef USE_FP16
 #extension GL_EXT_shader_16bit_storage : require

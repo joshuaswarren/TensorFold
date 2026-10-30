@@ -1,4 +1,4 @@
-// Stage 2 fixtures check ASH_QWEN35 add/SwiGLU/RMSNorm under fixed budgets, not spec proofs or cross-backend exactness.
+// ASH_QWEN35 add/SwiGLU/RMSNorm fixtures under fixed budgets; nonfinite by class (drivers vary NaN payloads).
 const std = @import("std");
 const contract = @import("contract");
 const c = contract.spec;
@@ -54,9 +54,9 @@ pub const AddFill = enum { random, cancel, classes };
 
 pub const AddCase = struct { name: []const u8, elems: usize, at: Offsets = .{}, fill: AddFill = .random };
 
-// Counts are multiples of four (binary_vec moves four per 8-byte load); offsets 256-byte aligned (128 bf16 elements).
+// Counts %4==0 (binary_vec moves 4/8-byte load); offsets 256B aligned, the largest minStorageBufferOffsetAlignment.
 
-// Add classes: 0x0001..0x007f are bf16 SUBNORMALS (0x0080 the smallest NORMAL); measured properties allow signed zero.
+// 0x0001..0x007f SUBNORMALs (0x0080 smallest NORMAL); measured properties, never vendor names, allow signed zero.
 pub const add_cases = [_]AddCase{
     .{ .name = "random 512", .elems = 512, .at = .{ .a = 128, .b = 256, .out = 384 } },
     .{ .name = "cancel 512", .elems = 512, .at = .{ .a = 128, .b = 256, .out = 384 }, .fill = .cancel },
@@ -250,7 +250,7 @@ pub const Swiglu = struct {
 
 // ---- RMSNorm: contract bound with the reduction budget named ----
 
-// depth = 20 f32 reduction roundings: 2048 takes 8 adds + 8 levels (16), 256 takes 1 + 8; RELATIVE gamma(20).
+// depth = 20: 2048 takes 8 adds + 8 levels (16), 256 1 + 8; the sum is positive, so gamma(20) is relative in any order.
 const rms_depth = 20;
 const rms_spec: c.Spec = .{
     .name = "vulkan fast_norm bf16 rms (ASH_QWEN35 weight*(x*inv))",

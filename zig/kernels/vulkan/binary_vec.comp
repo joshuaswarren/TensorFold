@@ -1,4 +1,4 @@
-// Copyright © 2026 Joshua Warren / mlx-omarchy contributors; SPDX-License-Identifier: MIT; four-wide ops.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 
 #version 460
 

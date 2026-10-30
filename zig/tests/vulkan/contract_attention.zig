@@ -1,4 +1,4 @@
-//! This contract checks rope_bf16 and sdpa_rows_bf16 against stage3_fixture f64; SDPA spans 256 lanes and 7168 keys.
+// Host-only rope/SDPA contract vs f64; fixture caps at 8 keys; shader SDPA uses 256 lanes and 7168-key limit.
 const std = @import("std");
 const contract = @import("contract");
 const c = contract.spec;
@@ -15,7 +15,7 @@ pub const key_tile: u64 = 16; // 16-key output tiles / load batches
 pub const key_stride: u64 = 1024; // threads striding the score scan
 pub const max_visible_keys: u64 = 7168; // kStreamKeys: the shared-memory stream
 
-/// For n keys, denominator depth is ceil(n/256)+8: 256 lanes, 8 tree levels, and 36 at n=7168.
+// For n keys, denominator depth is ceil(n/256)+8: 256 lanes, 8 tree levels, and 36 at n=7168.
 pub fn softmaxDepth(n: u64) u64 {
     return (n + lanes - 1) / lanes + tree_levels;
 }
@@ -40,7 +40,7 @@ pub const Mags = struct {
     value: f64 = 0,
 };
 
-/// Bound each output by per-stage depths/scales, two f32 exp ulps, and one RNE bf16 store (2^-8).
+// Bound each output by per-stage depths/scales, two f32 exp ulps, and one RNE bf16 store (2^-8).
 pub fn sdpaBound(n: u64, m: Mags, want: f64) f64 {
     const u: f64 = 0x1p-24;
     const dot = rel(dot_terms) * m.terms; // score dot depth 256
@@ -54,7 +54,7 @@ pub fn sdpaBound(n: u64, m: Mags, want: f64) f64 {
 
 pub const SdpaCase = struct { name: []const u8, rows: u64, prefix: u64 };
 
-/// Capacity covers prefix + rows and rejects totals above max_visible_keys.
+// Capacity covers prefix + rows and rejects totals above max_visible_keys.
 pub fn capacityOf(case: SdpaCase) u64 {
     return case.prefix + case.rows;
 }
@@ -64,7 +64,7 @@ pub fn visibleKeys(case: SdpaCase, r: u64) u64 {
     return case.prefix + r + 1;
 }
 
-/// Cases test n=1,15/16/17,255/256/257,1023/1024/1025,7167/7168 and rows 17/32 at 1024/7168 limits.
+// Cases test n=1,15/16/17,255/256/257,1023/1024/1025,7167/7168 and rows 17/32 at 1024/7168 limits.
 pub const served_cases = [_]SdpaCase{
     .{ .name = "decode n=1", .rows = 1, .prefix = 0 },
     .{ .name = "decode n=16 tile", .rows = 1, .prefix = 15 },
@@ -81,7 +81,7 @@ pub const served_cases = [_]SdpaCase{
     .{ .name = "prefill rows32 to 7168", .rows = 32, .prefix = 7136 },
 };
 
-/// Attend computes f64 dots, max, softmax, and output for n=prefix+r+1 in (kv_head,capacity,head_dim).
+// Attend f64 dots/max/softmax/output for n=prefix+r+1 in (kv_head,capacity,head_dim); matches fx.Attend.init order.
 pub fn attendRef(
     a: std.mem.Allocator,
     q_bits: []const u16,
@@ -135,7 +135,7 @@ pub fn attendRef(
     }
 }
 
-/// Causal SDPA compares GPU bits to f64 references; n=1 preserves V bits, and finite wants require finite outputs.
+// Causal SDPA compares GPU bits to f64 references; n=1 preserves V bits, and finite wants require finite outputs.
 pub const Sdpa = struct {
     a: std.mem.Allocator,
     case: SdpaCase,

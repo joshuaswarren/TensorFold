@@ -1,5 +1,5 @@
 // Native Vulkan Qwen3.5-2B engine: heap-stable object runs single-sequence prefill chunks, decode, and greedy draws.
-// Safety: storage16/int16 opens first; bf16, SDPA shared-memory, GDN subgroup, pinned admission precede weights/GPU.
+// Safety: gates (bf16, SDPA shmem, GDN subgroup) + admission precede weights; state last; child ptrs heap-owned first
 // `vk.orExit` exits 124 on Timeout and 1 on InFlight. Post-write failures poison until reset; no rollback.
 const std = @import("std");
 const vk = @import("vulkan");
@@ -13,7 +13,7 @@ const View = vk.tensor.View;
 
 pub const max_prefill_rows = fwd.max_prefill_rows;
 
-// The 32-row cut ends full chunks at 32; the schedule maps 32/33/63/64/65 to 32/32/64/64/65.
+// Chunk cut = min(done+32,total), pure, host-tested; totals 32/33/63/64/65 cut at 32 / 32,33 / 32,63 / 32,64 / 32,64,65
 pub fn chunkEnd(done: usize, total: usize) usize {
     return @min(done +| max_prefill_rows, total);
 }
@@ -170,7 +170,7 @@ pub const Engine = struct {
         e.poisoned = false;
     }
 
-    // Check ids/bounds before first write; commit 32-row chunks. Failure poisons; refusal leaves state untouched.
+    // Check ids/bounds, commit 32-row chunks. Failure poisons (partial RNN state never reused); refusals touch nothing.
     pub fn prefill(e: *Engine, tokens: []const u32) Error!void {
         if (e.poisoned) return error.Poisoned;
         if (tokens.len == 0) return error.UnsupportedPrompt;

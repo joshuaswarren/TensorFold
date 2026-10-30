@@ -1,4 +1,4 @@
-// Qwen3.5-2B: context 1–7168 (256 default), prefill 32; 2 exact-ID runs, lowest-index ties; teacher-forced is per-step.
+// Qwen3.5-2B: context 1-7168 (256 default); 2 exact-ID runs, lowest ties; exits 0/1/2/124; teacher-forced per-step.
 const std = @import("std");
 const q35v = @import("qwen35_vulkan");
 const engine_mod = q35v.engine;
@@ -114,7 +114,7 @@ pub fn sameHex(a: []const u8, b: []const u8) bool {
     return isShaHex(a) and isShaHex(b) and std.ascii.eqlIgnoreCase(a, b);
 }
 
-// Differing BF16 elements (2-byte pairs) between two logit dumps, or null when the lengths differ or are torn.
+// Differing BF16 elements (2-byte pairs) between two logit dumps, null on unequal/torn lengths; the diagnostic counter.
 pub fn countElementMismatches(a_bytes: []const u8, b_bytes: []const u8) ?u64 {
     if (a_bytes.len != b_bytes.len or a_bytes.len % 2 != 0) return null;
     var n: u64 = 0;
@@ -145,7 +145,7 @@ fn readExpectedIds(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, oracle_dir
     return out;
 }
 
-// Oracle result.json's fields (hashes, checkpoint note) the receipt echoes; a missing one means an unusable oracle.
+// Oracle result.json fields the receipt echoes; missing = unusable oracle, not a pass; arena-allocated, nothing freed.
 const OracleMeta = struct {
     prompt_token_hash: []const u8,
     generated_ids_hash: []const u8,
@@ -195,7 +195,7 @@ fn readOracleMeta(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, oracle_dir:
     };
 }
 
-// The bundle: qwen35_shaders SPIR-V per ShaderBundle field (8 stage-1, 4 norm/MLP, 3 attention, 7 GDN, 3 greedy).
+// The bundle: qwen35_shaders SPIR-V per ShaderBundle field, shared by probe and load test — the set the server serves.
 fn bundle() engine_mod.ShaderBundle {
     return .{
         .ops = .{
@@ -417,7 +417,7 @@ pub fn main(init: std.process.Init) !u8 {
     return if (match_a and match_b and ids_equal and logits_equal) 0 else 1;
 }
 
-// A greedy run: prefill (32-row chunks; --sequential-prefill one per token), then `ids_out.len` GPU argreduce draws.
+// Greedy: prefill (32-row chunks; --sequential-prefill per token = boundary evidence); ids_out.len argreduce draws.
 fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const u32, expected: []const u32, ids_out: []u32, rows_out: []u8, row_len: usize) !void {
     if (sequential) {
         for (prompt) |tok| try e.prefill(&.{tok});

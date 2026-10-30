@@ -1,4 +1,4 @@
-// Pointwise contract: stages 2-4's pointwise closures as host fixtures; contract_pointwise_main.zig drives the GPU.
+// Pointwise contract: stages 2-4 closures as host fixtures; preserve add checked STRICTLY (a flushing device fails).
 const std = @import("std");
 const contract = @import("contract");
 const stage2 = @import("stage2_fixture.zig");
@@ -36,7 +36,7 @@ fn sampleBits(rng: std.Random, scale: f32) u16 {
 
 // ---- Residual add, preserved: add_preserve_bf16 (binary_vec.comp + -DPRESERVE_F32), checked STRICTLY ----
 
-// The preserved add: stage 2 add's three shapes at 256-byte-aligned bf16 offsets; binary_vec.comp + DenormPreserve.
+// Preserved add: stage 2's three shapes, 256B-aligned; norm_mlp selects it where the device declares DenormPreserve.
 pub const PreserveCase = stage2.AddCase;
 pub const preserve_cases = [_]PreserveCase{
     .{ .name = "random 512", .elems = 512, .at = .{ .a = 128, .b = 256, .out = 384 } },
@@ -44,7 +44,7 @@ pub const preserve_cases = [_]PreserveCase{
     .{ .name = "classes 20", .elems = 20, .at = .{ .a = 128, .b = 256, .out = 384 }, .fill = .classes },
 };
 
-// The preserve gate reuses stage 2's add fixture (one model, two pipelines); allow_subnormal_flush stays false.
+// Preserve gate reuses stage 2's add fixture; allow_subnormal_flush false: a flushing device fails the subnormal rows.
 pub const PreserveAdd = stage2.Add;
 
 // ---- Attention output gate: one mid bf16 rounding of the sigmoid, one bf16 store ----
@@ -150,7 +150,7 @@ pub const Gate = struct {
 
 // ---- Gated RMSNorm: tokens x 16 head rows of 128, the [128] gain shared by every head, plus one mid rounding ----
 
-// depth = 12 (1 + 8 tree levels + 1 divide = 10, 2 margin); ops = 10; mids = 12 (2^-8, |z| >= 0.25, 3.6e-3 of |want|).
+// depth = 12 (1 + 8 levels + 1 divide = 10, 2 margin); ops = 10; mids = 12 (2^-8 of |normed|; |z| >= 0.25 floor).
 const gated_depth = 12;
 const gated_spec: c.Spec = .{
     .name = "vulkan fast_norm_gated bf16 per-head gated rms (silu(z)*bf16(x*(inv*w)), head rows of 128)",
@@ -165,7 +165,7 @@ fn gatedDepth(_: c.Shape) usize {
     return gated_depth;
 }
 
-// Production geometry (gdn.Model): 16 head rows of 128 a token (2048 bf16 elements); the [128] gain per head.
+// gdn.Model geometry: 16 head rows of 128 a token (2048 bf16 elements); one [128] gain shared by every head.
 pub const gated_heads: usize = 16;
 pub const gated_head_dim: usize = 128;
 pub const gated_width: usize = gated_heads * gated_head_dim;
@@ -216,7 +216,7 @@ pub const GatedNorm = struct {
     weight: []u16,
     z: []u16,
     out: []u16,
-    // silu64(z) * widen(bf16(x*(n*w))) per element, f64, mid rounding modeled; n the head norm, w the [128] gain.
+    // silu64(z) * widen(bf16(x*(n*w))), f64, mid modeled; w the shared [128] gain; nonfinite only at planted controls.
     want: []f64,
 
     pub fn init(a: std.mem.Allocator, case: GatedCase, seed: u64) !GatedNorm {
@@ -534,7 +534,7 @@ fn preserveAllocRun(a: std.mem.Allocator, case: PreserveCase) !void {
     (try PreserveAdd.init(a, case, 0x58b0)).deinit();
 }
 
-// OpCapability (word count 2, opcode 17) then DenormPreserve (4464): -DPRESERVE_F32 makes add_preserve_bf16 preserving.
+// OpCapability (2,17), DenormPreserve (4464): -DPRESERVE_F32 preserves; catches a no-ifdef define (the old -DUSE_BF16).
 fn hasCapability(spv: []align(4) const u8, cap: u32) bool {
     const words = std.mem.bytesAsSlice(u32, spv);
     if (words.len < 5 or words[0] != 0x07230203) return false;

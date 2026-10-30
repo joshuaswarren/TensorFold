@@ -1,4 +1,4 @@
-// Greedy selects max finite; exact ties (+0/-0) choose lowest index; any row NaN/inf refuses; no CPU fallback.
+// Greedy: max finite, +0/-0 ties to lowest index, any NaN/Inf refuses; argreduce = mlx-omarchy copies (max, one row)
 const std = @import("std");
 const c = @import("vk");
 const commands = @import("commands.zig");
@@ -43,7 +43,7 @@ const greedy_push_bytes: u32 = 60;
 /// finite_logits.comp reads only the row length.
 const FiniteParams = extern struct { count: u32 = 0 };
 
-// The pure plan rejects odd bf16 counts because View word-padding makes them invalid; it returns Invalid or TooLarge.
+// Pure plan: geometry only (Invalid empty, TooLarge huge); odd bf16 counts fail View word-padding at the caller
 pub const Plan = struct { count: u32, chunk_len: u32, chunks: u32 };
 
 pub fn greedyPlan(count: u64) Error!Plan {

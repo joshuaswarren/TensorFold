@@ -1,4 +1,4 @@
-// BF16 exponent 0x7f80 is inf, 0x7f81..0x7fff NaN; 256 lanes scan 16 values; record the first bad value.
+// Set a flag for any nonfinite BF16 input and record the first bad index.
 #version 460
 
 #extension GL_EXT_shader_16bit_storage : require

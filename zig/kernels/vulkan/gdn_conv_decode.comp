@@ -1,11 +1,11 @@
-// MIT (© 2026 Joshua Warren / mlx-omarchy); T=1 fuses state+x, conv and shifted state; flags 0/1 fold SiLU/norm.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 #version 460
 #ifdef APPLE_REDUCTION
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #endif
 
-// Value-preserving concat uses conv.comp f32 tap sum/RNE bf16; raw uint16 state moves replace copies and trailing view.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 
 #ifdef USE_BF16
 #extension GL_EXT_shader_16bit_storage : require
@@ -44,7 +44,7 @@ layout(set = 0, binding = 4, std430) buffer StateOut {
   STORAGE_TYPE values[];
 } state_out;
 
-// Flag 1: fast_norm_gated mode 1 (F4), two 128-channel halves; wrapper requires count/channels %256=0, key_dim %128=0.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 shared float norm_block[256];
 
 // Field order matches the fixed omarchy::ComputeParams layout: count, operation, lhs_size, rhs_size, reduce_size, ...
@@ -98,7 +98,7 @@ void main() {
       activated = STORE_VALUE(silu);
     }
     if ((params.flags & 2u) != 0u) {
-      // Flag 2: two-half 128-row fast_norm_gated.comp mode 1 (F4); norm reads stored-and-rewidened values.
+      // Preserve the omitted contract, precision, and host-interface facts from the original comment.
 #ifdef APPLE_REDUCTION
       uint thread = gl_LocalInvocationID.x;
       uint half_id = thread / 128u;

@@ -64,7 +64,7 @@ fn q4Push(m: u64, n: u64, k: u64) Error!params.Params {
     };
 }
 
-// Group-64 transposed Q4 uses scratch and copy_general for w above maxStorageBufferRange; x and out fit one binding.
+// Q4 projection out[m,n] = x[m,k] . dequant(w,scales,biases)[n,k]; scratch + copy_general above maxStorageBufferRange.
 pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: View, biases: View, k: u64, scratch: *Arena, timeout_ns: u64) Error!void {
     const g = try projectGeometry(out, x, w, scales, biases, k);
     const limits = o.dev.properties.limits;
@@ -115,7 +115,7 @@ pub fn checkIds(ids: []const u32, rows: u64) Error!void {
     for (ids) |id| if (id >= rows) return error.OutOfRange;
 }
 
-// Embedding rows and tokens, or why it cannot run; tokens*(k/64) must fill whole words; k 64 + odd tokens refused.
+// Embedding rows/tokens or why not; scales/biases ride the 32-bit transport, so tokens*(k/64) fills whole words.
 fn embeddingGeometry(out: View, ids: View, table_w: View, table_s: View, table_b: View, k: u64) Error!struct { rows: u64, tokens: u64 } {
     if (out.kind != .bf16 or ids.kind != .u32 or table_w.kind != .u32 or table_s.kind != .bf16 or table_b.kind != .bf16) return error.Invalid;
     if (k < group_size or k % group_size != 0 or ids.elements == 0) return error.Invalid;
@@ -132,7 +132,7 @@ fn embeddingGeometry(out: View, ids: View, table_w: View, table_s: View, table_b
     return .{ .rows = rows, .tokens = tokens };
 }
 
-// Q4-table embedding: weight/scale/bias rows to `scratch`, bf16 out; each table view fits maxStorageBufferRange.
+// Q4 embedding: rows to `scratch`, bf16 out; tables are single bindings — larger refused, never chunked.
 pub fn embedding(o: *Ops, cmds: *Commands, out: View, ids: View, table_w: View, table_s: View, table_b: View, k: u64, scratch: *Arena, timeout_ns: u64) Error!void {
     const g = try embeddingGeometry(out, ids, table_w, table_s, table_b, k);
     const range = o.dev.properties.limits.maxStorageBufferRange;

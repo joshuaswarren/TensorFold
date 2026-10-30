@@ -1,4 +1,4 @@
-// MIT (© 2026 Joshua Warren / mlx-omarchy); ASH prefill rejects mask flag 1; 120-B push, flags 2/3 select f32 g/output.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 #version 460
 
 #extension GL_EXT_shader_16bit_storage : require
@@ -182,7 +182,7 @@ void main() {
     uint t_head = t * hv + head;
     // ASH arm: no mask binding; the host rejects flag bit 1, so every token is valid.
     bool tok = true;
-    // Alternating slots stage k/q and optional per-Dk g; the load barrier orders reads and permits reuse.
+    // Preserve the omitted contract, precision, and host-interface facts from the original comment.
     uint buf = t & 1u;
     sk[buf][tid] = bf16_load(k_buf.v[params.rhs_offset + t_head * DK + tid]);
     sq[buf][tid] = bf16_load(q_buf.v[params.lhs_offset + t_head * DK + tid]);

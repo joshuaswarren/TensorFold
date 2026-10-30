@@ -1,4 +1,4 @@
-//! Qwen3.5-2B Vulkan rejects invalid Q4 group-64 loads; raw BF16 norms and staged `commands.orExit` protect heap views.
+// Qwen3.5-2B Vulkan: fail-closed Q4 admission before reads; raw BF16 norms; heap views; staged uploads use orExit.
 const std = @import("std");
 const vk = @import("vulkan");
 const pinned = @import("../../config.zig");
@@ -18,7 +18,7 @@ pub const Error = loader.table.Error || pinned.Error || vk.runtime.Error ||
 /// The text tower's key prefix, as the shared loader names it.
 const prefix = loader.checkpoint.prefix;
 
-/// A `Quant` stores packed affine words, per-group scales and biases, plus row/column geometry checked by qmm.
+// A `Quant` stores packed affine words, per-group scales and biases, plus row/column geometry checked by qmm.
 pub const Quant = struct {
     w: View,
     scales: View,
@@ -29,7 +29,7 @@ pub const Quant = struct {
 
 pub const DenseMlp = struct { gate: Quant, up: Quant, down: Quant };
 
-/// Full attention uses Q4/raw BF16; `q` has 4096 interleaved query/gate rows (8×256), split by forward to match Metal.
+// Full attention uses Q4/raw BF16; `q` has 4096 interleaved query/gate rows (8×256), split by forward to match Metal.
 pub const FullLayer = struct {
     input_norm: View,
     post_norm: View,
@@ -42,7 +42,7 @@ pub const FullLayer = struct {
     mlp: DenseMlp,
 };
 
-/// GatedDeltaNet keeps raw BF16 taps/norms/`dt_bias`; `conv_dw1d` widens uint16, and `A_log` stays raw F32.
+// GatedDeltaNet keeps raw BF16 taps/norms/`dt_bias`; `conv_dw1d` widens uint16, and `A_log` stays raw F32.
 pub const LinearLayer = struct {
     input_norm: View,
     post_norm: View,
@@ -60,7 +60,7 @@ pub const LinearLayer = struct {
 
 pub const Layer = union(enum) { full: FullLayer, linear: LinearLayer };
 
-/// The one supported model, checked field by field against the pinned family constants before anything is trusted.
+// The one supported model, checked field by field against the pinned family constants before anything is trusted.
 pub fn expectPinnedModel(s: loader.config.Spec) Error!void {
     const expected = .{
         .hidden = pinned.hidden,
@@ -114,7 +114,7 @@ fn expectTensor(key: []const u8, t: Tensor, dt: loader.table.DType, shape: []con
     }
 }
 
-/// `Builder` records heap-owned buffers; `deinit` frees created buffers on errors, preventing leaks and double-frees.
+// `Builder` records heap-owned buffers; `deinit` frees created buffers on errors, preventing leaks and double-frees.
 const Builder = struct {
     gpa: Allocator,
     dev: *const Device,
@@ -186,7 +186,7 @@ const Builder = struct {
         return b.tensor(t);
     }
 
-    /// For `n` rows, `k` inputs, group 64: checked U32 `[n,k/8]` words and BF16 scales/biases `[n,k/64]`.
+    // For `n` rows, `k` inputs, group 64: checked U32 `[n,k/8]` words and BF16 scales/biases `[n,k/64]`.
     fn quant(b: *Builder, name: []const u8, n: usize, k: usize) !Quant {
         var buf: [192]u8 = undefined;
         const w = try b.raw(try key(&buf, "{s}.weight", .{name}), .u32, &.{ n, k / 8 });
@@ -195,7 +195,7 @@ const Builder = struct {
         return .{ .w = w, .scales = scales, .biases = biases, .n = n, .k = k };
     }
 
-    /// Raw BF16 norm gains pass byte-for-byte; the Metal kernel multiplies gain directly, never `1 + w`.
+    // Raw BF16 norm gains pass byte-for-byte; the Metal kernel multiplies gain directly, never `1 + w`.
     fn norm(b: *Builder, name: []const u8, elements: usize) !View {
         return b.raw(name, .bf16, &.{elements});
     }
@@ -247,7 +247,7 @@ const Builder = struct {
     }
 };
 
-/// Typed text-tower views use owned heap buffers; checkpoint config decides whether the head ties to the embedding.
+// Typed text-tower views use owned heap buffers; checkpoint config decides whether the head ties to the embedding.
 pub const Model = struct {
     gpa: Allocator,
     spec: loader.config.Spec,
@@ -258,11 +258,11 @@ pub const Model = struct {
     buffers: []*Buffer,
     embed: Quant,
     final_norm: View,
-    /// When tied, `outputHead` returns `embed`; untied checkpoints require a separate head or loading is refused.
+    // When tied, `outputHead` returns `embed`; untied checkpoints require a separate head or loading is refused.
     head: ?Quant,
     layers: []Layer,
 
-    /// Loads `dir` via `cmds` with nonempty `staging`; it checks admission first and keeps heap-backed views valid.
+    // Loads `dir` via `cmds` with nonempty `staging`; it checks admission first and keeps heap-backed views valid.
     pub fn load(
         gpa: Allocator,
         dev: *const Device,
@@ -331,7 +331,7 @@ pub const Model = struct {
         return m.head orelse m.embed;
     }
 
-    /// Free device buffers only when no submission can touch a view; in-flight errors exit through `orExit`.
+    // Free device buffers only when no submission can touch a view; in-flight errors exit through `orExit`.
     pub fn deinit(m: *Model) void {
         for (m.buffers) |ptr| {
             var buf = ptr.*;

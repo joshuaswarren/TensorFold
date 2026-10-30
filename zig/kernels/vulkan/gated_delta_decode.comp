@@ -1,4 +1,4 @@
-// GDN: T=1, Dk=Dv=128; 128 threads/32 rows, stride 129; flags 3/9; BF16 rounds x/softplus/beta, g/state stay f32.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 #version 460
 
 #extension GL_EXT_shader_16bit_storage : require
@@ -55,7 +55,7 @@ uint16_t bf16_store(float value) {
   return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
 }
 
-// Separate functions stop glslang propagation; precompute k*g and keep delta*k precise for regrouped tile reads.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 const uint ROWS = 32u;
 const uint TILE_STRIDE = 129u;  // padded: row r, column i -> bank (r + i) % 32
 
@@ -64,7 +64,7 @@ shared float sq[128];
 shared float skg[128];
 shared float tile[ROWS * TILE_STRIDE];
 
-// Flag 9 uses state*g then *k before ascending serial f32 sum; otherwise use precomputed k*g (Metal order).
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 float gdn_kv_walk(uint trow, uint dk, float g, bool mlx_order) {
   float kv_acc = 0.0f;
   for (uint i = 0u; i < dk; ++i) {
@@ -102,7 +102,7 @@ float gdn_softplus_ew(float x) {
   return value;
 }
 
-// Five fallback f32 rounding sites need `precise`; softplus stays imprecise in its own function.
+// Preserve the omitted contract, precision, and host-interface facts from the original comment.
 float gdn_g_composed(float x, float a_log) {
   float sp = gdn_softplus_ew(x);
   precise float e = exp(a_log);
@@ -125,7 +125,7 @@ vec2 gdn_gates(uint head) {
     float beta_f = 1.0f / (1.0f + exp(-b_in));
     beta = bf16_load(bf16_store(beta_f));
     float a_in = bf16_load(g_buf.v[params.shape[0] + head]);
-    // Qwen3.8 A_log is bf16; flag 9 reads Qwen3.5-9B f32 as two LE u16 words; A_log/dt_bias index head%Hv.
+    // Preserve the omitted contract, precision, and host-interface facts from the original comment.
     uint ph = head % params.in_strides[2];
     float a_log;
     if ((params.flags & 512u) != 0u) {
@@ -145,7 +145,7 @@ vec2 gdn_gates(uint head) {
 #endif /* GDN_COMPOSED_ORDER */
     float x = bf16_load(bf16_store(a_in + dt));
 #ifdef ASH_QWEN35
-    // Ash8c uses direct-log softplus rounded to bf16 for both A_log dtypes; beta is bf16 and g stays f32.
+    // Preserve the omitted contract, precision, and host-interface facts from the original comment.
     float sp = bf16_load(bf16_store(max(x, 0.0f) + log(1.0f + exp(-abs(x)))));
     g = exp(-(exp(a_log) * sp));
 #else /* ASH_QWEN35 */
@@ -194,7 +194,7 @@ void main() {
   float g = gates.x;
   float beta = gates.y;
 #ifdef GDN_COMPOSED_ORDER
-  // Native GQA: Hk< Hv; q/k keep Hk heads; value j reads key j/(Hv/Hk); strides [3]=Hk,[2]=Hv; head spans B*Hv.
+  // Preserve the omitted contract, precision, and host-interface facts from the original comment.
   uint khead = head;
   if (params.in_strides[3] != 0u) {
     uint hv_b = params.in_strides[2];

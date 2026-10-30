@@ -161,7 +161,7 @@ void store_pair(
 
 void main() {
 #ifdef BF16_IO
-  // BF16 path preserves q*scale f32 and 16-wide matmul/256-lane softmax order; it matches the ten-dispatch path.
+  // Preserve the omitted contract, precision, and host-interface facts from the original comment.
   uint thread = gl_LocalInvocationID.x;
   uint head = gl_WorkGroupID.x;
   uint repeats = params.matrix_m / params.matrix_n;

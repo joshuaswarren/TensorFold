@@ -1,5 +1,5 @@
 // Stage 4 fixture: the GatedDeltaNet closure, 16 heads, head_dim 128, 6144 conv channels, 4 taps, vs f64 host refs.
-// Budgets (depth/ops/mids): split 40/5/3; gate 4/2; conv 4 taps/4/0; recur tokens*130+130/4; norm 128/1/2.
+// depth/ops/mids budgets, mag: split max|vals|^2, gate |g|, recur max state, norm max|x|^2*len; chunk=4/8 one ref
 const std = @import("std");
 const contract = @import("contract");
 pub const c = contract.spec;
@@ -39,7 +39,7 @@ fn violated(v: ?*Violation, output: Output, index: usize, want: f64, got: f64, b
     };
 }
 
-// Fixed budget: depth f32 sum@mag; ops f32 rounds; mids bf16 rounds; 1 bf16 store; finite>0, floor 2^-133.
+// budget: depth f32 sum@mag, ops f32 + mids bf16 rounds, 1 store; not sum-of-squares; never enlarge after GPU runs
 pub fn budget(depth: f64, ops: f64, mids: f64, want: f64, mag: f64) f64 {
     const u: f64 = 0x1p-24;
     const g = if (depth > 1) depth * u / (1 - depth * u) else 0;
@@ -70,12 +70,12 @@ fn f32Of(pairs: []const u16, word: usize) f64 {
     return @as(f32, @bitCast(@as(u32, pairs[2 * word]) | (@as(u32, pairs[2 * word + 1]) << 16)));
 }
 
-// f64-idealized g/beta chain: omits shader bf16 rounds on s and sp (~20x via exp(a_log)); `gateRefAsh` = checker ref.
+// f64 chain shared by split lane-0 and decode raw-gates; omits bf16 rounds (~20x); kept for amplification test
 pub fn gateRef(a_in: f64, b_in: f64, a_log: f64, dt: f64) gdn_mod.GateF64 {
     return gdn_mod.gateReferenceF64(a_in, b_in, a_log, dt);
 }
 
-// ASH: s=BF16(a+dt); sp=BF16(max(s,0)+log(1+exp(-|s|))); g=exp(-exp(A_log_f32)*sp) f32; beta=BF16(sigmoid(b))
+// ASH: s=BF16(a+dt); sp=BF16(max(s,0)+log(1+exp(-|s|))); g f32; beta=BF16(sigmoid(b)); residual = exp/log ulps
 pub fn gateRefAsh(a_in: u16, b_in: u16, a_log: f64, dt_in: u16) gdn_mod.GateF64 {
     const a = c.fromBf16(a_in);
     const dt = c.fromBf16(dt_in);
@@ -411,7 +411,7 @@ pub const Conv = struct {
 // ---- Prefill recurrence and decode: one serial f64 walker ----
 
 pub const RecurWalk = struct {
-    // state[head][row][dk]; y[token][head*128+row]; `snap_after` => `want_snap` = FULL state after `snap_after.? - 1`.
+    // state[head][row][dk]; y[token][head*128+row]; want_snap = FULL state after snap_after-1 (scan's snapshot slot)
     pub fn run(
         soa_bits: []const u16,
         g_pairs: []const u16, // f32 as u16 pairs [T*16*2]

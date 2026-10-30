@@ -1,4 +1,4 @@
-//! Greedy.select matches independent CPU max (248320 BF16; low-index ties, ±0 equal); NonFinite gives first-bad index.
+// Greedy.select vs CPU max (248320 BF16; low-index ties, ±0 equal); NonFinite first-bad index; exit codes 0/1/2/124.
 const std = @import("std");
 const vk = @import("vulkan");
 const shaders = @import("stage5_shaders");
@@ -116,7 +116,7 @@ fn refFail(gate: []const u8, e: anyerror) bool {
     return false;
 }
 
-/// Upload the full poisoned row; caller owns the buffer and creates its address-stable view.
+// Upload the full poisoned row; caller owns the buffer and creates its address-stable view.
 fn uploadRow(gate: []const u8, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, row: fx.Row, timeout: u64) ?vk.Buffer {
     var b = vk.Buffer.init(dev, .device, std.mem.sliceAsBytes(row.bits).len) catch |e| {
         _ = gpuFail(gate, e);
@@ -130,7 +130,7 @@ fn uploadRow(gate: []const u8, dev: *const vk.Device, cmds: *vk.Commands, stagin
     return b;
 }
 
-/// Run 3 selects via orExit; tokens must match, mismatches print FAIL, and GPU errors propagate raw.
+// Run 3 selects via orExit; tokens must match, mismatches print FAIL, and GPU errors propagate raw.
 fn selectRepeat(gate: []const u8, g: *vk.Greedy, cmds: *vk.Commands, staging: vk.Buffer, view: vk.tensor.View, timeout: u64) !u32 {
     var first: ?u32 = null;
     for (0..repeats) |rep| {
@@ -150,7 +150,7 @@ fn repeatFail(gate: []const u8, e: anyerror) bool {
     return false;
 }
 
-/// Download the full shell and require bit identity: poisoned guards and logits remain unchanged.
+// Download the full shell and require bit identity: poisoned guards and logits remain unchanged.
 fn shellChecked(gate: []const u8, a: std.mem.Allocator, cmds: *vk.Commands, staging: vk.Buffer, row: fx.Row, buf: vk.Buffer, timeout: u64) bool {
     const back = a.alloc(u16, row.bits.len) catch |e| return gpuFail(gate, e);
     defer a.free(back);
@@ -231,7 +231,7 @@ fn zeroGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *
     return true;
 }
 
-/// Non-winning -inf/+inf/NaN (even at winner) must refuse; decode() reports first-bad index, not GPU failure.
+// Non-winning -inf/+inf/NaN (even at winner) must refuse; decode() reports first-bad index, not GPU failure.
 fn nonFiniteGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, timeout: u64) !bool {
     const gate = "nonfinite-refused";
     const cases = [_]struct { kind: fx.NonFinite, bad: usize, label: []const u8 }{
@@ -301,7 +301,7 @@ fn minCountGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmd
     return singleRowGate(a, clock, dev, cmds, staging, gate, row, timeout);
 }
 
-/// Odd bf16 count uploads but View refuses with Misaligned before dispatch.
+// Odd bf16 count uploads but View refuses with Misaligned before dispatch.
 fn oddCountGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, timeout: u64) !bool {
     const gate = "odd-count-refused";
     var row = fx.random(a, 7, 0x57ad) catch |e| return gpuFail(gate, e);

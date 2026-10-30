@@ -209,7 +209,7 @@ fn ropeGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *
     return true;
 }
 
-// SDPA poisons outputs and checks three identical repeats, uploaded-bit f64 bounds, and SDPA_ROWS alone-row identity.
+// SDPA: poison shell, 3 identical repeats, uploaded-bit f64 bounds, single-key exactness, plants refused, unchanged
 fn sdpaGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, attn: *vk.Attention, case: ca.SdpaCase, seed: u64, timeout: u64) !bool {
     const row_elems: u64 = fx.heads * fx.head_dim;
     const f = try ca.Sdpa.init(a, case, seed);

@@ -1,4 +1,4 @@
-// Stage 5's greedy argmax rows use q.backend.draw as reference; window alignment=256 bytes, tail=16 x 0xffff.
+// Stage 5: reference re-walks widened bits (not production helpers), q.backend.draw rule; align=256B, tail=16x0xffff
 const std = @import("std");
 const contract = @import("contract");
 const c = contract.spec;
