@@ -98,6 +98,7 @@ fn bundle() q35v.engine.ShaderBundle {
             .copy_u32 = &q35s.copy_u32,
             .copy_u16 = &q35s.copy_u16,
             .qmm_q4_sg = &q35s.qmm_q4_sg,
+            .qmm_q4_sg_swiglu = &q35s.qmm_q4_sg_swiglu,
         },
         .norm = .{ .norm_bf16 = &q35s.norm_bf16, .add_bf16 = &q35s.add_bf16, .add_preserve_bf16 = &q35s.add_preserve_bf16, .swiglu_bf16 = &q35s.swiglu_bf16 },
         .attention = .{ .rope_bf16 = &q35s.rope_bf16, .sdpa_rows_bf16 = &q35s.sdpa_rows_bf16, .gate_bf16 = &q35s.gate_bf16 },
