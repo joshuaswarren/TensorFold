@@ -1,21 +1,6 @@
 #version 460
 
-// The qmm_q4_pk kernel with one planted fault per variant, for the Vulkan kernel contract's
-// controls: each control is this copy compiled with one define, and the shipped qmm_q4_pk.comp
-// stays untouched. Every variant reads the same bindings and push constants and evaluates the
-// same per-element expression as the kernel it copies; the fault is only the one the define
-// names, and the runner pushes the same flags (2: strided lanes, compensated sums) so each
-// fault lands on the path the real kernel takes.
-//
-//   TF_CTL_PK_DROP_TAIL   the last lane never walks the row's final pack: a tail the sums miss
-//   TF_CTL_PK_FP16        the lane sums accumulate in fp16
-//   TF_CTL_PK_SKIP_LEVEL  the lane tree starts one level down, so the upper half never folds in
-//   TF_CTL_PK_WRITE_W     lane 0 writes a fixed word just past the weights data after the walk
-//   TF_CTL_PK_WRITE_B     lane 0 writes a fixed element just past the biases data after the walk
-//
-// The two writes land past the data, where no workgroup reads, so the outputs stay correct and
-// only the gate 2 read-back of the inputs can see them; the fixture's buffers carry guard tails
-// past the data, as the qmm_bf16 fixture's do for its own input-write controls.
+// Five one-fault copies exercise qmm_q4_pk's real bindings, flags, and arithmetic paths in the kernel contract.
 
 // Copyright © 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
 
@@ -173,9 +158,7 @@ void main() {
       barrier();
     }
     if (lane == 0u) {
-      // the shipped kernel's class fix, once per output at the high+low combine: a non-finite
-      // high keeps its class, a finite high always has a finite chain beneath it, so the else
-      // operand is exactly the frozen expression
+      // The high/low combine preserves non-finite classes; finite highs retain the frozen expression.
       float total_sum = tree[0];
       if (compensated) {
         total_sum = (isnan(tree[0]) || isinf(tree[0])) ? tree[0] : tree[0] + tree_lo[0];
