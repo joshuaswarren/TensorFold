@@ -1,30 +1,9 @@
 #version 460
 
-// Specialized from the qmm.comp transposed affine path (bits 4, group 64): one 64-lane
-// workgroup per output (row, column). Lane l walks the row's packed words in ascending
-// strided order (l, l+64, ...) and evaluates EXACTLY the qmm.comp per-element expression
-// scale * float(q) + bias, times the widened bf16 x, accumulated in f32 in ascending
-// lane-element order within a pack; a fixed shared-memory binary tree (strides 32, 16, 8,
-// 4, 2, 1, a barrier between levels, no subgroup ops and no atomics) folds the 64 partials,
-// and lane 0 stores once with the repo's bf16_store RNE. The host grid-strides outputs past
-// the device's workgroup-count limit, so every lane sees the same loop trip count and every
-// barrier sits at uniform control flow; no lane returns before a barrier.
-//
-// The lane's loads are software-pipelined one pack ahead: the next pack's packed word,
-// scale, bias and all eight widened x elements are issued before the current pack's
-// arithmetic runs, so the memory latency overlaps it. The arithmetic, its order, the tree
-// and the store are unchanged — nibble widening and bf16→f32 are exact, so every output is
-// bit-identical to the serial-load kernel (proven bit-exact by tf-qmm-cand on the M1 and
-// on lavapipe, including planted non-finite inputs).
+// Group-64 Q4 uses 64 lanes per output, strided packs and a fixed tree; precise pipelined loads preserve output bits.
 
 
-// Load schedule (unit 8a): the next pack's word, scale, bias and its 8 widened x elements are issued before the
-// current pack's 32 arithmetic operations, so the memory latency overlaps the arithmetic. The per-output arithmetic
-// is unchanged: same lane pack order (l, l+64, ...), same element order, the same scale*float(q)+bias term and
-// compensated TwoSum per element, the same fixed 6-level tree, class fix and bf16 RNE store. The accumulators are
-// `precise`: with plain accumulators the device compiler built the pipelined body so that 1 of 6144 outputs differed
-// from the previous kernel by one bf16 ulp on real activations (all three Apple chips); the precise accumulators
-// keep every operation of the compensated chain as written.
+// Plain sums changed 1/6144 outputs by one bf16 ULP on all Apple chips; precise accumulators preserve outputs.
 
 // Copyright © 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
 
@@ -108,7 +87,7 @@ void main() {
     uint last = contiguous ? first + chunk : packs;
     precise float partial = 0.0;
     precise float comp = 0.0;
-    // the pipeline's current pack, loaded before the loop (lanes with no packs stay at zeros)
+    // Load the current pack before the loop; idle lanes keep zero values.
     uint pack = first;
     float scale = 0.0;
     float bias = 0.0;
@@ -130,7 +109,7 @@ void main() {
       }
     }
     while (pack < last) {
-      // issue the next pack's loads now; this pack's arithmetic overlaps them
+      // Load the next pack while the current pack's arithmetic runs.
       uint next = pack + step;
       bool has_next = next < last;
       float n_scale = scale;
@@ -148,7 +127,7 @@ void main() {
           n_q[e] = float((n_word >> (e * 4u)) & 0xFu);
         }
       }
-      // the frozen per-element arithmetic, unchanged in value and order
+      // Same per-element arithmetic and order as the split-K kernel.
       for (uint e = 0u; e < 8u; ++e) {
         precise float term = bf16_load(xb[e]) *
             (scale * q[e] + bias);
