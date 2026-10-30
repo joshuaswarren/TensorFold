@@ -505,16 +505,11 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     inline for (variants, 0..) |variant, i| {
         _ = contract_files.addCopyFile(controls[i], variant[0] ++ ".spv");
     }
-<<<<<<< HEAD
-    const contract_shaders = b.createModule(.{ .root_source_file = contract_files.add("vulkan_contract_shaders.zig", "pub const qmm_bf16 align(4) = @embedFile(\"qmm_bf16.spv\").*;\n" ++
-=======
     _ = contract_files.addCopyFile(qmm_q4_pk, "qmm_q4_pk.spv");
     inline for (pk_variants, 0..) |variant, i| {
         _ = contract_files.addCopyFile(pk_controls[i], variant[0] ++ ".spv");
     }
-    const contract_shaders = b.createModule(.{ .root_source_file = contract_files.add("vulkan_contract_shaders.zig",
-        "pub const qmm_bf16 align(4) = @embedFile(\"qmm_bf16.spv\").*;\n" ++
->>>>>>> e7ac90cd (contract(vulkan): register the parallel-K projection over the engine's real calls)
+    const contract_shaders = b.createModule(.{ .root_source_file = contract_files.add("vulkan_contract_shaders.zig", "pub const qmm_bf16 align(4) = @embedFile(\"qmm_bf16.spv\").*;\n" ++
         "pub const qmm_fmax align(4) = @embedFile(\"qmm_fmax.spv\").*;\n" ++
         "pub const atomic_sum align(4) = @embedFile(\"atomic_sum.spv\").*;\n" ++
         "pub const scribble_sum align(4) = @embedFile(\"scribble_sum.spv\").*;\n" ++
