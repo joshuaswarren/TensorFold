@@ -209,18 +209,7 @@ pub const Engine = struct {
         e.poisoned = false;
     }
 
-    /// One steady decode token as ONE command buffer, ONE vkQueueSubmit and
-    /// ONE fence wait: the fed token's ids upload, embed, all 24 layers,
-    /// final norm and head, the GPU greedy finite/argmax, the 12-byte
-    /// chosen-ID result copy and the optional full-row logits receipt copy
-    /// are all recorded into a single batch; the host reads the Result and
-    /// receipt only after that fence. Same op order, barriers, push values,
-    /// shaders and arithmetic as decode + draw + logitsBytes — only the
-    /// submission granularity differs. Every staging input and output gets
-    /// its own immutable slice within the batch; descriptor sets are banked
-    /// snapshots reused only after the fence. Wrap in vk.orExit as ever; a
-    /// pre-submit recording error aborts the batch cleanly and leaves the
-    /// engine poisoned (reset before reuse), exactly like decode.
+    /// One steady decode token as one batch: one command buffer, one submit, one fence; host reads only after it.
     pub fn decodeDraw(e: *Engine, token: u32, receipt_out: ?[]u8) Error!u32 {
         if (e.poisoned) return error.Poisoned;
         try vk.ops_q4.checkIds(&.{token}, e.model.embed.n);
@@ -249,11 +238,7 @@ pub const Engine = struct {
         return chosen;
     }
 
-    /// The GPU greedy draw over the current logits row: the unchanged-Ash
-    /// rule — largest finite logit, exact ties (including +0/-0) to the
-    /// lowest index, any NaN or infinity anywhere in the row refuses. A
-    /// non-finite refusal poisons the engine: no valid continuation exists
-    /// without a real reset.
+    /// The GPU draw over the logits row: largest finite logit wins, ties go lowest index, any NaN or infinity refuses.
     pub fn draw(e: *Engine) Error!u32 {
         try logitsReady(e.poisoned, e.state.visible());
         return vk.orExit(e.greedy.select(e.cmds, e.staging, e.logits, e.timeout_ns)) catch |err| {
