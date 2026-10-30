@@ -1,11 +1,18 @@
 #version 460
 
-// Group-64 Q4 uses 64 lanes per output, strided packs and a fixed tree; precise pipelined loads preserve output bits.
+// Q4 projection, one 64-lane workgroup per output (row, column), parallel over K. Lane l walks the row's
+// packed words l, l+64, ... in ascending order. The 8 elements of one packed word are summed with plain
+// left-associated f32 adds (psum += x * (scale * q + bias), precise: the order is as written, no fused
+// multiply-add); ONE Neumaier fold per pack carries the pack sum into the lane's (hi, lo) pair; a fixed
+// shared-memory tree of TwoSum merges folds the 64 lanes (strides 32, 16, 8, 4, 2, 1, a barrier between
+// levels, no subgroup ops, no atomics); lane 0 adds low to high once and stores with the repo's bf16
+// RNE. The grid-stride over outputs keeps every barrier in uniform control flow.
+//
+// Not bit-identical to the previous kernel (which compensated every element): the in-pack sum is plain,
+// so each pack sum carries up to 7 ordinary f32 roundings (about 1e-7 relative) that the per-element
+// chain caught. The contract states this kernel's depth as 8 * ceil(k / 512) + 17 roundings (49 at K 2048).
 
-
-// Plain sums changed 1/6144 outputs by one bf16 ULP on all Apple chips; precise accumulators preserve outputs.
-
-// Copyright © 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
+// Copyright (c) 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
 
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
@@ -87,66 +94,26 @@ void main() {
     uint last = contiguous ? first + chunk : packs;
     precise float partial = 0.0;
     precise float comp = 0.0;
-    // Load the current pack before the loop; idle lanes keep zero values.
-    uint pack = first;
-    float scale = 0.0;
-    float bias = 0.0;
-    uint word = 0u;
-    uint16_t xb[8];
-    float q[8];
-    for (uint e = 0u; e < 8u; ++e) {
-      xb[e] = uint16_t(0u);
-      q[e] = 0.0;
-    }
-    if (pack < last) {
-      scale = bf16_load(scales.values[column * groups_per_row + pack / 8u]);
-      bias = bf16_load(biases.values[column * groups_per_row + pack / 8u]);
-      word = input_w.values[w_base + pack];
+    for (uint pack = first; pack < last; pack += step) {
+      float scale = bf16_load(scales.values[column * groups_per_row + pack / 8u]);
+      float bias = bf16_load(biases.values[column * groups_per_row + pack / 8u]);
+      uint word = input_w.values[w_base + pack];
       uint k_base = pack * 8u;
+      precise float psum = 0.0;
       for (uint e = 0u; e < 8u; ++e) {
-        xb[e] = input_x.values[x_base + k_base + e];
-        q[e] = float((word >> (e * 4u)) & 0xFu); // exact, so hoisting changes no value
+        float q = float((word >> (e * 4u)) & 0xFu);
+        // plain left-associated in-pack adds: the re-association C2 exists for
+        psum += bf16_load(input_x.values[x_base + k_base + e]) *
+            (scale * q + bias);
       }
-    }
-    while (pack < last) {
-      // Load the next pack while the current pack's arithmetic runs.
-      uint next = pack + step;
-      bool has_next = next < last;
-      float n_scale = scale;
-      float n_bias = bias;
-      uint n_word = word;
-      uint16_t n_xb[8];
-      float n_q[8];
-      if (has_next) {
-        n_scale = bf16_load(scales.values[column * groups_per_row + next / 8u]);
-        n_bias = bf16_load(biases.values[column * groups_per_row + next / 8u]);
-        n_word = input_w.values[w_base + next];
-        uint n_k_base = next * 8u;
-        for (uint e = 0u; e < 8u; ++e) {
-          n_xb[e] = input_x.values[x_base + n_k_base + e];
-          n_q[e] = float((n_word >> (e * 4u)) & 0xFu);
-        }
+      // ONE TwoSum fold per pack into the lane's (hi, lo)
+      precise float t = partial + psum;
+      if (abs(partial) >= abs(psum)) {
+        comp += (partial - t) + psum;
+      } else {
+        comp += (psum - t) + partial;
       }
-      // Same per-element arithmetic and order as the split-K kernel.
-      for (uint e = 0u; e < 8u; ++e) {
-        precise float term = bf16_load(xb[e]) *
-            (scale * q[e] + bias);
-        precise float t = partial + term;
-        if (abs(partial) >= abs(term)) {
-          comp += (partial - t) + term;
-        } else {
-          comp += (term - t) + partial;
-        }
-        partial = t;
-      }
-      pack = next;
-      scale = n_scale;
-      bias = n_bias;
-      word = n_word;
-      for (uint e = 0u; e < 8u; ++e) {
-        xb[e] = n_xb[e];
-        q[e] = n_q[e];
-      }
+      partial = t;
     }
     tree[lane] = partial;
     tree_lo[lane] = comp;
