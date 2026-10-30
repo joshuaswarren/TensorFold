@@ -94,6 +94,7 @@ pub const Mock = struct {
         defer bytes.deinit(m.gpa);
         var ords: std.AutoHashMapUnmanaged(u64, u64) = .empty;
         defer ords.deinit(m.gpa);
+        const dump = std.c.getenv("TF_DRYRUN_DUMP") != null;
         for (m.entries.items) |e| {
             const W = struct {
                 fn f(l: *std.ArrayList(u8), al: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
@@ -111,6 +112,7 @@ pub const Mock = struct {
                 .submit => try W(&bytes, G, "Q\n", .{}),
             }
         }
+        if (dump) std.debug.print("{s}", .{bytes.items});
         std.crypto.hash.sha2.Sha256.hash(bytes.items, out, .{});
     }
 
