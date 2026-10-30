@@ -247,31 +247,69 @@ pub const Fixture = struct {
     }
 };
 
-/// Host reference reproduces parallel-K strided lanes, fixed tree, bf16 store, and independent row outputs.
+/// One lane's pack sums through the plain chain (the previous, uncompensated split-K).
+fn plainPkLane(sums: []const f32) f32 {
+    var partial: f32 = 0;
+    for (sums) |t| partial += t;
+    return partial;
+}
+
+/// One lane's pack sums through the Neumaier fold of the pack-level compensation: returns hi + lo.
+fn packFoldLane(sums: []const f32) f32 {
+    var partial: f32 = 0;
+    var comp: f32 = 0;
+    for (sums) |psum| {
+        const t = partial + psum;
+        if (@abs(partial) >= @abs(psum)) comp += (partial - t) + psum else comp += (psum - t) + partial;
+        partial = t;
+    }
+    return partial + comp;
+}
+
+/// The qmm_q4_pk kernel's exact host association for output (r, j): lane l walks the row's packs l, l+64, ...;
+/// the 8 elements of a pack are summed with plain f32 adds in ascending order (the qmm.comp expression for
+/// each term), ONE Neumaier fold per pack goes into the lane's (hi, lo); the shared-memory tree folds the 64
+/// pairs at strides 32, 16, 8, 4, 2, 1 with TwoSum; lane 0 adds low to high (a non-finite high keeps its
+/// class) and returns the bf16 bits it stores. Reads the fixture's uploaded bindings at their offsets, so a
+/// row's value depends only on that row's x and its column's w, never on the batch's m.
 pub fn pkOutput(f: Fixture, r: usize, j: usize) u16 {
     const s = f.case.shape;
-    var tree: [64]f32 = @splat(0);
+    var hi: [64]f32 = @splat(0);
+    var lo: [64]f32 = @splat(0);
     for (0..64) |lane| {
         var partial: f32 = 0;
+        var comp: f32 = 0;
         var pack: usize = lane;
         while (pack < s.k / 8) : (pack += 64) {
             const g = pack / 8;
             const scale: f32 = c.fromBf16(f.scales[f.case.at.scales + j * (s.k / 64) + g]);
             const bias: f32 = c.fromBf16(f.biases[f.case.at.biases + j * (s.k / 64) + g]);
             const word = f.w[f.case.at.w + j * (s.k / 8) + pack];
+            var psum: f32 = 0;
             for (0..8) |e| {
                 const q: f32 = @floatFromInt((word >> @as(u5, @intCast(4 * e))) & 0xF);
                 const x: f32 = c.fromBf16(f.x[f.case.at.x + r * s.k + pack * 8 + e]);
-                partial += x * (scale * q + bias);
+                psum += x * (scale * q + bias);
             }
+            const t = partial + psum;
+            if (@abs(partial) >= @abs(psum)) comp += (partial - t) + psum else comp += (psum - t) + partial;
+            partial = t;
         }
-        tree[lane] = partial;
+        hi[lane] = partial;
+        lo[lane] = comp;
     }
     var stride: usize = 32;
     while (stride > 0) : (stride /= 2) for (0..stride) |i| {
-        tree[i] += tree[i + stride];
+        const a = hi[i];
+        const b = hi[i + stride];
+        const sum = a + b;
+        const bb = sum - a;
+        const err = (a - (sum - bb)) + (b - bb);
+        hi[i] = sum;
+        lo[i] = lo[i] + lo[i + stride] + err;
     };
-    return c.toBf16(tree[0]);
+    const total: f32 = if (std.math.isNan(hi[0]) or std.math.isInf(hi[0])) hi[0] else hi[0] + lo[0];
+    return c.toBf16(total);
 }
 
 fn poisoned16(a: std.mem.Allocator, base: usize, len: usize) ![]u16 {
@@ -505,4 +543,12 @@ test "pk compensation: the end guard keeps the float64 class at every non-finite
     terms[7] = -std.math.inf(f32);
     terms[7 + 64] = 0;
     try testing.expectEqual(c.Class.neg_inf, c.classOf(compensatedSum(true, &terms)));
+}
+
+test "the pk host emulation follows the pack-level compensation, not the plain chain" {
+    // three pack sums 1e8, 1, -1e8: the plain chain loses the 1 against 1e8 and ends at 0, the fold keeps
+    // the lost low part and ends at the exact 1.
+    const sums = [_]f32{ 1.0e8, 1.0, -1.0e8 };
+    try testing.expectEqual(@as(f32, 0.0), plainPkLane(&sums));
+    try testing.expectEqual(@as(f32, 1.0), packFoldLane(&sums));
 }
