@@ -3,7 +3,5 @@
 pub const backend = @import("backend/vulkan/backend.zig");
 pub const engine = @import("backend/vulkan/engine.zig");
 pub const config = @import("config.zig");
-/// The engine's Vulkan backend module, for tools that inspect engine state
-/// (the model probe's barrier-elision milestone line).
 /// The engine's Vulkan backend module, for the dry-run harness and tools.
 pub const vk = @import("vulkan");

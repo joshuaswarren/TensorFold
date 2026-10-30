@@ -63,6 +63,7 @@ pub fn main(init: std.process.Init) !u8 {
         try vk.orExit(engine.reset());
         feed = 0;
     }
+    q35v.vk.dispatch.barrier_census.reset();
     var step: u64 = 0;
     while (step < 3) : (step += 1) {
         if (vk.orExit(engine.decodeDraw(feed, null))) |id| {
@@ -74,6 +75,8 @@ pub fn main(init: std.process.Init) !u8 {
             feed = 0;
         }
     }
+    const cen = q35v.vk.dispatch.barrier_census;
+    std.debug.print("DRYRUN decode barriers elided={d} emitted={d}\n", .{ cen.elided, cen.emitted });
     const d = md.mock.dispatchCount();
     const b = md.mock.barrierCount();
     std.debug.print("DRYRUN decode 3 tokens dispatches={d} barriers={d} verdict_failures={d}\n", .{ d - load_d, b - load_b, verdict_failures });
