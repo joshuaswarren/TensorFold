@@ -1,6 +1,33 @@
 #version 460
 
-// Q4 group-64 parallel-K: 64 lanes sum strided packs per output, then a fixed shared tree stores bf16.
+// Specialized from the qmm.comp transposed affine path (bits 4, group 64): one 64-lane
+// workgroup per output (row, column). Lane l walks the row's packed words in ascending
+// strided order (l, l+64, ...) and evaluates EXACTLY the qmm.comp per-element expression
+// scale * float(q) + bias, times the widened bf16 x, accumulated in f32 in ascending
+// lane-element order within a pack; a fixed shared-memory binary tree (strides 32, 16, 8,
+// 4, 2, 1, a barrier between levels, no subgroup ops and no atomics) folds the 64 partials,
+// and lane 0 stores once with the repo's bf16_store RNE. The host grid-strides outputs past
+// the device's workgroup-count limit, so every lane sees the same loop trip count and every
+// barrier sits at uniform control flow; no lane returns before a barrier.
+//
+// The lane's loads are software-pipelined one pack ahead: the next pack's packed word,
+// scale, bias and all eight widened x elements are issued before the current pack's
+// arithmetic runs, so the memory latency overlaps it. The arithmetic, its order, the tree
+// and the store are unchanged — nibble widening and bf16→f32 are exact, so every output is
+// bit-identical to the serial-load kernel (proven bit-exact by tf-qmm-cand on the M1 and
+// on lavapipe, including planted non-finite inputs).
+
+
+// CANDIDATE C1 (private probe kernel): the real qmm_q4_pk with one-deep
+// software-pipelined loads — before a pack's 32 arithmetic operations run, the
+// next pack's word, scale, bias and all 8 widened x elements are already
+// issued, so the memory latency overlaps the arithmetic. The per-output
+// arithmetic is UNCHANGED: same lane pack order (l, l+64, ...), same element
+// order, the same scale*float(q)+bias term and compensated TwoSum per element,
+// the same fixed 6-level tree, class fix and bf16 RNE store. Every operand
+// value is bit-identical (float() of a nibble and the bf16 widen are exact),
+// so every output must equal qmm_q4_pk.comp's bit for bit; the probe proves
+// that before timing. Never a shipped kernel.
 
 // Copyright © 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
 
@@ -25,7 +52,6 @@ layout(set = 0, binding = 4, std430) writeonly buffer Output {
   uint16_t values[];
 } output_data;
 
-// The stage 1 120-byte ComputeParams; only matrix_m/matrix_n/matrix_k are read.
 layout(push_constant) uniform Params {
   uint count;
   uint operation;
@@ -51,14 +77,12 @@ layout(push_constant) uniform Params {
 } params;
 
 shared float tree[64];
-shared float tree_lo[64]; // compensated variants only
+shared float tree_lo[64];
 
-// Widened bf16: exact f32, the qmm.comp LOAD_VALUE read.
 float bf16_load(uint16_t bits) {
   return uintBitsToFloat(uint(bits) << 16u);
 }
 
-// The repo's bf16_store RNE, shared verbatim with qmm.comp (NaN keeps its quiet class).
 uint16_t bf16_store(float value) {
   uint bits = floatBitsToUint(value);
   if (isnan(value)) {
@@ -69,48 +93,83 @@ uint16_t bf16_store(float value) {
 
 void main() {
   uint lane = gl_LocalInvocationID.x;
-  uint words_per_row = params.matrix_k / 8u;   // 8 packed nibbles a word
-  uint groups_per_row = params.matrix_k / 64u; // group 64: 8 words a group
-  uint packs = params.matrix_k / 8u;           // one word packs 8 q4 elements
+  uint words_per_row = params.matrix_k / 8u;
+  uint groups_per_row = params.matrix_k / 64u;
+  uint packs = params.matrix_k / 8u;
   uint total = params.matrix_m * params.matrix_n;
 
-  // Grid-stride over outputs: workgroup w starts at w, advances by gl_NumWorkGroups.x.
   for (uint index = gl_WorkGroupID.x; index < total; index += gl_NumWorkGroups.x) {
     uint row = index / params.matrix_n;
     uint column = index - row * params.matrix_n;
     uint w_base = column * words_per_row;
     uint x_base = row * params.matrix_k;
-    // EXPERIMENT flags select contiguous lanes and compensated TwoSum arithmetic; zero preserves frozen split-K.
+
     bool contiguous = (params.flags & 1u) != 0u && (packs % 64u) == 0u;
-    bool compensated = (params.flags & 2u) != 0u;
     uint chunk = packs / 64u;
     uint first = contiguous ? lane * chunk : lane;
     uint step = contiguous ? 1u : 64u;
     uint last = contiguous ? first + chunk : packs;
     float partial = 0.0;
     float comp = 0.0;
-    for (uint pack = first; pack < last; pack += step) {
-      float scale = bf16_load(scales.values[column * groups_per_row + pack / 8u]);
-      float bias = bf16_load(biases.values[column * groups_per_row + pack / 8u]);
-      uint word = input_w.values[w_base + pack];
+    // the pipeline's current pack, loaded before the loop (lanes with no packs stay at zeros)
+    uint pack = first;
+    float scale = 0.0;
+    float bias = 0.0;
+    uint word = 0u;
+    uint16_t xb[8];
+    float q[8];
+    for (uint e = 0u; e < 8u; ++e) {
+      xb[e] = uint16_t(0u);
+      q[e] = 0.0;
+    }
+    if (pack < last) {
+      scale = bf16_load(scales.values[column * groups_per_row + pack / 8u]);
+      bias = bf16_load(biases.values[column * groups_per_row + pack / 8u]);
+      word = input_w.values[w_base + pack];
       uint k_base = pack * 8u;
       for (uint e = 0u; e < 8u; ++e) {
-        float q = float((word >> (e * 4u)) & 0xFu);
-        if (compensated) {
-          precise float term = bf16_load(input_x.values[x_base + k_base + e]) *
-              (scale * q + bias);
-          precise float t = partial + term;
-          if (abs(partial) >= abs(term)) {
-            comp += (partial - t) + term;
-          } else {
-            comp += (term - t) + partial;
-          }
-          partial = t;
-        } else {
-          // the frozen expression, unchanged
-          partial += bf16_load(input_x.values[x_base + k_base + e]) *
-              (scale * q + bias);
+        xb[e] = input_x.values[x_base + k_base + e];
+        q[e] = float((word >> (e * 4u)) & 0xFu); // exact, so hoisting changes no value
+      }
+    }
+    while (pack < last) {
+      // issue the next pack's loads now; this pack's arithmetic overlaps them
+      uint next = pack + step;
+      bool has_next = next < last;
+      float n_scale = scale;
+      float n_bias = bias;
+      uint n_word = word;
+      uint16_t n_xb[8];
+      float n_q[8];
+      if (has_next) {
+        n_scale = bf16_load(scales.values[column * groups_per_row + next / 8u]);
+        n_bias = bf16_load(biases.values[column * groups_per_row + next / 8u]);
+        n_word = input_w.values[w_base + next];
+        uint n_k_base = next * 8u;
+        for (uint e = 0u; e < 8u; ++e) {
+          n_xb[e] = input_x.values[x_base + n_k_base + e];
+          n_q[e] = float((n_word >> (e * 4u)) & 0xFu);
         }
+      }
+      // the frozen per-element arithmetic, unchanged in value and order
+      for (uint e = 0u; e < 8u; ++e) {
+        precise float term = bf16_load(xb[e]) *
+            (scale * q[e] + bias);
+        precise float t = partial + term;
+        if (abs(partial) >= abs(term)) {
+          comp += (partial - t) + term;
+        } else {
+          comp += (term - t) + partial;
+        }
+        partial = t;
+      }
+      pack = next;
+      scale = n_scale;
+      bias = n_bias;
+      word = n_word;
+      for (uint e = 0u; e < 8u; ++e) {
+        xb[e] = n_xb[e];
+        q[e] = n_q[e];
       }
     }
     tree[lane] = partial;
@@ -118,28 +177,20 @@ void main() {
     barrier();
     for (uint stride = 32u; stride >= 1u; stride >>= 1u) {
       if (lane < stride) {
-        if (compensated) {
-          precise float a = tree[lane];
-          precise float b2 = tree[lane + stride];
-          precise float sum = a + b2;
-          precise float bb = sum - a;
-          precise float err = (a - (sum - bb)) + (b2 - bb);
-          tree[lane] = sum;
-          tree_lo[lane] = tree_lo[lane] + tree_lo[lane + stride] + err;
-        } else {
-          tree[lane] += tree[lane + stride];
-        }
+        precise float a = tree[lane];
+        precise float b2 = tree[lane + stride];
+        precise float sum = a + b2;
+        precise float bb = sum - a;
+        precise float err = (a - (sum - bb)) + (b2 - bb);
+        tree[lane] = sum;
+        tree_lo[lane] = tree_lo[lane] + tree_lo[lane + stride] + err;
       }
       barrier();
     }
     if (lane == 0u) {
-      // Non-finite highs keep their class; finite outputs use the frozen expression after the high/low combine.
-      float total_sum = tree[0];
-      if (compensated) {
-        total_sum = (isnan(tree[0]) || isinf(tree[0])) ? tree[0] : tree[0] + tree_lo[0];
-      }
+      float total_sum = (isnan(tree[0]) || isinf(tree[0])) ? tree[0] : tree[0] + tree_lo[0];
       output_data.values[index] = bf16_store(total_sum);
     }
-    barrier(); // orders this iteration's reads before the next grid-stride iteration's writes
+    barrier();
   }
 }
