@@ -145,9 +145,7 @@ pub const Vulkan = struct {
             .handle => |h| std.math.cast(u32, h) orelse return error.InvalidQwenToken,
         };
         if (token >= pinned.vocab) return error.InvalidQwenToken;
-        // one combined engine operation: decode + GPU greedy draw in a
-        // single submit/fence; the legacy decode/draw pair remains for
-        // reference paths
+        // one combined op: decode + GPU greedy draw in one submit/fence; the legacy decode/draw pair stays too
         return try self.engine.decodeDraw(token, null);
     }
 
@@ -167,8 +165,7 @@ pub const Vulkan = struct {
         if (self.owner != w.stream) return error.UnknownQwenStream;
         if (w.positions.len != 1 or w.positions[0] != self.engine.visible() + 1) return error.InvalidQwenPosition;
         if (samplingRefused(w.stream)) return error.UnsupportedQwenSampling;
-        // the same combined engine operation as queueFn: decode + GPU greedy
-        // draw in a single submit/fence
+        // the same combined operation as queueFn: decode + GPU greedy draw in one submit/fence
         o.sampled[0] = try self.engine.decodeDraw(w.pending, null);
     }
 
