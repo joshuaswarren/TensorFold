@@ -247,11 +247,7 @@ pub const Fixture = struct {
     }
 };
 
-/// The qmm_q4_pk kernel's exact host association for output (r, j): lane l sums the row's
-/// packs l, l+64, ... in f32 (ascending element order within a pack, the qmm.comp expression),
-/// then the shared-memory tree folds the 64 partials at strides 32, 16, 8, 4, 2, 1; returns
-/// the bf16 bits lane 0 stores. Reads the fixture's uploaded bindings at their offsets, so a
-/// row's value depends only on that row's x and its column's w, never on the batch's m.
+/// Host reference reproduces parallel-K strided lanes, fixed tree, bf16 store, and independent row outputs.
 pub fn pkOutput(f: Fixture, r: usize, j: usize) u16 {
     const s = f.case.shape;
     var tree: [64]f32 = @splat(0);
@@ -421,9 +417,7 @@ test "q4 fixture: a row's pk tree output alone is bit-identical to its output in
     }
 }
 
-/// The kernel's compensated lane sums and TwoSum tree: the frozen unguarded error updates
-/// exactly as shipped, with (when `end_guard`) the class fix applied once at the high+low
-/// combine, exactly as the kernel now applies it at its store.
+/// Reference emulates compensated lane sums, TwoSum tree, and optional end guard at the high/low combine.
 fn compensatedSum(comptime end_guard: bool, terms: []const f32) f32 {
     var tree: [64]f32 = @splat(0);
     var los: [64]f32 = @splat(0);
@@ -460,12 +454,7 @@ fn compensatedSum(comptime end_guard: bool, terms: []const f32) f32 {
 }
 
 test "pk compensation: the end guard leaves finite sums bit-identical to the frozen form" {
-    // The select's else operand is the frozen expression, and a finite high implies a finite
-    // chain all the way down (non-finiteness only ever climbs the high tree), so every finite
-    // output executes exactly the arithmetic the kernel shipped with. The overflow round shows
-    // the one intended difference: finite inputs whose running sum passes f32's max give
-    // infinity under the end guard where the frozen form NaN'd, matching the plain serial
-    // chain's overflow class.
+    // Only the end guard changes overflow class; finite outputs retain shipped arithmetic.
     var prng = std.Random.DefaultPrng.init(0xbeef5);
     const rng = prng.random();
     for (0..24) |round| {
@@ -484,11 +473,7 @@ test "pk compensation: the end guard leaves finite sums bit-identical to the fro
 }
 
 test "pk compensation: the end guard keeps the float64 class at every non-finite plant" {
-    // One +inf, one -inf, two opposite infinities sharing a lane, two in different lanes, and a
-    // NaN: the emulated output's class equals the float64 reference's in each case, where the
-    // frozen form gave NaN for a single infinity. The reference's class is order-independent
-    // here: one infinity wins every sum it enters, and an infinity meeting its opposite is NaN
-    // in any order.
+    // Infinity and NaN cases verify the guarded result class against the order-independent f64 reference.
     const Plant = struct { at: usize, put: f32 };
     const plants = [_]Plant{
         .{ .at = 7, .put = std.math.inf(f32) },
@@ -505,7 +490,7 @@ test "pk compensation: the end guard keeps the float64 class at every non-finite
         const got = compensatedSum(true, &terms);
         try testing.expectEqual(c.classOf(want), c.classOf(got));
     }
-    // opposite infinities: in one lane (2048-apart strided neighbours) and in different lanes
+    // opposite infinities: in one lane (64 apart in the term list, consecutive in its chain) and in different lanes
     var terms: [2048]f32 = @splat(0);
     var prng = std.Random.DefaultPrng.init(0x51ce);
     for (&terms) |*v| v.* = (prng.random().float(f32) * 2 - 1) * 0.25;
