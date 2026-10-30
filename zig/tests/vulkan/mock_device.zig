@@ -267,6 +267,15 @@ export fn mockCmdCopyBuffer(_: ?*anyopaque, srcBuffer: ?*anyopaque, dstBuffer: ?
         if (m.resolve(@intFromPtr(srcBuffer), @intCast(region.srcOffset))) |src| {
             if (m.resolve(@intFromPtr(dstBuffer), @intCast(region.dstOffset))) |dst| {
                 @memcpy(dst[0..@intCast(region.size)], src[0..@intCast(region.size)]);
+                // The engine's only 12-byte copy is the greedy verdict slice
+                // (Result { finite_flag, first_bad, index }). A real device
+                // would have executed the argreduce chain; the mock writes
+                // what it would produce on all-finite logits: flag 0, chosen
+                // id 0 (mock-only; never product code).
+                if (region.size == 12) {
+                    const verdict: [3]u32 = .{ 0, 0, 0 };
+                    @memcpy(dst[0..12], std.mem.sliceAsBytes(&verdict)[0..12]);
+                }
             }
         }
         m.log(.{ .copy = .{ .src_buf = @intFromPtr(srcBuffer), .dst_buf = @intFromPtr(dstBuffer), .src_off = @intCast(region.srcOffset), .dst_off = @intCast(region.dstOffset), .bytes = @intCast(region.size) } });
