@@ -402,7 +402,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         },
     });
     host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = contract_fixture })).step);
-    // The parallel-K fixture's host proofs: stated depth, one-row routing, every control's arithmetic refused by its checker.
+    // The parallel-K fixture proves one-row routing and catches its five planted faults (3 arithmetic, 2 input writes).
     const contract_pk_fixture = b.createModule(.{
         .root_source_file = b.path("zig/tests/vulkan/contract_qmm_pk.zig"),
         .target = b.graph.host,
@@ -414,7 +414,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         },
     });
     host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = contract_pk_fixture })).step);
-    // The gdn group's host proofs: walker vs the stage 4 fixture's, depth shape honesty, stress sums' f32 and fp16 margins.
+    // GDN host proofs compare walkers, validate depth shapes, and stress f32 and fp16 sums.
     const contract_gdn_fixture = b.createModule(.{
         .root_source_file = b.path("zig/tests/vulkan/contract_gdn.zig"),
         .target = b.graph.host,
@@ -479,8 +479,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         }
         break :blk out;
     };
-    // The one-row parallel-K kernel and its five controls (contract_controls_pk.comp, a copy of
-    // the kernel with one fault per define), compiled for the same runner.
+    // Compile the one-row parallel-K kernel and its five controls from the same source copy for the contract runner.
     const pk_cmd = b.addSystemCommand(&.{ contract_glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-o" });
     const qmm_q4_pk = pk_cmd.addOutputFileArg("qmm_q4_pk.spv");
     pk_cmd.addFileArg(b.path("zig/kernels/vulkan/qmm_q4_pk.comp"));
