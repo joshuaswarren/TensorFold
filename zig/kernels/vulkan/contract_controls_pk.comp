@@ -117,8 +117,8 @@ void main() {
     uint first = contiguous ? lane * chunk : lane;
     uint step = contiguous ? 1u : 64u;
     uint last = contiguous ? first + chunk : packs;
-    float partial = 0.0;
-    float comp = 0.0;
+    precise float partial = 0.0;
+    precise float comp = 0.0;
     // the pipeline's current pack, loaded before the loop (lanes with no packs stay at zeros)
     uint pack = first;
     float scale = 0.0;

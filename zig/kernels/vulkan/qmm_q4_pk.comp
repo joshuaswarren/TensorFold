@@ -18,16 +18,13 @@
 // on lavapipe, including planted non-finite inputs).
 
 
-// CANDIDATE C1 (private probe kernel): the real qmm_q4_pk with one-deep
-// software-pipelined loads — before a pack's 32 arithmetic operations run, the
-// next pack's word, scale, bias and all 8 widened x elements are already
-// issued, so the memory latency overlaps the arithmetic. The per-output
-// arithmetic is UNCHANGED: same lane pack order (l, l+64, ...), same element
-// order, the same scale*float(q)+bias term and compensated TwoSum per element,
-// the same fixed 6-level tree, class fix and bf16 RNE store. Every operand
-// value is bit-identical (float() of a nibble and the bf16 widen are exact),
-// so every output must equal qmm_q4_pk.comp's bit for bit; the probe proves
-// that before timing. Never a shipped kernel.
+// Load schedule (unit 8a): the next pack's word, scale, bias and its 8 widened x elements are issued before the
+// current pack's 32 arithmetic operations, so the memory latency overlaps the arithmetic. The per-output arithmetic
+// is unchanged: same lane pack order (l, l+64, ...), same element order, the same scale*float(q)+bias term and
+// compensated TwoSum per element, the same fixed 6-level tree, class fix and bf16 RNE store. The accumulators are
+// `precise`: with plain accumulators the device compiler built the pipelined body so that 1 of 6144 outputs differed
+// from the previous kernel by one bf16 ulp on real activations (all three Apple chips); the precise accumulators
+// keep every operation of the compensated chain as written.
 
 // Copyright © 2026 Joshua Warren and mlx-omarchy contributors; MIT License, full text in LICENSES/mlx-omarchy-MIT.txt.
 
@@ -109,8 +106,8 @@ void main() {
     uint first = contiguous ? lane * chunk : lane;
     uint step = contiguous ? 1u : 64u;
     uint last = contiguous ? first + chunk : packs;
-    float partial = 0.0;
-    float comp = 0.0;
+    precise float partial = 0.0;
+    precise float comp = 0.0;
     // the pipeline's current pack, loaded before the loop (lanes with no packs stay at zeros)
     uint pack = first;
     float scale = 0.0;
