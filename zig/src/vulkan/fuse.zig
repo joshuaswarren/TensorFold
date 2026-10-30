@@ -45,6 +45,17 @@ pub fn swigluMilestone(buf: []u8, swiglu_switch: bool, fuse_switch: bool) []cons
     return std.fmt.bufPrint(buf, "off ({s})", .{if (fuse_switch) "TF_VK_FUSE_SWIGLU=0" else "group fusion off"}) catch "off";
 }
 
+/// TF_VK_CONV_INPLACE=0 keeps the qkv copy into the conv window; any other value or unset writes qkv in place.
+pub fn convInplaceFromEnv(v: ?[*:0]const u8) bool {
+    const s = v orelse return true;
+    return !std.mem.eql(u8, std.mem.span(s), "0");
+}
+
+/// The qkv projection can write the conv window tail only for a decode row and when the prefix keeps the binding aligned.
+pub fn convInplaceAllowed(switch_on: bool, rows: usize, prefix_bytes: u64, alignment: u64) bool {
+    return switch_on and rows == 1 and alignment != 0 and prefix_bytes % alignment == 0;
+}
+
 /// TF_VK_FUSE=0 loads exactly as today; any other value or unset fuses.
 pub fn fuseFromEnv(v: ?[*:0]const u8) bool {
     const s = v orelse return true;
@@ -322,4 +333,22 @@ test "the swiglu epilogue requires group fusion and says which switch turned it 
     try testing.expectEqualStrings("on", swigluMilestone(&buf, true, true));
     try testing.expectEqualStrings("off (group fusion off)", swigluMilestone(&buf, true, false));
     try testing.expectEqualStrings("off (TF_VK_FUSE_SWIGLU=0)", swigluMilestone(&buf, false, true));
+}
+
+test "TF_VK_CONV_INPLACE=0 turns the in-place conv window off, anything else leaves it on" {
+    try testing.expect(convInplaceFromEnv(null));
+    try testing.expect(convInplaceFromEnv("1"));
+    try testing.expect(convInplaceFromEnv(""));
+    try testing.expect(!convInplaceFromEnv("0"));
+}
+
+test "the in-place conv window needs a decode row and a binding-aligned prefix" {
+    const prefix: u64 = 3 * 6144 * 2; // three state rows of the 6144 conv channels in bf16
+    try testing.expectEqual(@as(u64, 36864), prefix);
+    try testing.expect(convInplaceAllowed(true, 1, prefix, 256));
+    try testing.expect(convInplaceAllowed(true, 1, prefix, 64));
+    try testing.expect(!convInplaceAllowed(false, 1, prefix, 256)); // the switch is off
+    try testing.expect(!convInplaceAllowed(true, 2, prefix, 256)); // prefill chunks keep the copy
+    try testing.expect(!convInplaceAllowed(true, 1, prefix, 8192)); // 36864 is 4.5 x 8192: an alignment the prefix does not meet
+    try testing.expect(!convInplaceAllowed(true, 1, prefix, 0)); // a device that reports nothing refuses
 }

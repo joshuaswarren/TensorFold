@@ -229,12 +229,14 @@ pub const Gdn = struct {
         try wantSplitOutputs(out_soa, g_out, beta_out);
         try wantF32(&.{a_log});
         const plan = try convPrefillPlan(conv_input.elements, conv_state_in.elements, qkv.elements, weight.elements, conv_state_out.elements, tokens);
-        try refuseOverlap(&.{ conv_input, conv_state_out }, &.{ conv_state_in, qkv, weight });
+        const tail = try conv_input.slice(plan.state_elements, plan.tokens_elements);
+        const in_place = qkv.sameWindow(tail); // the projection already wrote the window tail
+        try refuseOverlap(&.{ conv_input, conv_state_out }, if (in_place) &.{ conv_state_in, weight } else &.{ conv_state_in, qkv, weight });
         try refuseOverlap(&.{ out_soa, g_out, beta_out, conv_out }, &.{ conv_input, a, b, a_log, dt });
         // rows 0..2 of the conv input are the stored conv state
         try m.copy(cmds, try conv_input.slice(0, plan.state_elements), conv_state_in, timeout_ns);
         // rows 3.. are the projection output
-        try m.copy(cmds, try conv_input.slice(plan.state_elements, plan.tokens_elements), qkv, timeout_ns);
+        if (!in_place) try m.copy(cmds, tail, qkv, timeout_ns);
         try m.conv_bf16.bind(&.{ conv_input.bind(), weight.bind(), conv_out.bind() });
         var p: params.Params = .{
             .count = plan.count,
