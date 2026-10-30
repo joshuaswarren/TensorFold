@@ -35,10 +35,7 @@ pub const DenseMlp = struct {
     gate_up: ?Group = null,
 };
 
-/// One fused decode group: the members' weight rows concatenated into three
-/// shared buffers (the member `Quant`s are views into them), so the decode
-/// path can run the group as one projection. `starts` are the members' first
-/// output rows in the fused output (element offsets for a one-row batch).
+/// One fused decode group: member weight rows in three shared buffers (members are views); `starts` are first rows.
 pub const Group = struct {
     fused: Quant,
     starts: [vk.fuse.max_members]u64 = undefined,
@@ -68,8 +65,7 @@ pub const FullLayer = struct {
     q_norm: View,
     k_norm: View,
     mlp: DenseMlp,
-    /// q, k and v of one layer concatenated for the one-row decode pass; the
-    /// member Quant views above point into the same buffers.
+    /// q, k and v of one layer concatenated for the one-row decode pass; the member views point into the same buffers.
     qkv: ?Group = null,
 };
 
@@ -209,20 +205,13 @@ const Builder = struct {
         return ptr;
     }
 
-    /// A device buffer holding `t`'s bytes exactly, streamed through the
-    /// staging buffer; the returned view is typed and word-padded by `View`.
-    ///
-    /// Ownership transfers exactly once: until the slot is registered in
-    /// `keep`, this function alone cleans up (slot plus the Vk allocation) on
-    /// every failure; after registration only `Builder.deinit` frees it, so a
-    /// failed upload never double-frees or leaves a dangling slot.
+    /// Uploads go through staging; `View` pads words; `Builder.deinit` owns slots after `keep`.
     fn tensor(b: *Builder, t: Tensor) !View {
         const kind = kindOf(t.dtype) orelse return error.UnsupportedModel;
         const elements: u64 = @intCast(t.numel());
         const bytes: u64 = @intCast(t.bytes.len);
         const ptr = try b.device(bytes);
-        // registered: in-flight failures exit the process here (orExit),
-        // never unwinding into the frees below this load's scope
+        // Registered slots belong to `Builder.deinit`; `orExit` prevents in-flight failures from unwinding into frees.
         try vk.orExit(vk.upload(b.cmds, ptr.*, 0, b.staging, t.bytes, b.timeout_ns));
         return View.init(ptr, kind, 0, elements);
     }
@@ -243,12 +232,7 @@ const Builder = struct {
         return .{ .w = w, .scales = scales, .biases = biases, .n = n, .k = k };
     }
 
-    /// The members of one decode group as rows of three shared buffers, with
-    /// the pad rows the alignment plan asks for zeroed. Each member keeps a
-    /// full `Quant` (views into the shared buffers), so the prefill path and
-    /// the separate-dispatch fallback read the exact same bytes. The fused
-    /// whole rides alongside for the one-row pass. A group past the device's
-    /// range limits refuses here: the caller loads the members separately.
+    /// A decode group as three shared buffers, pad rows zeroed; members keep `Quant` views; refuses past range limits.
     fn groupQuant(b: *Builder, spec: []const struct { name: []const u8, rows: usize }, k: usize) !Group {
         const lim: vk.ops_q4.Limits = .{
             .max_range = b.dev.properties.limits.maxStorageBufferRange,
@@ -293,8 +277,7 @@ const Builder = struct {
         return g;
     }
 
-    /// A raw BF16 norm gain, passed through byte for byte (the Metal oracle's
-    /// semantics: the kernel multiplies the gain directly, no `1 + w`).
+    // Raw BF16 norm gains pass byte-for-byte; the Metal kernel multiplies gain directly, never `1 + w`.
     fn norm(b: *Builder, name: []const u8, elements: usize) !View {
         return b.raw(name, .bf16, &.{elements});
     }
@@ -334,8 +317,7 @@ const Builder = struct {
         const m = try b.mlp(base);
         if (pinned.linear(index)) {
             const lin = try key(&buf, "{s}linear_attn.", .{base});
-            // The mixer members load first, in the separate layout's order,
-            // so the FUSE=0 stream matches the unit 12 tree byte for byte.
+            // The mixer members load first, in the separate order, so FUSE=0 equals the old stream byte for byte.
             var l: LinearLayer = .{
                 .input_norm = input_norm,
                 .post_norm = post_norm,
@@ -352,8 +334,7 @@ const Builder = struct {
             };
             var done = false;
             if (b.fuse_groups) {
-                // one key buffer per member: shared buffers alias earlier
-                // slices with later (shorter) writes — in_proj_bkv
+                // one key buffer per member: shared buffers alias earlier slices with later shorter writes
                 var kb0: [192]u8 = undefined;
                 var kb1: [192]u8 = undefined;
                 var kb2: [192]u8 = undefined;
@@ -478,8 +459,7 @@ pub const Model = struct {
             .staging = staging,
             .timeout_ns = timeout_ns,
             .table = &ck.main,
-            // TF_VK_FUSE, read once: the concatenation decision is made here,
-            // when the weights are laid out. 0 loads exactly as today.
+            // TF_VK_FUSE, read once: the concatenation is decided when the weights are laid out; 0 loads as before.
             .fuse_groups = vk.fuse.fuseFromEnv(std.c.getenv("TF_VK_FUSE")),
         };
         defer b.deinit();
@@ -537,8 +517,7 @@ pub const Model = struct {
 
 const testing = std.testing;
 
-/// One tensor the loader will request: name, dtype and shape, all checkable
-/// against a safetensors header without a GPU.
+/// One tensor the loader will request: name, dtype and shape, checkable against a safetensors header without a GPU.
 pub const Request = struct { name: []const u8, dtype: loader.table.DType, shape: [4]usize, rank: usize };
 
 /// The layer prefix's tensor name, formatted into `buf` (the Builder's key).
@@ -566,9 +545,7 @@ fn addRequest(gpa: Allocator, out: *std.ArrayList(Request), buf: *[192]u8, compt
     try out.append(gpa, .{ .name = try gpa.dupe(u8, try formatKey(buf, fmt, args)), .dtype = dtype, .shape = shape, .rank = rank });
 }
 
-/// Every tensor the loader requests for layer `index`: names, dtypes,
-/// shapes. Names are heap copies, so the list outlives this call. The caller
-/// frees.
+/// Every tensor the loader requests for layer `index`: names, dtypes, shapes; names are heap copies, the caller frees.
 pub fn layerRequests(gpa: Allocator, index: usize) Error![]Request {
     var out: std.ArrayList(Request) = .empty;
     errdefer out.deinit(gpa);
@@ -605,10 +582,7 @@ pub fn layerRequests(gpa: Allocator, index: usize) Error![]Request {
             try addRequest(gpa, &out, &nb, "{s}A_log", .{lin}, .f32, .{ pinned.linear_heads, 0, 0, 0 }, 1);
             try addRequest(gpa, &out, &nb, "{s}dt_bias", .{lin}, .bf16, .{ pinned.linear_heads, 0, 0, 0 }, 1);
         }
-        // the fused arm's four members each get their OWN key buffer: the
-        // loader's group spec held four slices of one buffer, and the last
-        // (shortest) write left stale tails the earlier slices read back as
-        // in_proj_bkv
+        // each fused member has its own key buffer: a shared one kept stale bytes of an earlier, longer name
         var kb0: [192]u8 = undefined;
         var kb1: [192]u8 = undefined;
         var kb2: [192]u8 = undefined;
@@ -644,9 +618,7 @@ pub fn layerRequests(gpa: Allocator, index: usize) Error![]Request {
 }
 
 test "the fused GDN group resolves every member name against a shared key buffer" {
-    // the loader's group spec holds four names built into one buffer; the
-    // member the loader touches first must read back as in_proj_qkv, not a
-    // stale-tail mash like in_proj_bkv
+    // the loader's group spec holds four names in one buffer; the first must read back as in_proj_qkv, not a stale mash
     const a = testing.allocator;
     const reqs = try layerRequests(a, 0);
     defer {
