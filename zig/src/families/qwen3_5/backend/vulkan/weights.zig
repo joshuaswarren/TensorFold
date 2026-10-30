@@ -364,6 +364,8 @@ const Builder = struct {
         const m = try b.mlp(base);
         if (pinned.linear(index)) {
             const lin = try key(&buf, "{s}linear_attn.", .{base});
+            // The mixer members load first, in the separate layout's order,
+            // so the FUSE=0 stream matches the unit 12 tree byte for byte.
             var l: LinearLayer = .{
                 .input_norm = input_norm,
                 .post_norm = post_norm,
@@ -371,11 +373,11 @@ const Builder = struct {
                 .z = undefined,
                 .a = undefined,
                 .b = undefined,
-                .out = try b.quant(try key(&buf, "{s}out_proj", .{lin}), pinned.hidden, pinned.linear_heads * pinned.linear_dim),
-                .gnorm = try b.norm(try key(&buf, "{s}norm.weight", .{lin}), pinned.linear_dim),
-                .conv = try b.raw(try key(&buf, "{s}conv1d.weight", .{lin}), .bf16, &.{ pinned.conv_dim, pinned.conv_taps, 1 }),
-                .a_log = try b.raw(try key(&buf, "{s}A_log", .{lin}), .f32, &.{pinned.linear_heads}),
-                .dt_bias = try b.raw(try key(&buf, "{s}dt_bias", .{lin}), .bf16, &.{pinned.linear_heads}),
+                .out = undefined,
+                .gnorm = undefined,
+                .conv = undefined,
+                .a_log = undefined,
+                .dt_bias = undefined,
                 .mlp = m,
             };
             var done = false;
@@ -409,6 +411,11 @@ const Builder = struct {
                 l.a = try b.quant(try key(&buf, "{s}in_proj_a", .{lin}), pinned.linear_heads, pinned.hidden);
                 l.b = try b.quant(try key(&buf, "{s}in_proj_b", .{lin}), pinned.linear_heads, pinned.hidden);
             }
+            l.out = try b.quant(try key(&buf, "{s}out_proj", .{lin}), pinned.hidden, pinned.linear_heads * pinned.linear_dim);
+            l.gnorm = try b.norm(try key(&buf, "{s}norm.weight", .{lin}), pinned.linear_dim);
+            l.conv = try b.raw(try key(&buf, "{s}conv1d.weight", .{lin}), .bf16, &.{ pinned.conv_dim, pinned.conv_taps, 1 });
+            l.a_log = try b.raw(try key(&buf, "{s}A_log", .{lin}), .f32, &.{pinned.linear_heads});
+            l.dt_bias = try b.raw(try key(&buf, "{s}dt_bias", .{lin}), .bf16, &.{pinned.linear_heads});
             return .{ .linear = l };
         }
         const attn = try key(&buf, "{s}self_attn.", .{base});
@@ -418,9 +425,9 @@ const Builder = struct {
             .q = undefined,
             .k = undefined,
             .v = undefined,
-            .o = try b.quant(try key(&buf, "{s}o_proj", .{attn}), pinned.hidden, pinned.query_heads * pinned.head_dim),
-            .q_norm = try b.norm(try key(&buf, "{s}q_norm.weight", .{attn}), pinned.head_dim),
-            .k_norm = try b.norm(try key(&buf, "{s}k_norm.weight", .{attn}), pinned.head_dim),
+            .o = undefined,
+            .q_norm = undefined,
+            .k_norm = undefined,
             .mlp = m,
         };
         var done = false;
@@ -448,6 +455,9 @@ const Builder = struct {
             f.k = try b.quant(try key(&buf, "{s}k_proj", .{attn}), pinned.kv_heads * pinned.head_dim, pinned.hidden);
             f.v = try b.quant(try key(&buf, "{s}v_proj", .{attn}), pinned.kv_heads * pinned.head_dim, pinned.hidden);
         }
+        f.o = try b.quant(try key(&buf, "{s}o_proj", .{attn}), pinned.hidden, pinned.query_heads * pinned.head_dim);
+        f.q_norm = try b.norm(try key(&buf, "{s}q_norm.weight", .{attn}), pinned.head_dim);
+        f.k_norm = try b.norm(try key(&buf, "{s}k_norm.weight", .{attn}), pinned.head_dim);
         return .{ .full = f };
     }
 };

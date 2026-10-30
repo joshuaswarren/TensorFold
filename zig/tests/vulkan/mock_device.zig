@@ -92,6 +92,7 @@ pub const Mock = struct {
     pub fn logSha(m: *const Mock, out: *[32]u8) !void {
         var bytes: std.ArrayList(u8) = .empty;
         defer bytes.deinit(m.gpa);
+        const dump = std.c.getenv("TF_DRYRUN_DUMP") != null;
         var ords: std.AutoHashMapUnmanaged(u64, u64) = .empty;
         defer ords.deinit(m.gpa);
         for (m.entries.items) |e| {
@@ -111,6 +112,7 @@ pub const Mock = struct {
                 .submit => try W(&bytes, G, "Q\n", .{}),
             }
         }
+        if (dump) std.debug.print("{s}", .{bytes.items});
         std.crypto.hash.sha2.Sha256.hash(bytes.items, out, .{});
     }
 
