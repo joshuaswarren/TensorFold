@@ -11,6 +11,7 @@ const Commands = commands.Commands;
 const Buffer = memory.Buffer;
 const Error = dispatch.Error;
 const ops_q4 = @import("ops_q4.zig");
+const fuse = @import("fuse.zig");
 
 /// The compiled shader images Ops runs; every field is a real SPIR-V image of the named variant.
 pub const Shaders = struct {
@@ -25,6 +26,9 @@ pub const Shaders = struct {
     copy_u16: []align(4) const u8,
     /// The decode subgroup qmv image (the probe's SG master); null keeps every qmm dispatch on the old kernel.
     qmm_q4_sg: ?[]align(4) const u8 = null,
+    /// The same kernel with the fused swiglu epilogue (-DFUSED_SWIGLU); null keeps the
+    /// decode MLP on candidate B's merged dispatch plus the separate swiglu.
+    qmm_q4_sg_swiglu: ?[]align(4) const u8 = null,
 };
 
 const dummy_bytes: u64 = 256;
@@ -88,8 +92,13 @@ pub const Ops = struct {
     copy_u16: dispatch.Pipeline,
     /// The decode matmul's subgroup qmv pipeline when engine init built it; null keeps the old kernel byte-for-byte.
     qmm_q4_sg: ?dispatch.Pipeline,
+    /// The swiglu-epilogue variant of that kernel (candidate C), built only when TF_VK_FUSE_SWIGLU
+    /// admits it; null keeps the decode MLP on the merged dispatch plus the separate swiglu.
+    qmm_q4_sg_swiglu: ?dispatch.Pipeline,
     /// Fixed once at init; the model probe reports it at ready.
     qmm_path: ops_q4.QmmPath,
+    /// TF_VK_FUSE_SWIGLU's init-time decision; the model probe reports it at ready.
+    fuse_swiglu: bool,
     /// Read-only stand-in for declared bindings a kernel never touches (cast 1, copy 1 and 3).
     dummy: Buffer,
 
@@ -108,7 +117,9 @@ pub const Ops = struct {
             .copy_u32 = undefined,
             .copy_u16 = undefined,
             .qmm_q4_sg = null,
+            .qmm_q4_sg_swiglu = null,
             .qmm_path = .old_device,
+            .fuse_swiglu = false,
             .dummy = try Buffer.init(dev, .device, dummy_bytes),
         };
         errdefer o.dummy.deinit();
@@ -141,6 +152,15 @@ pub const Ops = struct {
             o.qmm_path = .sg;
         }
         errdefer if (o.qmm_q4_sg) |*sg| sg.deinit();
+        // Candidate C's switch, read once at engine init: TF_VK_FUSE_SWIGLU=0 keeps the
+        // decode MLP on candidate B's merged dispatch plus the separate swiglu.
+        o.fuse_swiglu = fuse.swigluFromEnv(std.c.getenv("TF_VK_FUSE_SWIGLU"));
+        if (o.fuse_swiglu) {
+            if (shaders.qmm_q4_sg_swiglu) |img| {
+                o.qmm_q4_sg_swiglu = try dispatch.Pipeline.init(dev, img, .{ .bindings = 5, .push_bytes = params.push_bytes, .writes = 1 << 4 });
+            }
+        }
+        errdefer if (o.qmm_q4_sg_swiglu) |*sw| sw.deinit();
         return o;
     }
 
@@ -156,6 +176,7 @@ pub const Ops = struct {
         o.copy_u32.deinit();
         o.copy_u16.deinit();
         if (o.qmm_q4_sg) |*sg| sg.deinit();
+        if (o.qmm_q4_sg_swiglu) |*sw| sw.deinit();
         o.dummy.deinit();
     }
 
