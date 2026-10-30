@@ -30,7 +30,7 @@ pub fn steps(
     }) });
     b.step("vulkan-model-probe-build", "Build zig-out/bin/tf-qwen35-model without running GPU work").dependOn(&b.addInstallArtifact(probe, .{}).step);
 
-    // (b) the server over the Vulkan engines: the server's entry point and checkpoint CLI, the factory's engine_api.
+    // (b) Server entry point, checkpoint CLI and factory engine_api over Vulkan engines.
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const server = b.addExecutable(.{ .name = "tensorfold-native-vulkan", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/server/main.zig"),

@@ -77,7 +77,7 @@ pub const NormMlp = struct {
         return .{ .buffer = &m.dummy, .len = dummy_bytes };
     }
 
-    /// RMSNorm computes x*rsqrt(mean(x^2)+eps)*gamma; View.init rejects scalar padding, so row gamma binds at offset 0.
+    /// RMSNorm applies x*rsqrt(mean(x^2)+eps)*gamma; row gamma binds at offset 0.
     pub fn rmsNorm(m: *NormMlp, cmds: *Commands, out: View, x: View, gamma: View, rows: u64, width: u64, eps: f32, timeout_ns: u64) Error!void {
         if (out.kind != .bf16 or x.kind != .bf16 or gamma.kind != .bf16) return error.Invalid;
         const plan = try normPlan(x.elements, out.elements, gamma.elements, rows, width, eps);

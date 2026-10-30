@@ -158,7 +158,7 @@ const Builder = struct {
         return t;
     }
 
-    /// Uploads bytes through staging; `View` pads words, and `Builder.deinit` owns slots after `keep` registration.
+    /// Staging uploads pad words; `Builder.deinit` owns slots after `keep`.
     fn tensor(b: *Builder, t: Tensor) !View {
         const kind = kindOf(t.dtype) orelse return error.UnsupportedModel;
         const elements: u64 = @intCast(t.numel());
