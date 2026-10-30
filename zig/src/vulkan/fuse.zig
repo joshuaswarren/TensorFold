@@ -5,17 +5,13 @@ const ops_q4 = @import("ops_q4.zig");
 const dispatch = @import("dispatch.zig");
 const Error = dispatch.Error;
 
-/// TF_VK_FUSE_SWIGLU=0 keeps candidate B's merged dispatch plus the separate
-/// swiglu; any other value or unset lets the decode MLP run one dispatch.
+/// TF_VK_FUSE_SWIGLU=0 keeps the merged gate|up dispatch plus the separate swiglu; otherwise the MLP runs one dispatch.
 pub fn swigluFromEnv(v: ?[*:0]const u8) bool {
     const s = v orelse return true;
     return !std.mem.eql(u8, std.mem.span(s), "0");
 }
 
-/// The fused-swiglu workgroup's row mapping, mirroring the shader's
-/// FUSED_SWIGLU arithmetic exactly: workgroup w's slots 0 and 1 own gate rows
-/// 4w..4w+3, slots 2 and 3 the matching up rows (weight rows gate_rows past
-/// them); the epilogue writes out rows 4w..4w+3. Pure and host-tested.
+/// The fused-swiglu workgroup row mapping as the shader's FUSED_SWIGLU: slots 0-1 own gate rows, 2-3 the up rows.
 pub fn swigluSlotRow(workgroup: u64, slot: u64, r: u64, gate_rows: u64) struct { weight_row: u64, out_row: u64 } {
     const half = slot / 2;
     const pair = slot % 2;
@@ -23,20 +19,14 @@ pub fn swigluSlotRow(workgroup: u64, slot: u64, r: u64, gate_rows: u64) struct {
     return .{ .weight_row = out_row + half * gate_rows, .out_row = out_row };
 }
 
-/// f32 -> bf16 -> f32, round to nearest even — the GLSL bf16_store's integer
-/// trick (NaN keeps its class; the tests never generate one).
+/// f32 -> bf16 -> f32, round to nearest even: the GLSL bf16_store's integer trick (NaN keeps its class).
 pub fn bf16Round(v: f32) f32 {
     const bits: u32 = @bitCast(v);
     if ((bits & 0x7fffffff) > 0x7f800000) return v;
     return @bitCast((bits +% 0x7fff +% ((bits >> 16) & 1)) & 0xffff0000);
 }
 
-/// The fused epilogue on the accumulators: both dots rounded to bf16 (the
-/// store point of the unfused pipeline), then swiglu.comp's ASH_QWEN35
-/// program — denom = 1 + exp(-g), silu = g / denom (the division form, no
-/// intermediate rounding), one round at the store. Host emulation of the
-/// composition and the rounding points; the GPU's exp and division must
-/// compile identically in both kernels, which the device pilot hashes gate.
+/// The fused epilogue on the accumulators: both dots rounded to bf16, then swiglu.comp's program; host emulation.
 pub fn swigluEpilogue(acc_g: f32, acc_u: f32) f32 {
     const g = bf16Round(acc_g);
     const u = bf16Round(acc_u);
@@ -45,9 +35,7 @@ pub fn swigluEpilogue(acc_g: f32, acc_u: f32) f32 {
     return bf16Round(silu * u);
 }
 
-/// Candidate C rides candidate B: the epilogue dispatches the merged
-/// gate|up group, so group fusion off means the epilogue is off however the
-/// env switch is set.
+/// The fused swiglu epilogue needs the merged gate|up group, so FUSE off disables it.
 pub fn swigluEffective(swiglu_switch: bool, fuse_switch: bool) bool {
     return swiglu_switch and fuse_switch;
 }
@@ -213,15 +201,14 @@ test "the swiglu-epilogue workgroup mapping covers every row exactly once" {
 test "the fused epilogue composes the two unfused stages bit for bit on the host" {
     var prng = std.Random.DefaultPrng.init(0xc0ffee);
     const rand = prng.random();
-    // the unfused pipeline: qmm stores bf16(acc) (RNE), swiglu widens exactly,
-    // applies the ASH formula in f32, stores bf16
+    // the unfused pipeline: qmm stores bf16(acc) (RNE), swiglu widens exactly, applies the Qwen3.5 formula, stores bf16
     for (0..2000) |_| {
         const acc_g = rand.float(f32) * 20 - 10;
         const acc_u = rand.float(f32) * 20 - 10;
         // stage 1 (the qmm store): bf16 rounding
         const stored_g = bf16Round(acc_g);
         const stored_u = bf16Round(acc_u);
-        // stage 2 (swiglu.comp's ASH_QWEN35 path): widen exact, one round at the store
+        // stage 2 (swiglu.comp's Qwen3.5 path): widen exact, one round at the store
         const denom = 1.0 + @exp(-stored_g);
         const want = bf16Round((stored_g / denom) * stored_u);
         // the fused epilogue: identical operations on the identical rounded inputs
@@ -239,9 +226,7 @@ test "TF_VK_FUSE_SWIGLU and the census: 24 swiglu dispatches go, 376 remain" {
     try testing.expectEqual(@as(u64, 376), 490 - saved_by_b - swiglu_dispatches);
 }
 
-/// The single-row qmm chain on the host, over packed words exactly as
-/// uploaded (the affine_fixture replay's in-order acc += x * (s q + b),
-/// bf16 params widened exactly): one output element per weight row.
+/// The host single-row qmm chain over packed words as uploaded (in-order acc += x * (s q + b)): one output per row.
 fn replayRow(x: []const f32, w: []const u32, scales: []const u16, biases: []const u16, w_row_words: u64, param_row_groups: u64, row: u64, k: u64) f32 {
     var acc: f32 = 0;
     const s_at = row * param_row_groups;
@@ -330,7 +315,7 @@ test "the real 2B tower fuses 90 of its 490 decode dispatches away" {
 
 test "the swiglu epilogue requires group fusion and says which switch turned it off" {
     try testing.expect(swigluEffective(true, true));
-    try testing.expect(!swigluEffective(true, false)); // C rides B's merged weights
+    try testing.expect(!swigluEffective(true, false)); // the epilogue rides the merged weights
     try testing.expect(!swigluEffective(false, true));
     try testing.expect(!swigluEffective(false, false));
     var buf: [96]u8 = undefined;
