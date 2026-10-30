@@ -10,10 +10,7 @@ const check = runtime.check;
 
 pub const Error = runtime.Error || error{ BadSpirv, NoLocalSize, TooManyBindings, BadPushSize, BadWorkgroup, BadGroupCount, BadBindings, Aliased, BatchOverflow };
 
-/// Barrier elision: a dispatch's post-barrier is deferred and emitted only
-/// before a later dispatch (or command) that actually hazards against it.
-/// TF_VK_NOBAR=0 restores today's barrier after every dispatch for a
-/// same-binary A/B; any other value or unset elides.
+/// Barrier elision: a dispatch's post-barrier is deferred until something hazards; TF_VK_NOBAR=0 restores it.
 pub var elide_barriers: bool = true;
 
 pub fn elideFromEnv(v: ?[*:0]const u8) bool {
@@ -21,8 +18,7 @@ pub fn elideFromEnv(v: ?[*:0]const u8) bool {
     return !std.mem.eql(u8, std.mem.span(s), "0");
 }
 
-/// One buffer range a dispatch reads or writes: same underlying buffer and
-/// intersecting [offset, offset+len) is a hazard.
+/// One buffer range a dispatch reads or writes: same buffer and intersecting range is a hazard.
 pub const HazardRange = struct { buf: c.VkBuffer, offset: u64, len: u64 };
 
 pub const hazard_range_cap = 32;
@@ -31,10 +27,7 @@ fn rangesOverlap(a: HazardRange, b: HazardRange) bool {
     return a.buf == b.buf and a.offset < b.offset + b.len and b.offset < a.offset + a.len;
 }
 
-/// Would recording a dispatch with these ranges against the not-yet-
-/// barriered earlier work need the full barrier? RAW: the next reads what
-/// an earlier unsynchronised dispatch wrote. WAW: it writes it. WAR: it
-/// writes what an earlier one read. Pure and host-tested.
+/// Would this dispatch against unsynchronised work need the barrier? RAW, WAW or WAR do. Pure and host-tested.
 pub fn hazardNeeded(pending_writes: []const HazardRange, pending_reads: []const HazardRange, next_writes: []const HazardRange, next_reads: []const HazardRange) bool {
     for (pending_writes) |w| {
         for (next_reads) |r| if (rangesOverlap(w, r)) return true;
@@ -46,10 +39,7 @@ pub fn hazardNeeded(pending_writes: []const HazardRange, pending_reads: []const 
     return false;
 }
 
-/// The unsynchronised writes and reads accumulated since the last emitted
-/// barrier. Bounded: past the cap the set saturates and every hazard check
-/// orders, so elision degrades to today's behaviour instead of dropping a
-/// range.
+/// Unsynchronised writes and reads since the last barrier; past the cap it saturates and every check orders.
 pub const Hazard = struct {
     writes: [hazard_range_cap]HazardRange = undefined,
     reads: [hazard_range_cap]HazardRange = undefined,
@@ -94,13 +84,10 @@ pub const Hazard = struct {
     }
 };
 
-/// The one command buffer's pending barrier state; the engine is single-
-/// threaded and one command buffer is recorded at a time (the batch_open
-/// style).
+/// The one command buffer's pending barrier state; the engine serves one stream at a time, one buffer at a time.
 pub var hazard_pending: Hazard = .{};
 
-/// The barrier a deferred dispatch owes, emitted verbatim before the
-/// hazarding dispatch or command; then the set restarts.
+/// The barrier a deferred dispatch owes, emitted verbatim before the hazarding dispatch or command.
 pub fn flushHazard(dev: *const Device, cmd: c.VkCommandBuffer) void {
     if (hazard_pending.n_writes == 0 and hazard_pending.n_reads == 0 and !hazard_pending.saturated) return;
     const b: c.VkMemoryBarrier = .{
@@ -163,8 +150,7 @@ pub const Pipeline = struct {
     batch_epoch_seen: u32 = 0,
     stash: [max_bindings]Binding = undefined,
     stash_n: u32 = 0,
-    /// The bindings of the pending dispatch, kept for the barrier-elision
-    /// hazard check in record (both schedules: bind is the single door).
+    /// The pending dispatch's bindings, kept for the hazard check in record (bind is the single door).
     last_bindings: [max_bindings]Binding = undefined,
     last_n: u32 = 0,
 
@@ -364,7 +350,7 @@ pub const Pipeline = struct {
         const api = &p.dev.api;
         const reads = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT | c.VK_ACCESS_TRANSFER_READ_BIT | c.VK_ACCESS_TRANSFER_WRITE_BIT;
         const stages = c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | c.VK_PIPELINE_STAGE_TRANSFER_BIT;
-        // TF_VK_NOBAR=0: today's stream verbatim — one full barrier after every dispatch.
+        // TF_VK_NOBAR=0: the previous stream exactly, one barrier after every dispatch.
         if (!elide_barriers) {
             api.vkCmdBindPipeline(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
             api.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout, 0, 1, &set, 0, null);
@@ -377,11 +363,7 @@ pub const Pipeline = struct {
             }, 0, null, 0, null);
             return;
         }
-        // Elision: the deferred barrier of the earlier unsynchronised
-        // dispatches is owed before this one only when they actually hazard
-        // (RAW, WAW or WAR over the same underlying buffer ranges);
-        // otherwise this dispatch joins the unsynchronised set and the
-        // batch/submission end flushes what is left.
+        // The earlier unsynchronised dispatches' deferred barrier is owed here only on a real hazard.
         const bindings = p.last_bindings[0..p.last_n];
         var next_w: [max_bindings]HazardRange = undefined;
         var next_r: [max_bindings]HazardRange = undefined;
@@ -585,7 +567,7 @@ test "hazardNeeded orders RAW, WAW and WAR and admits independent dispatches" {
     const in = hbuf(0x10);
     const qkv = hbuf(0x20);
     const z = hbuf(0x30);
-    // no pending writes: nothing to order against
+    // a pending write to qkv, a next dispatch that touches only in: no overlap, no barrier
     try std.testing.expect(!hazardNeeded(&.{hr(qkv, 0, 64)}, &.{}, &.{hr(in, 0, 64)}, &.{hr(in, 0, 64)}));
     const pending = [_]HazardRange{hr(qkv, 0, 64)};
     try std.testing.expect(hazardNeeded(&pending, &.{}, &.{}, &.{hr(qkv, 0, 32)})); // RAW: next reads qkv
@@ -608,7 +590,7 @@ test "the unsynchronised set accumulates across elided dispatches until a flush"
     h.add(&.{hr(a_out, 0, 64)}, &.{hr(shared_in, 0, 64)}); // a: reads shared, writes a_out
     try std.testing.expect(!h.hazard(&.{}, &.{hr(shared_in, 0, 64)})); // b: reads shared, writes b_out: independent of a
     h.add(&.{hr(b_out, 0, 64)}, &.{hr(shared_in, 0, 64)});
-    // c reads a's output (not b's): the barrier is still needed — a is unsynchronised
+    // c reads a's output (not b's): the barrier is still needed, a is unsynchronised
     try std.testing.expect(h.hazard(&.{}, &.{hr(a_out, 0, 64)}));
     h.clear();
     try std.testing.expect(!h.hazard(&.{}, &.{hr(a_out, 0, 64)})); // after the flush, nothing pending
