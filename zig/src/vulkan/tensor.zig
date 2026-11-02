@@ -69,11 +69,6 @@ pub const View = struct {
         return .{ .buffer = v.buffer, .offset = v.byte_offset, .len = v.byteLen() };
     }
 
-    /// Whether two windows are the very same bytes: one buffer, offset, length and kind.
-    pub fn sameWindow(a: View, b: View) bool {
-        return a.buffer == b.buffer and a.byte_offset == b.byte_offset and a.elements == b.elements and a.kind == b.kind;
-    }
-
     /// Whether two windows overlap (same buffer only); used to refuse aliasing before Pipeline.bind does.
     pub fn overlaps(a: View, b: View) bool {
         return a.buffer == b.buffer and a.byte_offset < b.byte_offset + b.byteLen() and b.byte_offset < a.byte_offset + a.byteLen();
@@ -136,16 +131,4 @@ test "overlap is same-buffer range intersection" {
     try testing.expect(a.overlaps(c));
     try testing.expect(!a.overlaps(b));
     try testing.expect(!a.overlaps(d));
-}
-
-test "sameWindow is one buffer with identical offset, length and kind" {
-    const buf = fakeBuffer(1024);
-    const other = fakeBuffer(1024);
-    const v = try View.init(&buf, .bf16, 64, 32);
-    try testing.expect(v.sameWindow(try View.init(&buf, .bf16, 64, 32)));
-    try testing.expect(v.sameWindow(try (try View.init(&buf, .bf16, 0, 128)).slice(32, 32)));
-    try testing.expect(!v.sameWindow(try View.init(&buf, .bf16, 64, 16)));
-    try testing.expect(!v.sameWindow(try View.init(&buf, .bf16, 128, 32)));
-    try testing.expect(!v.sameWindow(try View.init(&buf, .u16, 64, 32)));
-    try testing.expect(!v.sameWindow(try View.init(&other, .bf16, 64, 32)));
 }

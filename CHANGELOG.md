@@ -94,7 +94,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 - Vulkan decode folds the MLP's merged gate and up projection and its swiglu into one dispatch: an epilogue of the subgroup decode kernel applies the ASH_QWEN35 swiglu program (swiglu.comp) to the two bf16-rounded dots and stores only the activations, 400 to 376 dispatches per decoded token on the engine's recorded command stream; it needs group fusion on, and `TF_VK_FUSE_SWIGLU=0` keeps the separate swiglu dispatch. {{unit 15: steady-token timing per chip and the logits-hash result}} (#PR_TBD). Thanks to @joshuawarren.
 
-- Vulkan decode writes the GDN qkv projection straight into the tail of the conv window (the three state rows are copied in front), dropping the 18 per-token qkv window copies and the barrier behind each: 490 to 472 dispatches per decoded token with fusion off, 376 to 358 with group fusion and the swiglu epilogue, on the engine's recorded command stream, and `TF_VK_CONV_INPLACE=0` restores the copy. {{unit 16: steady-token timing per chip and the logits-hash result}} (#PR_TBD). Thanks to @joshuawarren.
+- Vulkan single-row GDN convolution uses the existing fused state/convolution operator without an assembled input window. Multi-row prefill keeps its existing path. This removes the decode-only window allocation and `TF_VK_CONV_INPLACE` switch. Native output equality and timing remain unmeasured for this source change.
 
 ## 1.1.9
 

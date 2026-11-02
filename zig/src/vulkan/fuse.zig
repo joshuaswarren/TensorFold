@@ -45,17 +45,6 @@ pub fn swigluMilestone(buf: []u8, swiglu_switch: bool, fuse_switch: bool) []cons
     return std.fmt.bufPrint(buf, "off ({s})", .{if (fuse_switch) "TF_VK_FUSE_SWIGLU=0" else "group fusion off"}) catch "off";
 }
 
-/// TF_VK_CONV_INPLACE=0 keeps the qkv copy into the conv window; any other value or unset writes qkv in place.
-pub fn convInplaceFromEnv(v: ?[*:0]const u8) bool {
-    const s = v orelse return true;
-    return !std.mem.eql(u8, std.mem.span(s), "0");
-}
-
-/// The qkv projection writes the conv window tail only for a decode row and a binding-aligned prefix.
-pub fn convInplaceAllowed(switch_on: bool, rows: usize, prefix_bytes: u64, alignment: u64) bool {
-    return switch_on and rows == 1 and alignment != 0 and prefix_bytes % alignment == 0;
-}
-
 /// TF_VK_FUSE=0 loads exactly as today; any other value or unset fuses.
 pub fn fuseFromEnv(v: ?[*:0]const u8) bool {
     const s = v orelse return true;
@@ -228,13 +217,10 @@ test "the fused epilogue composes the two unfused stages bit for bit on the host
     }
 }
 
-test "TF_VK_FUSE_SWIGLU and the census: 24 swiglu dispatches go, 376 remain" {
+test "TF_VK_FUSE_SWIGLU admits the epilogue unless explicitly disabled" {
     try testing.expect(swigluFromEnv(null));
     try testing.expect(swigluFromEnv("1"));
     try testing.expect(!swigluFromEnv("0"));
-    const saved_by_b: u64 = 90;
-    const swiglu_dispatches: u64 = 24; // one per layer, deleted by the epilogue
-    try testing.expectEqual(@as(u64, 376), 490 - saved_by_b - swiglu_dispatches);
 }
 
 /// The host single-row qmm chain over packed words as uploaded (in-order acc += x * (s q + b)): one output per row.
@@ -304,26 +290,6 @@ test "a row replayed from the fused bytes equals the member replayed alone, bit 
     };
 }
 
-test "the real 2B tower fuses 90 of its 490 decode dispatches away" {
-    // qmm dispatches per decode token: 18 x (qkv,z,a,b,out) + 6 x (q,k,v,o) + 24 x (gate,up,down) + head = 187.
-    var qmm: u64 = 1; // the head
-    var saved: u64 = 0;
-    for (0..24) |i| {
-        if (i % 4 == 3) {
-            qmm += 4; // q,k,v,o
-            saved += 2; // q,k,v -> one
-        } else {
-            qmm += 5; // qkv,z,a,b,out
-            saved += 3; // qkv,z,a,b -> one
-        }
-        qmm += 3; // gate,up,down
-        saved += 1; // gate,up -> one
-    }
-    try testing.expectEqual(@as(u64, 187), qmm);
-    try testing.expectEqual(@as(u64, 90), saved);
-    try testing.expectEqual(@as(u64, 490 - 90), 490 - saved); // 400 remain
-}
-
 test "the swiglu epilogue requires group fusion and says which switch turned it off" {
     try testing.expect(swigluEffective(true, true));
     try testing.expect(!swigluEffective(true, false)); // the epilogue rides the merged weights
@@ -333,22 +299,4 @@ test "the swiglu epilogue requires group fusion and says which switch turned it 
     try testing.expectEqualStrings("on", swigluMilestone(&buf, true, true));
     try testing.expectEqualStrings("off (group fusion off)", swigluMilestone(&buf, true, false));
     try testing.expectEqualStrings("off (TF_VK_FUSE_SWIGLU=0)", swigluMilestone(&buf, false, true));
-}
-
-test "TF_VK_CONV_INPLACE=0 turns the in-place conv window off, anything else leaves it on" {
-    try testing.expect(convInplaceFromEnv(null));
-    try testing.expect(convInplaceFromEnv("1"));
-    try testing.expect(convInplaceFromEnv(""));
-    try testing.expect(!convInplaceFromEnv("0"));
-}
-
-test "the in-place conv window needs a decode row and a binding-aligned prefix" {
-    const prefix: u64 = 3 * 6144 * 2; // three state rows of the 6144 conv channels in bf16
-    try testing.expectEqual(@as(u64, 36864), prefix);
-    try testing.expect(convInplaceAllowed(true, 1, prefix, 256));
-    try testing.expect(convInplaceAllowed(true, 1, prefix, 64));
-    try testing.expect(!convInplaceAllowed(false, 1, prefix, 256)); // the switch is off
-    try testing.expect(!convInplaceAllowed(true, 2, prefix, 256)); // prefill chunks keep the copy
-    try testing.expect(!convInplaceAllowed(true, 1, prefix, 8192)); // 36864 is 4.5 x 8192: not aligned
-    try testing.expect(!convInplaceAllowed(true, 1, prefix, 0)); // a device that reports nothing refuses
 }
