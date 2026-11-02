@@ -100,7 +100,18 @@ pub const Core = struct {
         const mark = c.scratch.mark();
         errdefer c.scratch.reset(mark) catch {};
         const dim = pinned.linear_heads * pinned.linear_dim;
-        const qkv = try c.scratch.alloc(.bf16, rows * pinned.conv_dim);
+        const window_prefix: u64 = state.conv_rows * pinned.conv_dim;
+        const in_place = vk.ops.convInplaceAllowed(
+            c.acc.ops.conv_inplace,
+            rows,
+            window_prefix * 2,
+            c.acc.ops.dev.properties.limits.minStorageBufferOffsetAlignment,
+        );
+        const window = if (in_place) try c.scratch.alloc(.bf16, window_prefix + pinned.conv_dim) else null;
+        const qkv = if (window) |v|
+            try v.slice(window_prefix, pinned.conv_dim)
+        else
+            try c.scratch.alloc(.bf16, rows * pinned.conv_dim);
         try c.project(qkv, x, layer.qkv);
         const z = try c.scratch.alloc(.bf16, rows * dim);
         try c.project(z, x, layer.z);
@@ -112,7 +123,7 @@ pub const Core = struct {
         const g = try c.scratch.alloc(.f32, rows * pinned.linear_heads);
         const beta = try c.scratch.alloc(.bf16, rows * pinned.linear_heads);
         const conv_out = try c.scratch.alloc(.bf16, rows * pinned.conv_dim);
-        const conv_in = try c.scratch.alloc(.bf16, (rows + state.conv_rows) * pinned.conv_dim);
+        const conv_in = window orelse try c.scratch.alloc(.bf16, (rows + state.conv_rows) * pinned.conv_dim);
         try vk.orExit(c.acc.gdn.convPrefill(c.cmds, soa, g, beta, conv_out, conv_in, s.convInput(slot), qkv, layer.conv, a, b, layer.a_log, layer.dt_bias, s.convOutput(slot), rows, c.timeout_ns));
         const y = try c.scratch.alloc(.bf16, rows * dim);
         try vk.orExit(c.acc.gdn.prefillRecur(c.cmds, soa, g, beta, s.gdnInput(slot), y, s.gdnOutput(slot), null, rows, @min(rows, max_gdn_chunk), c.timeout_ns));

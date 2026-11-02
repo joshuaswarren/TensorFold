@@ -104,6 +104,13 @@ fn refuseOverlap(writes: []const View, reads: []const View) Error!void {
     };
 }
 
+pub fn convCopyRequired(conv_input: View, qkv: View, state_elements: u64) Error!bool {
+    const tail = try conv_input.slice(state_elements, qkv.elements);
+    if (qkv.sameWindow(tail)) return false;
+    try refuseOverlap(&.{conv_input}, &.{qkv});
+    return true;
+}
+
 pub const Gdn = struct {
     dev: *const Device,
     copy_u16: dispatch.Pipeline,
@@ -229,12 +236,14 @@ pub const Gdn = struct {
         try wantSplitOutputs(out_soa, g_out, beta_out);
         try wantF32(&.{a_log});
         const plan = try convPrefillPlan(conv_input.elements, conv_state_in.elements, qkv.elements, weight.elements, conv_state_out.elements, tokens);
-        try refuseOverlap(&.{ conv_input, conv_state_out }, &.{ conv_state_in, qkv, weight });
+        const copy_qkv = try convCopyRequired(conv_input, qkv, plan.state_elements);
+        try refuseOverlap(&.{ conv_input, conv_state_out }, &.{ conv_state_in, weight });
+        try refuseOverlap(&.{conv_state_out}, &.{qkv});
         try refuseOverlap(&.{ out_soa, g_out, beta_out, conv_out }, &.{ conv_input, a, b, a_log, dt });
         // rows 0..2 of the conv input are the stored conv state
         try m.copy(cmds, try conv_input.slice(0, plan.state_elements), conv_state_in, timeout_ns);
         // rows 3.. are the projection output
-        try m.copy(cmds, try conv_input.slice(plan.state_elements, plan.tokens_elements), qkv, timeout_ns);
+        if (copy_qkv) try m.copy(cmds, try conv_input.slice(plan.state_elements, plan.tokens_elements), qkv, timeout_ns);
         try m.conv_bf16.bind(&.{ conv_input.bind(), weight.bind(), conv_out.bind() });
         var p: params.Params = .{
             .count = plan.count,
@@ -632,4 +641,15 @@ test "gdn push flags match the masks the embedded shaders actually test" {
     try testing.expectEqual(@as(u32, 0), conv_decode_flags);
     try testing.expect(std.mem.indexOf(u8, src.gdn_conv_decode, "(params.flags & 1u)") != null);
     try testing.expect(std.mem.indexOf(u8, src.gdn_conv_decode, "(params.flags & 2u)") != null);
+}
+
+test "conv copy skips only the exact projection tail and rejects partial overlap" {
+    const buf = Buffer{ .dev = undefined, .handle = null, .memory = null, .len = 128, .kind = .device, .mapped = null, .coherent = false };
+    const window = try View.init(&buf, .bf16, 0, 32);
+    const tail = try window.slice(24, 8);
+    try testing.expect(!try convCopyRequired(window, tail, 24));
+    try testing.expect(try convCopyRequired(window, try View.init(&buf, .bf16, 64, 8), 24));
+    try testing.expectError(error.Aliased, convCopyRequired(window, try View.init(&buf, .bf16, 44, 8), 24));
+    try testing.expectError(error.Aliased, convCopyRequired(window, try View.init(&buf, .u16, 48, 8), 24));
+    try testing.expectError(error.OutOfRange, convCopyRequired(window, tail, 28));
 }

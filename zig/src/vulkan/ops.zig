@@ -71,6 +71,14 @@ pub fn dequantPlan(out_elements: u64, w_elements: u64, scales_elements: u64, bia
     };
 }
 
+pub fn convInplaceFromEnv(v: ?[*:0]const u8) bool {
+    return if (v) |s| std.mem.eql(u8, std.mem.span(s), "1") else false;
+}
+
+pub fn convInplaceAllowed(switch_on: bool, rows: usize, prefix_bytes: u64, alignment: u64) bool {
+    return switch_on and rows == 1 and alignment != 0 and prefix_bytes % alignment == 0;
+}
+
 pub const Ops = struct {
     dev: *const Device,
     qmm_bf16: dispatch.Pipeline,
@@ -81,6 +89,7 @@ pub const Ops = struct {
     cast_f32_bf16: dispatch.Pipeline,
     copy_u32: dispatch.Pipeline,
     copy_u16: dispatch.Pipeline,
+    conv_inplace: bool,
     /// Read-only stand-in for declared bindings a kernel never touches (cast 1, copy 1 and 3).
     dummy: Buffer,
 
@@ -97,6 +106,7 @@ pub const Ops = struct {
             .cast_f32_bf16 = undefined,
             .copy_u32 = undefined,
             .copy_u16 = undefined,
+            .conv_inplace = convInplaceFromEnv(std.c.getenv("TF_VK_CONV_INPLACE")),
             .dummy = try Buffer.init(dev, .device, dummy_bytes),
         };
         errdefer o.dummy.deinit();
@@ -253,4 +263,18 @@ test "dispatch groups round up without wrapping" {
     try testing.expectEqual([3]u32{ 1, 1, 1 }, dispatchGroups(256, 256));
     try testing.expectEqual([3]u32{ 2, 1, 1 }, dispatchGroups(257, 256));
     try testing.expectEqual([3]u32{ (1 << 32) / 256, 1, 1 }, dispatchGroups(std.math.maxInt(u32), 256));
+}
+
+test "conv window reuse requires explicit opt-in and aligned single-row projection" {
+    try testing.expect(!convInplaceFromEnv(null));
+    try testing.expect(!convInplaceFromEnv("0"));
+    try testing.expect(!convInplaceFromEnv(""));
+    try testing.expect(convInplaceFromEnv("1"));
+    const prefix: u64 = 3 * 6144 * 2;
+    try testing.expect(convInplaceAllowed(true, 1, prefix, 256));
+    try testing.expect(!convInplaceAllowed(false, 1, prefix, 256));
+    try testing.expect(!convInplaceAllowed(true, 0, prefix, 256));
+    try testing.expect(!convInplaceAllowed(true, 2, prefix, 256));
+    try testing.expect(!convInplaceAllowed(true, 1, prefix, 8192));
+    try testing.expect(!convInplaceAllowed(true, 1, prefix, 0));
 }
