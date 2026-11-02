@@ -4,7 +4,7 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
-- Vulkan Qwen3.5 decode can write its QKV projection directly into the convolution window with `TF_VK_CONV_INPLACE=1`. The option is off by default. Prompt processing and unaligned windows keep the copy. No kernel arithmetic changes.
+- Vulkan Qwen3.5 can write a single-row QKV projection directly into the convolution window with `TF_VK_CONV_INPLACE=1`. The option is off by default. Multi-row prompt processing and unaligned windows keep the copy. No kernel arithmetic changes.
 
 - LFM2.5-24B-A2B on Metal can hand an external drafter the rows of the layers it reads (its taps), copied on the GPU by a new kernel, `lfm2_tap`, that the kernel contract checks bit for bit with two planted controls (#1390, part of #1374). A drafting stream resumes a kept prompt state only when it also holds the drafter's context. Nothing uses the taps yet: without a drafter none are kept and every forward runs as before. Thanks to @BlivionIaG.
 
