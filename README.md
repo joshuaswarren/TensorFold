@@ -290,3 +290,7 @@ Thank you to everyone who has sent TensorFold a pull request, a measurement or a
 [@xjqx2z](https://github.com/xjqx2z),
 [@Yuepixel](https://github.com/Yuepixel),
 [@YvesLaRose](https://github.com/YvesLaRose).
+
+## Contributors
+
+Everyone credited so far: [CONTRIBUTORS.md](CONTRIBUTORS.md).
