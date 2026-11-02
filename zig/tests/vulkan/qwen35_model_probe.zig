@@ -355,13 +355,13 @@ pub fn main(init: std.process.Init) !u8 {
     const samples_b = try a.alloc(SteadySample, expected.len - 1);
     defer a.free(samples_b);
 
-    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_a, rows_a, row_len, samples_a, io) catch |e| {
+    const ttft_a = greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_a, rows_a, row_len, samples_a, io) catch |e| {
         std.debug.print("FAIL run1: {s}\n", .{@errorName(e)});
         return 1;
     };
     std.debug.print("MILESTONE run1-done elapsed_ms={d}\n", .{clock.ms()});
     try engine.reset();
-    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_b, rows_b, row_len, samples_b, io) catch |e| {
+    const ttft_b = greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_b, rows_b, row_len, samples_b, io) catch |e| {
         std.debug.print("FAIL run2: {s}\n", .{@errorName(e)});
         return 1;
     };
@@ -417,6 +417,7 @@ pub fn main(init: std.process.Init) !u8 {
         .context_cap = opts.context,
         .prompt_chunks = if (opts.sequential_prefill) prompt.len else chunkCount(prompt.len),
         .prefill_chunk_rows = if (opts.sequential_prefill) 1 else engine_mod.max_prefill_rows,
+        .ttft = .{ ttft_a, ttft_b },
         .capacity = engine.capacity(),
         .model_context = engine.modelContext(),
         .prompt_tokens = prompt.len,
@@ -487,20 +488,24 @@ fn steadyToken(io: std.Io, e: *Engine, s: u64, token: u32, row: []u8) !SteadySam
 }
 
 /// One greedy run: prefill, first draw and logits row, then the timed steady tokens; teacher-forced is per-step.
-fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const u32, expected: []const u32, ids_out: []u32, rows_out: []u8, row_len: usize, samples_out: []SteadySample, io: std.Io) !void {
+fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const u32, expected: []const u32, ids_out: []u32, rows_out: []u8, row_len: usize, samples_out: []SteadySample, io: std.Io) !Ttft {
     if (samples_out.len != ids_out.len - 1) return error.Invalid;
+    const prefill_t0 = std.Io.Clock.awake.now(io);
     if (sequential) {
         for (prompt) |tok| try e.prefill(&.{tok});
     } else {
         try e.prefill(prompt);
     }
+    const prefill_t1 = std.Io.Clock.awake.now(io);
     ids_out[0] = try e.draw();
     try e.logitsBytes(rows_out[0..row_len]);
+    const first_token_t1 = std.Io.Clock.awake.now(io);
     for (1..ids_out.len) |step| {
         const feed: u32 = if (teacher_forced) expected[step - 1] else ids_out[step - 1];
         samples_out[step - 1] = try steadyToken(io, e, step, feed, rows_out[step * row_len ..][0..row_len]);
         ids_out[step] = samples_out[step - 1].id;
     }
+    return .{ .prefill_t0_ns = @intCast(prefill_t0.nanoseconds), .prefill_t1_ns = @intCast(prefill_t1.nanoseconds), .first_token_t1_ns = @intCast(first_token_t1.nanoseconds) };
 }
 
 const RepeatChecks = struct { runs: u64 = 2, generated_ids_equal: bool, logits_bytes_equal: bool };
@@ -512,6 +517,15 @@ const OracleEcho = struct {
     checkpoint_note: []const u8,
 };
 
+/// Pre-fill/first-token timing taken with a clean awake-clock reset immediately before the prefill,
+/// per run: prefill_t1 - prefill_t0 is the scheduled prefill, first_token_t1 - prefill_t0 is TTFT
+/// (prefill schedule + first draw + logits row readback). Never written inside a timed sample.
+const Ttft = struct {
+    prefill_t0_ns: u64,
+    prefill_t1_ns: u64,
+    first_token_t1_ns: u64,
+};
+
 const Receipt = struct {
     status: []const u8,
     backend: []const u8 = "vulkan-qwen35-first-core",
@@ -521,6 +535,7 @@ const Receipt = struct {
     context_cap: usize,
     prompt_chunks: usize,
     prefill_chunk_rows: usize,
+    ttft: [2]Ttft,
     capacity: usize,
     model_context: usize,
     prompt_tokens: usize,
@@ -583,6 +598,10 @@ test "buildResult escapes oracle strings and round-trips through the JSON parser
         .context_cap = 512,
         .prompt_chunks = 1,
         .prefill_chunk_rows = 32,
+        .ttft = .{
+            .{ .prefill_t0_ns = 1000, .prefill_t1_ns = 3000, .first_token_t1_ns = 4000 },
+            .{ .prefill_t0_ns = 5000, .prefill_t1_ns = 7000, .first_token_t1_ns = 8000 },
+        },
         .capacity = 256,
         .model_context = 4096,
         .prompt_tokens = 3,
@@ -614,6 +633,8 @@ test "buildResult escapes oracle strings and round-trips through the JSON parser
     try testing.expect(std.mem.indexOf(u8, j, "rev \"937") == null);
     try testing.expectEqualStrings(&@as([64]u8, @splat('c')), root.get("generated_ids_hash").?.string);
     try testing.expectEqualStrings("teacher-forced", root.get("execution_mode").?.string);
+    try testing.expectEqual(@as(i64, 2000), root.get("ttft").?.array.items[0].object.get("prefill_t1_ns").?.integer - root.get("ttft").?.array.items[0].object.get("prefill_t0_ns").?.integer);
+    try testing.expectEqual(@as(i64, 3000), root.get("ttft").?.array.items[1].object.get("first_token_t1_ns").?.integer - root.get("ttft").?.array.items[1].object.get("prefill_t0_ns").?.integer);
     try testing.expectEqualStrings("rowwise", root.get("prefill_schedule").?.string);
     try testing.expect(root.get("repeat_checks").?.object.get("generated_ids_equal").? == .bool);
     try testing.expect(root.get("oracle_logits_element_mismatches").? == .null);
