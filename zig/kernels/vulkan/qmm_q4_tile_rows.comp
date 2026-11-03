@@ -57,11 +57,9 @@ float bf16_value(uint16_t x) {
   return uintBitsToFloat(uint(x) << 16u);
 }
 
-const uint R = 8u;
-
 void main() {
   uint groups_per_row = params.matrix_k / 64u;
-  uint blocks = (params.matrix_m + R - 1u) / R;
+  uint blocks = (params.matrix_m + 7u) / 8u;
   uint total = blocks * params.matrix_n;
   uint stride = gl_NumWorkGroups.x * 256u;
   uint last_row = params.matrix_m - 1u;
@@ -73,12 +71,22 @@ void main() {
     uint w_base = tile * params.matrix_k + lane;
     uint param_base = tile * (groups_per_row * 32u) + lane;
     uint row_vectors = params.matrix_k / 8u;
-    uint xb[R];
-    float acc[R];
-    for (uint r = 0u; r < R; ++r) {
-      xb[r] = min(block * R + r, last_row) * row_vectors;
-      acc[r] = 0.0;
-    }
+    uint x0 = min(block * 8u + 0u, last_row) * row_vectors;
+    uint x1 = min(block * 8u + 1u, last_row) * row_vectors;
+    uint x2 = min(block * 8u + 2u, last_row) * row_vectors;
+    uint x3 = min(block * 8u + 3u, last_row) * row_vectors;
+    uint x4 = min(block * 8u + 4u, last_row) * row_vectors;
+    uint x5 = min(block * 8u + 5u, last_row) * row_vectors;
+    uint x6 = min(block * 8u + 6u, last_row) * row_vectors;
+    uint x7 = min(block * 8u + 7u, last_row) * row_vectors;
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    float acc2 = 0.0;
+    float acc3 = 0.0;
+    float acc4 = 0.0;
+    float acc5 = 0.0;
+    float acc6 = 0.0;
+    float acc7 = 0.0;
     for (uint group = 0u; group < groups_per_row; ++group) {
       float scale = bf16_value(scales.values[param_base + group * 32u]);
       float bias = bf16_value(biases.values[param_base + group * 32u]);
@@ -87,24 +95,45 @@ void main() {
         for (uint t = 0u; t < 4u; ++t) {
           uint word = w4[t];
           uint at = group * 8u + half_group * 4u + t;
-          uvec4 xs[R];
-          for (uint r = 0u; r < R; ++r) {
-            xs[r] = input_x.values[xb[r] + at];
-          }
+          uvec4 x0v = input_x.values[x0 + at];
+          uvec4 x1v = input_x.values[x1 + at];
+          uvec4 x2v = input_x.values[x2 + at];
+          uvec4 x3v = input_x.values[x3 + at];
+          uvec4 x4v = input_x.values[x4 + at];
+          uvec4 x5v = input_x.values[x5 + at];
+          uvec4 x6v = input_x.values[x6 + at];
+          uvec4 x7v = input_x.values[x7 + at];
           for (uint pair = 0u; pair < 4u; ++pair) {
             float low = scale * float((word >> (pair * 8u)) & 0xfu) + bias;
             float high = scale * float((word >> (pair * 8u + 4u)) & 0xfu) + bias;
-            for (uint r = 0u; r < R; ++r) {
-              acc[r] += uintBitsToFloat(xs[r][pair] << 16u) * low;
-              acc[r] += uintBitsToFloat(xs[r][pair] & 0xffff0000u) * high;
-            }
+            acc0 += uintBitsToFloat(x0v[pair] << 16u) * low;
+            acc0 += uintBitsToFloat(x0v[pair] & 0xffff0000u) * high;
+            acc1 += uintBitsToFloat(x1v[pair] << 16u) * low;
+            acc1 += uintBitsToFloat(x1v[pair] & 0xffff0000u) * high;
+            acc2 += uintBitsToFloat(x2v[pair] << 16u) * low;
+            acc2 += uintBitsToFloat(x2v[pair] & 0xffff0000u) * high;
+            acc3 += uintBitsToFloat(x3v[pair] << 16u) * low;
+            acc3 += uintBitsToFloat(x3v[pair] & 0xffff0000u) * high;
+            acc4 += uintBitsToFloat(x4v[pair] << 16u) * low;
+            acc4 += uintBitsToFloat(x4v[pair] & 0xffff0000u) * high;
+            acc5 += uintBitsToFloat(x5v[pair] << 16u) * low;
+            acc5 += uintBitsToFloat(x5v[pair] & 0xffff0000u) * high;
+            acc6 += uintBitsToFloat(x6v[pair] << 16u) * low;
+            acc6 += uintBitsToFloat(x6v[pair] & 0xffff0000u) * high;
+            acc7 += uintBitsToFloat(x7v[pair] << 16u) * low;
+            acc7 += uintBitsToFloat(x7v[pair] & 0xffff0000u) * high;
           }
         }
       }
     }
-    uint row = block * R;
-    for (uint r = 0u; r < R; ++r) {
-      if (row + r < params.matrix_m) output_data.values[params.output_offset + (row + r) * params.matrix_n + column] = bf16_store(acc[r]);
-    }
+    uint row = block * 8u;
+    output_data.values[params.output_offset + row * params.matrix_n + column] = bf16_store(acc0);
+    if (row + 1u < params.matrix_m) output_data.values[params.output_offset + (row + 1u) * params.matrix_n + column] = bf16_store(acc1);
+    if (row + 2u < params.matrix_m) output_data.values[params.output_offset + (row + 2u) * params.matrix_n + column] = bf16_store(acc2);
+    if (row + 3u < params.matrix_m) output_data.values[params.output_offset + (row + 3u) * params.matrix_n + column] = bf16_store(acc3);
+    if (row + 4u < params.matrix_m) output_data.values[params.output_offset + (row + 4u) * params.matrix_n + column] = bf16_store(acc4);
+    if (row + 5u < params.matrix_m) output_data.values[params.output_offset + (row + 5u) * params.matrix_n + column] = bf16_store(acc5);
+    if (row + 6u < params.matrix_m) output_data.values[params.output_offset + (row + 6u) * params.matrix_n + column] = bf16_store(acc6);
+    if (row + 7u < params.matrix_m) output_data.values[params.output_offset + (row + 7u) * params.matrix_n + column] = bf16_store(acc7);
   }
 }
