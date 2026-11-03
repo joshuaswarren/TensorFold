@@ -67,16 +67,21 @@ fn q4Push(m: u64, n: u64, k: u64) Error!params.Params {
 /// Which qmm image a dispatch runs: `scalar` is qmm.comp, `vec4` is qmm_q4_vec4.comp (same arithmetic, 16-byte loads).
 pub const Qmm = enum { scalar, vec4 };
 
-// vec4 loads uvec4 from x and w: both windows must start 16-byte aligned (k % 64 keeps strides and ranges aligned).
-pub fn qmmVariant(x: View, w: View) Qmm {
-    return if (x.byte_offset % 16 == 0 and w.byte_offset % 16 == 0) .vec4 else .scalar;
+/// Outputs one qmm_q4_vec4 thread computes; the shader's ROWS default must equal it (the identity gate checks).
+pub const vec4_rows: u32 = 4;
+
+// vec4 loads uvec4 from x and w: both windows 16-byte aligned, and n splits into whole threads of vec4_rows outputs.
+pub fn qmmVariant(x: View, w: View, n: u64) Qmm {
+    return if (x.byte_offset % 16 == 0 and w.byte_offset % 16 == 0 and n % vec4_rows == 0) .vec4 else .scalar;
 }
 
-fn qmmPipeline(o: *Ops, force: ?Qmm, x: View, w: View) Error!*dispatch.Pipeline {
-    const fit = qmmVariant(x, w);
+const QmmPick = struct { pipe: *dispatch.Pipeline, per_thread: u32 };
+
+fn qmmPipeline(o: *Ops, force: ?Qmm, x: View, w: View, n: u64) Error!QmmPick {
+    const fit = qmmVariant(x, w, n);
     const want = force orelse fit;
     if (want == .vec4 and fit == .scalar) return error.Misaligned;
-    return if (want == .vec4) &o.qmm_q4_vec4 else &o.qmm_bf16;
+    return if (want == .vec4) .{ .pipe = &o.qmm_q4_vec4, .per_thread = vec4_rows } else .{ .pipe = &o.qmm_bf16, .per_thread = 1 };
 }
 
 // Q4 projection out[m,n] = x[m,k] . dequant(w,scales,biases)[n,k]; scratch + copy_general above maxStorageBufferRange.
@@ -92,10 +97,11 @@ pub fn projectAs(o: *Ops, force: ?Qmm, cmds: *Commands, out: View, x: View, w: V
     if (x.byteLen() > lim.max_range or out.byteLen() > lim.max_range) return error.TooLarge;
     const rows = try chunkRows(lim, k, g.n);
     if (rows == 0) {
-        const pipe = try qmmPipeline(o, force, x, w);
+        const pick = try qmmPipeline(o, force, x, w, g.n);
+        const pipe = pick.pipe;
         try pipe.bind(&.{ x.bind(), w.bind(), scales.bind(), biases.bind(), out.bind() });
         const p = try q4Push(g.m, g.n, k);
-        try pipe.run(cmds, std.mem.asBytes(&p), ops_mod.dispatchGroups(p.count, pipe.local[0]), timeout_ns);
+        try pipe.run(cmds, std.mem.asBytes(&p), ops_mod.dispatchGroups(p.count / pick.per_thread, pipe.local[0]), timeout_ns);
         return;
     }
     const block = try scratch.alloc(.bf16, g.m * rows);
@@ -110,10 +116,11 @@ pub fn projectAs(o: *Ops, force: ?Qmm, cmds: *Commands, out: View, x: View, w: V
         const s_chunk = try scales.slice(first * row_groups, chunk * row_groups);
         const b_chunk = try biases.slice(first * row_groups, chunk * row_groups);
         const block_chunk = try block.slice(0, g.m * chunk);
-        const pipe = try qmmPipeline(o, force, x, w_chunk);
+        const pick = try qmmPipeline(o, force, x, w_chunk, chunk);
+        const pipe = pick.pipe;
         try pipe.bind(&.{ x.bind(), w_chunk.bind(), s_chunk.bind(), b_chunk.bind(), block_chunk.bind() });
         const p = try q4Push(g.m, chunk, k);
-        try pipe.run(cmds, std.mem.asBytes(&p), ops_mod.dispatchGroups(p.count, pipe.local[0]), timeout_ns);
+        try pipe.run(cmds, std.mem.asBytes(&p), ops_mod.dispatchGroups(p.count / pick.per_thread, pipe.local[0]), timeout_ns);
         // Scatter the packed block into the full row-major output; raw u16 columns keep every RNE byte.
         const scatter = &o.copy_u16;
         try scatter.bind(&.{ block_chunk.bind(), o.dummyBinding(), out.bind(), o.dummyBinding() });
@@ -212,13 +219,17 @@ test "the vec4 qmm image is chosen only when every vector load is 16-byte aligne
     const buf = @import("memory.zig").Buffer{ .dev = &dev, .handle = null, .memory = null, .len = 1 << 20, .kind = .device, .mapped = null, .coherent = false };
     const w = try View.init(&buf, .u32, 2048, 100 * 16);
     const x = try View.init(&buf, .bf16, 64, 3 * 128);
-    try testing.expectEqual(Qmm.vec4, qmmVariant(x, w));
+    try testing.expectEqual(Qmm.vec4, qmmVariant(x, w, 100));
     // 4-byte windows are legal views, but a uvec4 load through them would be misaligned.
-    try testing.expectEqual(Qmm.scalar, qmmVariant(try View.init(&buf, .bf16, 68, 3 * 128), w));
-    try testing.expectEqual(Qmm.scalar, qmmVariant(try View.init(&buf, .bf16, 72, 3 * 128), w));
-    try testing.expectEqual(Qmm.scalar, qmmVariant(x, try View.init(&buf, .u32, 2052, 100 * 16)));
-    try testing.expectEqual(Qmm.scalar, qmmVariant(x, try View.init(&buf, .u32, 2056, 100 * 16)));
-    try testing.expectEqual(Qmm.vec4, qmmVariant(try View.init(&buf, .bf16, 16, 3 * 128), try View.init(&buf, .u32, 32, 100 * 16)));
+    try testing.expectEqual(Qmm.scalar, qmmVariant(try View.init(&buf, .bf16, 68, 3 * 128), w, 100));
+    try testing.expectEqual(Qmm.scalar, qmmVariant(try View.init(&buf, .bf16, 72, 3 * 128), w, 100));
+    try testing.expectEqual(Qmm.scalar, qmmVariant(x, try View.init(&buf, .u32, 2052, 100 * 16), 100));
+    try testing.expectEqual(Qmm.scalar, qmmVariant(x, try View.init(&buf, .u32, 2056, 100 * 16), 100));
+    try testing.expectEqual(Qmm.vec4, qmmVariant(try View.init(&buf, .bf16, 16, 3 * 128), try View.init(&buf, .u32, 32, 100 * 16), 100));
+    // A thread computes vec4_rows outputs, so an n that is not a multiple of it stays on the scalar image.
+    try testing.expectEqual(Qmm.scalar, qmmVariant(x, w, 101));
+    try testing.expectEqual(Qmm.scalar, qmmVariant(x, w, 6));
+    try testing.expectEqual(Qmm.vec4, qmmVariant(x, w, 8));
 }
 
 test "embedding geometry derives rows and tokens and refuses torn tables" {

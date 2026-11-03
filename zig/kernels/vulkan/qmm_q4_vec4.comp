@@ -2,6 +2,10 @@
 // qmm.comp q4 g64 transposed bf16, 16-byte loads, one batch, zero offsets; same arithmetic; see ops_q4.qmmVariant.
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+// ROWS adjacent outputs per thread share every x load and each keeps its own accumulator; see ops_q4.vec4_rows.
+#ifndef ROWS
+#define ROWS 4
+#endif
 
 layout(local_size_x = 256) in;
 
@@ -59,33 +63,47 @@ float bf16_value(uint16_t x) {
 
 void main() {
   uint groups_per_row = params.matrix_k / 64u;
-  uint total = params.matrix_m * params.matrix_n;
+  uint columns = params.matrix_n / ROWS;
+  uint total = params.matrix_m * columns;
   uint stride = gl_NumWorkGroups.x * 256u;
   for (uint index = gl_GlobalInvocationID.x; index < total; index += stride) {
-    uint row = index / params.matrix_n;
-    uint column = index - row * params.matrix_n;
-    uint w_vec = column * (params.matrix_k / 32u);
+    uint row = index / columns;
+    uint first = (index - row * columns) * ROWS;
     uint x_vec = row * (params.matrix_k / 8u);
-    uint param_base = column * groups_per_row;
-    float accumulator = 0.0;
+    float accumulator[ROWS];
+    for (uint r = 0u; r < ROWS; ++r) {
+      accumulator[r] = 0.0;
+    }
     for (uint group = 0u; group < groups_per_row; ++group) {
-      float scale = bf16_value(scales.values[param_base + group]);
-      float bias = bf16_value(biases.values[param_base + group]);
+      float scale[ROWS];
+      float bias[ROWS];
+      for (uint r = 0u; r < ROWS; ++r) {
+        uint param = (first + r) * groups_per_row + group;
+        scale[r] = bf16_value(scales.values[param]);
+        bias[r] = bf16_value(biases.values[param]);
+      }
       for (uint half_group = 0u; half_group < 2u; ++half_group) {
-        uvec4 w4 = input_w.values[w_vec + group * 2u + half_group];
+        uvec4 w4[ROWS];
+        for (uint r = 0u; r < ROWS; ++r) {
+          w4[r] = input_w.values[(first + r) * (params.matrix_k / 32u) + group * 2u + half_group];
+        }
         for (uint t = 0u; t < 4u; ++t) {
-          uint word = w4[t];
           uvec4 x8 = input_x.values[x_vec + group * 8u + half_group * 4u + t];
-          for (uint pair = 0u; pair < 4u; ++pair) {
-            uint x_pair = x8[pair];
-            accumulator += uintBitsToFloat(x_pair << 16u) *
-                (scale * float((word >> (pair * 8u)) & 0xfu) + bias);
-            accumulator += uintBitsToFloat(x_pair & 0xffff0000u) *
-                (scale * float((word >> (pair * 8u + 4u)) & 0xfu) + bias);
+          for (uint r = 0u; r < ROWS; ++r) {
+            uint word = w4[r][t];
+            for (uint pair = 0u; pair < 4u; ++pair) {
+              uint x_pair = x8[pair];
+              accumulator[r] += uintBitsToFloat(x_pair << 16u) *
+                  (scale[r] * float((word >> (pair * 8u)) & 0xfu) + bias[r]);
+              accumulator[r] += uintBitsToFloat(x_pair & 0xffff0000u) *
+                  (scale[r] * float((word >> (pair * 8u + 4u)) & 0xfu) + bias[r]);
+            }
           }
         }
       }
     }
-    output_data.values[params.output_offset + index] = bf16_store(accumulator);
+    for (uint r = 0u; r < ROWS; ++r) {
+      output_data.values[params.output_offset + row * params.matrix_n + first + r] = bf16_store(accumulator[r]);
+    }
   }
 }

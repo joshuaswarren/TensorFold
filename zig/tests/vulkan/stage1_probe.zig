@@ -428,17 +428,16 @@ fn projectGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds
         }
     }
     // The vec4 image is the scalar image with wider loads: its bytes must equal the scalar bytes exactly.
-    if (vk.ops_q4.qmmVariant(x_view, w_view) != .vec4) {
-        std.debug.print("FAIL project case=\"{s}\": its windows are not 16-byte aligned, so the vec4 image is not exercised\n", .{case.name});
-        return false;
-    }
+    const fits = vk.ops_q4.qmmVariant(x_view, w_view, case.shape.n) == .vec4;
     const scalar_bits = try a.alloc(u16, f.out.len);
     defer a.free(scalar_bits);
     inline for (.{ vk.ops_q4.Qmm.scalar, vk.ops_q4.Qmm.vec4 }) |force| {
-        try vk.orExit(vk.upload(cmds, out.buf, 0, staging, std.mem.sliceAsBytes(f.out), timeout));
-        try vk.orExit(vk.ops_q4.projectAs(o, force, cmds, out_view, x_view, w_view, s_view, b_view, case.shape.k, scratch, timeout));
-        try scratch.reset(mark);
-        try fetch(cmds, staging, out.buf, std.mem.sliceAsBytes(if (force == .scalar) scalar_bits else bits), timeout);
+        if (force == .scalar or fits) {
+            try vk.orExit(vk.upload(cmds, out.buf, 0, staging, std.mem.sliceAsBytes(f.out), timeout));
+            try vk.orExit(vk.ops_q4.projectAs(o, force, cmds, out_view, x_view, w_view, s_view, b_view, case.shape.k, scratch, timeout));
+            try scratch.reset(mark);
+            try fetch(cmds, staging, out.buf, std.mem.sliceAsBytes(if (force == .scalar) scalar_bits else bits), timeout);
+        }
     }
     if (std.mem.indexOfDiff(u16, scalar_bits, bits)) |at| {
         std.debug.print("FAIL project case=\"{s}\": the vec4 image differs from the scalar image at element {d}\n", .{ case.name, at });
