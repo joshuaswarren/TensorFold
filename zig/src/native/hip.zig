@@ -102,7 +102,16 @@ fn ready(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open
     const index: c_int = if (o.device) |d| @intCast(d) else hip.Device.ordinal(o.rank);
     const caps = hip.Device.capsOf(index) orelse return refuse(a, problem, "HIP device {d} is not a GPU this engine supports", .{index});
     var notes: hip.Policy.Notes = .{};
-    var policy = hip.Policy.resolve(o.policy, .current, &notes) catch |err| return refuse(a, problem, "the policy \"{s}\" is refused ({s})", .{ o.policy, @errorName(err) });
+    var policy = hip.Policy.resolveFrom(hip.Policy.forCaps(caps, o.tp), o.policy, .current, &notes) catch |err| return refuse(a, problem, "the policy \"{s}\" is refused ({s})", .{ o.policy, @errorName(err) });
+    // the step came from the GPU's defaults when the plain defaults under the same flags differ: one rank may fall back
+    var plain_notes: hip.Policy.Notes = .{};
+    const plain = hip.Policy.resolve(o.policy, .current, &plain_notes) catch policy;
+    const own_default = o.tp == 1 and plain.prefill_step != policy.prefill_step;
+    const fallback_step: ?u32 = if (own_default) plain.prefill_step else null;
+    if (fallback_step) |s| notes.add("prefill_step {d} is this GPU's default, {d} when it admits fewer streams; ", .{
+        policy.prefill_step,
+        s,
+    });
     if (o.mtp_drafts) |n| policy.mtp.drafts = @intCast(n);
     if (o.mtp_confidence) |c| policy.mtp.confidence = c;
     if (o.keep) |n| policy.slots = @intCast(@min(n, 1 << 16));
@@ -112,7 +121,7 @@ fn ready(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open
     const policy_line = try std.fmt.allocPrint(gpa, "{f}", .{policy});
     std.debug.print("[tensorfold] HIP rank {d} of {d}: policy {s}{s} {s}\n", .{ o.rank, o.tp, policy_line, if (o.rank > 0) " (rank 0's)" else "", notes.text() });
     return .{
-        .dev = .{ .index = index, .caps = caps, .policy = policy, .group = group },
+        .dev = .{ .index = index, .caps = caps, .policy = policy, .group = group, .fallback_step = fallback_step },
         .options = .{
             .window = @intCast(window),
             .streams = @max(o.lanes, 1),
@@ -186,8 +195,14 @@ fn join(
     };
 }
 
+/// The family's Info.reasoning: false when it declares `pub const reasoning = false` (no reasoning block).
+fn reasoning(comptime F: type) bool {
+    return if (@hasDecl(F, "reasoning")) F.reasoning else true;
+}
+
 /// The family's refusal of --slide or --mtp-confidence, when it names one.
 fn flagRefused(comptime F: type, o: api.Open) ?[]const u8 {
+    if (o.rope_yarn != null) return "--rope-yarn: the native HIP engine has no YaRN rope; serve without --rope-yarn, or on CUDA";
     if (o.slide and @hasDecl(F, "slide_refusal")) return F.slide_refusal;
     if (o.mtp_confidence != null and @hasDecl(F, "confidence_refusal")) return F.confidence_refusal;
     return null;
@@ -227,6 +242,10 @@ fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     const report = @import("sys").optional_libraries.atBoundary();
     defer report.deinit();
+    if (try o.slideRefusal(a, "HIP")) |why| {
+        problem.* = why;
+        return null;
+    }
     if (o.fsrRefusal("hip")) |why| {
         problem.* = why;
         return null;
@@ -266,7 +285,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, loaded.backend, h.clock.clock());
     errdefer h.core.deinit();
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = @intCast(loaded.streams), .context_window = @intCast(r.options.window), .prefill_step = F.prefill_step, .policy = h.policy_line, .startup = loaded.startup, .structures = true });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = @intCast(loaded.streams), .context_window = @intCast(r.options.window), .prefill_step = F.prefill_step, .decode_share = o.decode_share, .policy = h.policy_line, .startup = loaded.startup, .structures = true, .reasoning = reasoning(F) });
     h.host.memory = .{ .read = readMemory };
     try h.host.start();
     served = true;
@@ -277,6 +296,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
 pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !bool {
     const report = @import("sys").optional_libraries.atBoundary();
     defer report.deinit();
+    if (try o.slideRefusal(a, "HIP")) |why| {
+        problem.* = why;
+        return false;
+    }
     inline for (registry) |F| {
         if (std.mem.eql(u8, o.model_type, F.model_type)) {
             if (flagRefused(F, o)) |why| {
@@ -297,6 +320,13 @@ pub fn follow(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[
     }
     problem.* = try std.fmt.allocPrint(a, "the native HIP engine has no backend for {s} checkpoints yet; serve with --engine python", .{o.model_type});
     return false;
+}
+
+test "a HIP family declares replies without reasoning with `pub const reasoning = false`; others keep the default" {
+    try std.testing.expect(reasoning(struct {}));
+    try std.testing.expect(!reasoning(struct {
+        pub const reasoning = false;
+    }));
 }
 
 test "every registered family is listed for capabilities" {
@@ -397,4 +427,19 @@ test "matrix=on runs only where the matrix-core tiles exist; auto runs everywher
 
 test {
     _ = @import("draft_sources_hip_test.zig");
+}
+
+test "slide admission: hip refuses before checkpoint or device access" {
+    try @import("slide_open_test.zig").check(open, "HIP", &.{ "qwen3_5", "qwen3_5_moe", "qwen4_exp", "nemotron_h" });
+}
+
+test "slide admission: HIP followers refuse before joining ranks" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (families) |f| {
+        var why: []const u8 = "";
+        try std.testing.expect(!try follow(a, std.testing.allocator, std.testing.io, .{ .dir = "missing-slide-checkpoint", .model_type = f.model_type, .slide = true, .tp = 2, .rank = 1 }, &why));
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "--slide: {s} checkpoints do not learn on HIP yet", .{f.model_type}), why);
+    }
 }

@@ -24,11 +24,13 @@ test {
     _ = native;
     _ = native_moe;
     _ = mtp;
+    _ = @import("cuda_mtp_bf16.zig");
     _ = @import("cuda_mtp_batch.zig");
     _ = config;
     _ = geometry;
     _ = @import("draw.zig");
     _ = @import("cuda_draft_weights.zig");
+    _ = @import("cuda_draft_config.zig");
     _ = draft;
     _ = vision;
     _ = @import("cuda_vision_prompt.zig");
@@ -40,6 +42,8 @@ test {
     _ = @import("cuda_pages_init_test.zig");
     _ = @import("cuda_pages_lifetime_test.zig");
     _ = @import("cuda_mtp_area_test.zig");
+    _ = @import("cuda_prefix.zig");
+    _ = @import("cuda_prefix_fault_test.zig");
 }
 
 pub const slide = @import("cuda_slide.zig");

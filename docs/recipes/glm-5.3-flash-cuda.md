@@ -38,11 +38,27 @@ left after a 12.2 GiB reserve` and a 5.8 GiB prompt cache
 
 - `--vision` on every rank reads images and video: rank 0's tower encodes them and sends their rows and spans to the
   other ranks ([1.1.0](../../CHANGELOG.md#110)). Video needs `libtfvideo`
-  ([video](../vision.md#video-on-the-native-server)).
+  ([video](../vision.md#video-on-the-native-server)). `TF_GLM_VISION_HOST=1` keeps the tower's bf16 weights in pinned
+  host memory and copies each part of a pass into one device slot as it runs (240 MiB for GLM-5.3-Flash's tower instead
+  of its 1.05 GiB), leaving rank 0 that much more room for KV pages. Checked on two RTX PRO 6000 Blackwell cards.
 - Nonstreaming `/v1/completions` requests return `prompt_logprobs`, structured output follows its schema with drafts
   on, and required and named tool calls use the model's tool markup ([1.1.1](../../CHANGELOG.md#111): #1016 to #1018).
 - `--kv-cache fp8` is an opt-in FP8 latent cache. BF16 remains the default, and its native quality and device
   qualification are pending ([1.1.2](../../CHANGELOG.md#112)).
+- `TF_GLM_HOST_CACHE=1` on every rank keeps kept prompt states in pinned host memory instead of on the card, so a
+  long conversation's next turn resumes when the card has no room left for its state (#1510). `--prompt-cache-gib`
+  sizes the host cache on each rank (8 GiB unasked, at most half of the available memory), and the KV pool sets no
+  device cache aside. Checked on two RTX PRO 6000 Blackwell cards at TP=2 with the EXL3 4bpw checkpoint.
+- `TF_GLM_KV_HOST=1` on every rank (with KV pages, BF16) keeps the KV pages' latent rows in pinned host memory: the
+  device keeps the pooled index keys, and each sparse call copies only the rows it picked into device slots. The KV
+  pool then costs the card 768 bytes a token instead of 13,056, so a 1,048,576-token window fits beside the weights.
+  `TF_GLM_KV_HOST_GIB` sizes the host pages (one full window unasked); `TF_GLM_KV_HOST_SHARED=1` gives the ranks of
+  one host a single copy in `/dev/shm`. Checked on two RTX PRO 6000 Blackwell cards at TP=2.
+- `TF_GLM_CHUNK_SOLO=4096` on every rank (opt-in) lets a prompt pass take 4,096 rows while no other stream is decoding.
+  Unset or `2048`, every pass takes 2,048 rows and nothing extra is held. See [Prompt chunk size](#prompt-chunk-size).
+- `TF_GLM_DENSE_BITS=4` (EXL3 at TP=2, off by default) repacks the BF16 dense layers to 4 bits at load. Decode is
+  faster (24.8 to 35.0 tok/s in one user's run), but replies differ from the default, so it is lossy and stays opt-in
+  (#1761).
 
 ## More ranks
 
@@ -51,6 +67,37 @@ left after a 12.2 GiB reserve` and a 5.8 GiB prompt cache
 ([#1067](https://github.com/ashhart/TensorFold/issues/1067)). How a prompt's rows reach the other ranks
 (`TF_GLM_PREFILL_REDUCE`) and the two-rank RoCE gathers (`TF_ROCE`) are in
 [placement](../multi-rank-receipts.md#the-settings-the-ranks-agreed-on).
+
+## Prompt chunk size
+
+A prompt runs in passes of 2,048 rows. Kept prompt states sit on that grid, and a stream decoding beside a prompt waits
+for each pass to end. A pass that takes more rows reads each routed expert's weights fewer times, so a lone prompt
+comes sooner. `TF_GLM_CHUNK_SOLO=4096` lets a pass take two of those chunks when no other stream is decoding as it
+starts. With one decoding, or with `prompt_logprobs` or image rows, the pass takes 2,048. A drafter's steps take one
+chunk, so `--drafter` beside it is refused at load.
+
+The grid does not move, so warm turns resume where they do unset, and streams decoding beside a prompt see the same
+passes. Replies are the same bytes either way. Two costs remain:
+- A request that arrives during a solo pass waits for that pass to end before its own prompt runs. After that, the
+  passes are short again.
+- The prompt buffers are sized for 4,096 rows for the whole run: 1.92 GiB more at TP=2 and 1.56 GiB at TP=3, which
+  comes out of the room for KV pages and the prompt cache. In the runs below, TP=2's default cache goes from 4.7 to
+  2.8 GiB.
+
+| | TP=2 unset | TP=2 `=4096` | TP=3 unset | TP=3 `=4096` |
+| --- | --- | --- | --- | --- |
+| First token of a cold prompt, 8K / 32K / 128K (s) | 6.08 / 23.94 / 98.16 | 5.72 / 22.22 / 91.33 | 5.00 / 19.61 / 80.26 | 4.64 / 17.99 / 73.45 |
+| First token of a warm turn, 10K history + 500 / 1,500 / 3,000 tokens (s) | 1.40 / 2.06 / 2.87 | 1.40 / 2.05 / 2.83 | 1.14 / 1.67 / 2.35 | 1.14 / 1.68 / 2.31 |
+| First token of a warm turn, 40K history + 500 / 1,500 / 3,000 tokens (s) | 1.25 / 2.03 / 3.05 | 1.26 / 2.04 / 3.03 | 1.02 / 1.67 / 2.51 | 1.02 / 1.66 / 2.48 |
+| Gap between a decoding stream's tokens beside a 32K prompt, median / longest (ms) | 1,474 / 1,749 | 1,478 / 1,751 | 1,219 / 1,444 | 1,219 / 1,459 |
+| That stream's tokens during the prompt | 17.0 | 16.5 | 16.0 | 16.5 |
+| First token of a short request sent 6 to 8 s into a 32K prompt, mean (lowest to highest) (s) | 1.27 (0.88 to 1.65) | 2.48 (1.35 to 3.47) | 1.24 (0.70 to 1.67) | 1.73 (1.07 to 2.67) |
+| That prompt's first token (s) | 23.54 | 23.27 | 19.32 | 18.99 |
+
+Each setting is two fresh servers (one at TP=2 for the cold row), `--parallel 4 --context 524288`, `TF_KV_PAGES=on`,
+`Bizuayeu/GLM-5.3-Flash-XSFP4` with its MTP drafts. Cold prompts are Python source at `--prompt-cache-gib 0`, and a
+repeated filler line gains 2 to 5% at the same sizes. The other rows ran with the prompt cache on (the default at TP=2,
+2 GiB at TP=3). Three rows at TP=2 that waited on the heat guard are left out.
 
 ## Long runs on GB10
 

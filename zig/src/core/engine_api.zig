@@ -2,11 +2,11 @@
 const std = @import("std");
 const lanes = @import("lanes");
 const Allocator = std.mem.Allocator;
+pub const profile = @import("profile");
 pub const tfvideo = @import("tfvideo.zig");
 pub const DraftSources = @import("draft_sources.zig").Sources;
 /// The server's name for one request, unique while the process lives.
 pub const Id = u64;
-
 /// One request's sampling (Python's exact_sampling.Sampling); a request without one decodes greedily.
 pub const Sampling = lanes.Sampling;
 /// presence_penalty and frequency_penalty, applied where ``Info.penalties``.
@@ -14,6 +14,7 @@ pub const Penalties = lanes.Penalties;
 pub const EmbeddingInfo = lanes.embedding.Info;
 pub const EmbeddingBatch = lanes.embedding.Batch;
 pub const embedding_vector = @import("embedding_vector.zig");
+pub const load_ledger = @import("load_ledger.zig");
 
 /// One image of a request (``Request.images``): the tower's input and the placeholder rows its output replaces.
 pub const Image = lanes.stream.Image;
@@ -148,26 +149,7 @@ pub const SpeechSubmitError = error{ Closed, Busy, InvalidRequest, Unsupported }
 pub const Reason = enum { stop, length, cancelled, failed, silence };
 pub const speech_guard = @import("speech_guard.zig");
 
-/// What a finished reply's rounds did, for its runtime fields and /metrics.
-pub const Stats = struct {
-    rounds: u64 = 0,
-    drafted: u64 = 0,
-    accepted: u64 = 0,
-    /// The narrowest verify window of the reply's rounds (drafted replies: 2 or more).
-    min_rows: u32 = 0,
-    prefill_widths: []const u32 = &.{},
-    prefill_raised: []const bool = &.{},
-    /// The loop period that ended or interrupted the think block, if any.
-    loop_period: ?u32 = null,
-    /// Prompt prefill duration measured by the engine host, in seconds.
-    prefill_seconds: ?f64 = null,
-    /// The GPU-busy seconds of the forward passes the reply ran in, where profiling times them (TF_Q27_PROFILE).
-    gpu_seconds: ?f64 = null,
-    /// Seconds from engine submission to first admission; an engine that admits immediately leaves zero.
-    queued_seconds: f64 = 0,
-    /// The drafter's own counters as a JSON object, or empty.
-    telemetry_json: []const u8 = "",
-};
+pub const Stats = @import("engine_stats.zig").Stats;
 
 pub const Event = union(enum) {
     /// The prompt is in the cache: ``cached`` of its tokens came from a kept prefix.
@@ -205,6 +187,8 @@ pub const Info = struct {
     loop_guard: bool = false,
     /// The engine enforces a token budget while the think block is open.
     thinking_budget: bool = true,
+    /// The model can emit a reasoning block; false: all reply text is answer content, whatever enable_thinking renders.
+    reasoning: bool = true,
     /// The engine stops the reply after the think block at Request.answer_max (every lane engine: Info.ofLanes).
     answer_limit: bool = false,
     structures: bool = false,
@@ -232,6 +216,8 @@ pub const Info = struct {
     draft_sources: DraftSources = .{},
     /// The immutable retained-prefix plan applied at startup, not a process memory limit or current cache occupancy.
     prompt_cache_plan: ?PromptCachePlan = null,
+    /// --decode-share: the reply's share of a fill step's wall time beside live decoders; null: the engine's default.
+    decode_share: ?f64 = null,
     /// The engine scores decisions (`score`) and writes no text: the server refuses text requests.
     decides: bool = false,
     /// Decisions may carry pictures (`Decision.pictures`).
@@ -244,6 +230,8 @@ pub const Info = struct {
     slide_conversations: bool = false,
     /// Whether a request's caches fit beside the running streams' now (null: a free lane does); else it waits in order.
     admit: ?Admit = null,
+    /// A byte budget each request promises its caches from as it is admitted (null: none); never beside `admit`.
+    ledger: ?Ledger = null,
 
     /// What a lane engine's streams enforce themselves (core/lanes/stream.zig): loop guards and answer limits.
     pub fn ofLanes(i: Info) Info {
@@ -257,6 +245,13 @@ pub const Info = struct {
 pub const Admit = struct {
     ctx: *anyopaque,
     fits: *const fn (ctx: *anyopaque, prompt: u32, max_tokens: u32) bool,
+};
+
+/// The bytes the lane host may promise at once, and what one request's caches cost at most (core/kv_ledger.zig).
+pub const Ledger = struct {
+    ctx: *anyopaque,
+    total: u64,
+    cost: *const fn (ctx: *anyopaque, prompt: u32, max_tokens: u32) u64,
 };
 
 pub const PromptCacheCapacity = struct { budget_bytes: u64, minimum_state_bytes: u64 };
@@ -281,6 +276,7 @@ pub const Precision = enum { checkpoint, full };
 
 /// What a server asks of the engine it opens: the checkpoint, and the serve flags an engine reads.
 pub const Open = struct {
+    pub const slideRefusal = @import("engine_slide.zig").refusal;
     pub fn fsrRefusal(o: Open, backend: []const u8) ?[]const u8 {
         if (o.ssd_experts_gib == null and !o.ple_on_ssd and o.fsr_trace == null) return null;
         if (!std.mem.eql(u8, backend, "metal") or !std.mem.eql(u8, o.model_type, "qwen4_exp"))
@@ -307,6 +303,7 @@ pub const Open = struct {
     drafter: ?[]const u8 = null,
     drafter_name: ?[]const u8 = null, // the supplied --drafter name, before resolving its directory
     drafter_bits: u8 = 4,
+    rope_yarn: ?f64 = null, // --rope-yarn: YaRN over the checkpoint's trained window; families without it refuse
     /// --record: each stream's committed rows and tapped features written under this folder, for drafter training.
     record: ?[]const u8 = null,
     speed_up: ?[]const u8 = null,
@@ -341,6 +338,8 @@ pub const Open = struct {
     /// --mtp-drafts and --mtp-confidence; null: the engine's defaults.
     mtp_drafts: ?u32 = null,
     mtp_confidence: ?f64 = null,
+    /// --decode-share: the reply's share of a fill step's wall time beside live decoders; null: the engine's default.
+    decode_share: ?f64 = null,
     /// Kept prompt entries (--checkpoint-slots); null: the engine's plan.
     keep: ?i64 = null,
     /// Tensor parallelism: this process is `rank` of `tp`; rank 0 listens on `master`:`master_port` for the others.
@@ -446,6 +445,8 @@ pub const Engine = struct {
         imprint: ?*const fn (ctx: *anyopaque, ask: *ImprintAsk) bool = null,
         /// A planned stop's first half: no more work, disk writes finished under a deadline, the engine thread joined.
         drain: ?*const fn (ctx: *anyopaque) void = null,
+        /// The server's load-ledger producer at attach, null at detach (load_ledger.zig); null entry: no engine group.
+        load: ?*const fn (ctx: *anyopaque, producer: ?load_ledger.Producer) void = null,
     };
 
     pub fn info(e: Engine) Info {
@@ -579,6 +580,7 @@ test {
     _ = @import("lane_embedding_test.zig");
     _ = speech_guard;
     _ = @import("lane_host.zig");
+    _ = load_ledger;
     _ = @import("lane_host_test.zig");
     _ = @import("lane_root_copy_test.zig");
     _ = @import("lane_rounds_test.zig");

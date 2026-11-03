@@ -14,20 +14,29 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
 
     if (o.context > prompt.max_tokens) return error.ContextOverWindow;
     if (o.segments != 1) return error.UnsupportedOption;
-    if ((o.tp != 1 and o.tp != 2) or o.rank >= o.tp) return error.BadRank;
+    if (o.tp != 1 and o.tp != 2) return error.FlashNextRanksOverTwo;
+    if (o.rank >= o.tp) return error.BadRank;
     // refused before the stream, the glue or a captured set loads
-    const chunk = try prompt.chunkRows();
+    const chunk = try @import("cuda_chunk.zig").soloRows(try prompt.chunkRows()); // the largest pass, solo or not
     _ = try @import("cuda_modelopt_threads.zig").configured(); // TF_FLASHNEXT_LOAD_THREADS, refused before any load
     const mode = try config.mode(gpa, io, dir);
-    if (o.tp != 1 and (mode != .modelopt or captured != null)) return error.UnsupportedQuantization;
+    if (o.tp != 1 and mode != .modelopt) return error.FlashNextRanksNeedModelopt;
+    if (o.tp != 1 and captured != null) return error.FlashNextRanksOnCapturedGlue;
     if (o.slide and (mode != .affine or o.tp != 1)) return error.UnsupportedLearningFormat;
     if (o.slide and captured != null) return error.TrainingOnCapturedGlue;
     const page_tokens = try @import("cuda_kv_lanes.zig").paging();
     if (page_tokens > 0 and (o.tp != 1 or o.slide or captured != null)) return error.FlashNextPagesUnsupported;
+    // pending DeltaNet rows run on one GPU only: TF_FLASHNEXT_KEEP_LATE=1 with tensor parallel is refused
+    const Draft = @import("cuda_mtp_draft.zig").Draft;
+    const late_fits = o.tp == 1;
+    if (Draft.lateWanted() == true and !late_fits) return error.FlashNextKeepLateUnsupported;
+    Draft.late_on = (Draft.lateWanted() orelse true) and late_fits;
     const driver: *cuda.Driver = @constCast(ctx.d);
     const own = try gpa.create(Cuda);
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .context = o.context, .engine = undefined, .glue = undefined, .stream = undefined, .logits = undefined };
+    // fixed-size lane buffers reused across streams (cuda_lane_parts.zig; TF_FLASHNEXT_LANE_PARTS=0: allocate each)
+    own.parts.on = if (std.c.getenv("TF_FLASHNEXT_LANE_PARTS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
     own.stream = try cuda.Stream.init(driver, true);
     errdefer own.stream.deinit();
     own.glue = try Glue.load(driver);
@@ -43,7 +52,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
             id.image_tokens = v.image_tokens;
             id.max_images = v.max_images;
         }
-        own.ranks = try ranks.Session.init(gpa, io, o.master orelse "127.0.0.1", o.master_port, o.rank, id);
+        own.ranks = try ranks.Session.init(gpa, io, o.master orelse "127.0.0.1", o.master_port, o.rank, id, ranks.linkWait());
     }
     errdefer if (own.ranks) |r| {
         r.poison();
@@ -55,6 +64,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         own.engine.collective = &r.collective;
     }
     errdefer own.engine.deinit();
+    const e = own.engine;
+    if (e.chunk != e.busy_chunk) std.log.info("flashnext: prompt passes of {d} rows, {d} while another stream decodes", .{ e.chunk, e.busy_chunk });
     if (o.vision) |limits| {
         if (own.set != null) return error.VisionCapturedSetUnsupported;
         own.vision = try images.Vision.load(gpa, io, driver, own.stream, dir, limits, o.rank, own.glue.f.prep_media, own.glue.f.pool_media, own.glue.f.prep_media_paged, own.glue.f.pool_media_paged);
@@ -70,6 +81,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         if (std.c.getenv("TF_FLASHNEXT_CONFIDENCE")) |v| own.confidence = std.fmt.parseFloat(f64, std.mem.span(v)) catch mtp.default_confidence;
     }
     errdefer if (own.head) |h| h.deinit();
+    @import("cuda_prompt_wt.zig").dropPageCache(io, dir, e.ngram.files.items);
     const window = @min(o.context + mtp.max_rows, prompt.max_tokens);
     // and an attention block's block scores at the window (64 MiB at 262,144 tokens)
     _ = try own.engine.reserveScores(window, @min(o.context, own.engine.chunk));

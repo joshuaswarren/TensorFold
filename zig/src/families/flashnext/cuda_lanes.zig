@@ -34,11 +34,11 @@ pub fn Namespace(comptime Tri: type) type {
         pub const max_segments: u32 = 1;
         pub const prompt_rows: u32 = @intCast(prompt.batch.default_chunk);
         /// The prompt cache's copies of a stream's state (cuda_snap.zig), called with `Loaded.target`.
-        pub const snap_bytes = snapBytes;
+        pub const snap_bytes = snaps.bytes;
         pub const snap_repeat_min: u32 = 16;
-        pub const snap_save = snapSave;
-        pub const snap_restore = snapRestore;
-        pub const snap_drop = snapDrop;
+        pub const snap_save = snaps.save;
+        pub const snap_restore = snaps.restore;
+        pub const snap_drop = snaps.drop;
         pub const kept_disk = @import("cuda_disk.zig").Kept(@This()); // their disk image, as qwen3_5 declares its own
         /// TF_FLASHNEXT_KV_PAGES: the pool's lanes, the pages of a request's rows and a drafted window (kvl).
         pub const window_rows = kvl.window_rows;
@@ -117,10 +117,12 @@ pub fn Namespace(comptime Tri: type) type {
             return local;
         }
 
-        /// A request or load this engine refuses, in words; null: none of its own.
-        pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
-            return @import("cuda_lanes_explain.zig").explain(err);
+        /// A request this engine refuses, in words; with no engine (cuda.zig's open), a load it refuses.
+        pub fn explain(ctx: ?*anyopaque, err: anyerror) ?[]const u8 {
+            const words = @import("cuda_lanes_explain.zig");
+            return if (ctx == null) words.open(err) else words.explain(err);
         }
+        pub const explains_open = true;
 
         /// A stream's caches; with the head, its cache, a window's buffers and the drafts it holds for the next round.
         const Lane = struct {
@@ -131,9 +133,16 @@ pub fn Namespace(comptime Tri: type) type {
             filled: ?usize = 0,
             /// Where its caches came from: the pool's lanes, or its own (the one a pool leaves beside it).
             from: kvl.From = .none,
+            /// Its sequence's and draft's fixed-size buffers' blocks (Parts), given back when it drops.
+            part_seq: ?cuda.DeviceBuffer = null,
+            part_draft: ?cuda.DeviceBuffer = null,
         };
 
+        const Parts = @import("cuda_lane_parts.zig").Parts;
+        const seq_parts = @import("cuda_seq_parts.zig");
+
         const Ops = mtp.Ops(Tri);
+        const snaps = @import("cuda_lanes_snap.zig").Snaps(Cuda);
 
         pub const Cuda = struct {
             gpa: std.mem.Allocator,
@@ -149,6 +158,7 @@ pub fn Namespace(comptime Tri: type) type {
             glue: Glue,
             stream: cuda.Stream,
             lanes: std.AutoHashMapUnmanaged(*lanes.Stream, Lane) = .empty,
+            parts: Parts = .{},
             /// A round's scores, every row [round_streams, vocab] bf16.
             logits: cuda.DeviceBuffer,
             drawn: [ring]u32 = undefined,
@@ -202,7 +212,7 @@ pub fn Namespace(comptime Tri: type) type {
                     .score = @import("cuda_score.zig").Hook(Cuda, Tri).call,
                     .first_masked = firstMaskedFn,
                 };
-                const ranked_table = @import("cuda_score.zig").withoutScore(scoring_table);
+                const ranked_table = comptime @import("cuda_score.zig").withoutScore(scoring_table);
                 return .{ .ptr = self, .proposal_head = if (self.head) |h| &h.service else null, .vtable = if (self.ranks == null) &scoring_table else &ranked_table };
             }
 
@@ -222,7 +232,7 @@ pub fn Namespace(comptime Tri: type) type {
                     .hidden_rows = true,
                     .batch_rows = if (drafting) mtp.round_rows else round_streams,
                     .max_streams = round_streams,
-                    // a shared round's greedy streams draft in one head pass a step (lanes_draft.batched)
+                    // a shared round's streams draft in one head pass a step (lanes_draft.batched)
                     .draft_streams = drafting and lanes_draft.batchHeads(),
                 };
             }
@@ -270,10 +280,14 @@ pub fn Namespace(comptime Tri: type) type {
                 // a window's rows past the reply's last token (its drafts) still need cache slots
                 const cap = @min(ids.len + s.max_new + (if (drafting) mtp.max_rows else 0), prompt.max_tokens);
                 const from = self.kv.choose();
-                gop.value_ptr.* = .{ .seq = (if (self.ranks) |r| r.create(cap) else if (from == .pool) self.kv.pool.?.open(cap) else self.engine.newSeq(cap)) catch |err| {
+                // a contiguous lane's fixed-size buffers from the parts kept from an earlier stream
+                var part_seq: ?cuda.DeviceBuffer = null;
+                if (self.parts.on and self.ranks == null and from != .pool) part_seq = Parts.take(&self.parts.seqs, self.engine.driver, seq_parts.seqPartsBytes()) catch null;
+                gop.value_ptr.* = .{ .seq = (if (self.ranks) |r| r.create(cap) else if (from == .pool) self.kv.pool.?.open(cap) else if (part_seq) |b| seq_parts.newSeqIn(self.engine, cap, b) else self.engine.newSeq(cap)) catch |err| {
+                    if (part_seq) |b| Parts.give(&self.parts.seqs, self.gpa, b);
                     self.lanes.removeByPtr(gop.key_ptr);
                     return err;
-                }, .from = from };
+                }, .from = from, .part_seq = part_seq };
                 self.kv.opened(from);
                 const l = gop.value_ptr;
                 l.seq.untaught = s.untaught;
@@ -281,7 +295,10 @@ pub fn Namespace(comptime Tri: type) type {
                     dropLane(self, l);
                     self.lanes.removeByPtr(gop.key_ptr);
                 }
-                if (drafting) l.draft = if (from == .pool) try self.kv.pool.?.draft(&l.seq, cap) else try mtp.Draft.init(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk);
+                if (drafting and from != .pool and l.part_seq != null) {
+                    l.part_draft = try Parts.take(&self.parts.drafts, self.engine.driver, mtp.Draft.partsBytes(self.head.?.ids.len, self.engine.chunk));
+                    l.draft = try mtp.Draft.initParts(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk, l.part_draft.?);
+                } else if (drafting) l.draft = if (from == .pool) try self.kv.pool.?.draft(&l.seq, cap) else try mtp.Draft.init(self.gpa, self.engine.driver, self.stream, cap, self.head.?.ids.len, self.engine.chunk);
                 if (s.images.len != 0) {
                     const v = self.vision orelse return error.VisionNotEnabled;
                     l.seq.media = try v.state(ids, s.images);
@@ -305,26 +322,27 @@ pub fn Namespace(comptime Tri: type) type {
                 }
                 return l;
             }
-            /// One prompt chunk, cut at the next cache mark; true once the last row's scores are in seq.logits.
-            fn step(self: *Cuda, s: *lanes.Stream, l: *Lane) !bool {
+            /// One prompt chunk, its rows picked as it starts, cut at the next cache mark; true once it was the last.
+            fn step(self: *Cuda, s: *lanes.Stream, l: *Lane, _: u32) !bool {
                 const ids = s.prompt();
                 const at = l.filled orelse return true;
                 if (s.isCancelled()) {
                     s.keepInterruptedPrefill(@intCast(at));
                     return error.Cancelled;
                 }
-                var stop = @min(ids.len, at + self.engine.chunk);
+                const rows = @import("cuda_chunk.zig").passRows(&self.lanes, l, self.engine.chunk, self.engine.busy_chunk);
+                var stop = @min(ids.len, at + rows);
                 for (s.reuse.marks) |m| if (m > at and m < stop) {
                     stop = m;
                     break;
                 };
                 const last = stop == ids.len;
-                self.engine.ngram.warmAhead(ids, stop, @min(ids.len, stop + self.engine.chunk));
+                self.engine.ngram.warmAhead(ids, stop, @min(ids.len, stop + rows));
                 if (l.draft) |*d| {
                     try self.ops().prefillChunk(&l.seq, d, ids, at, stop);
                 } else if (self.ranks) |r| {
-                    try r.forward(Tri, self.tri(), &l.seq, ids[at..stop], .{ .logits = if (last) .last else .none });
-                } else try self.engine.forward(Tri, self.tri(), &l.seq, ids[at..stop], .{ .logits = if (last) .last else .none });
+                    try r.forward(Tri, self.tri(), &l.seq, ids[at..stop], .{ .logits = if (last) .last else .none, .prompt = true });
+                } else try self.engine.forward(Tri, self.tri(), &l.seq, ids[at..stop], .{ .logits = if (last) .last else .none, .prompt = true });
                 l.filled = if (last) null else stop;
                 if (!last and std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(stop)) != null) {
                     if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(stop));
@@ -333,8 +351,7 @@ pub fn Namespace(comptime Tri: type) type {
             }
         };
         pub fn envUsize(name: [:0]const u8, default: usize) usize {
-            const v = std.c.getenv(name) orelse return default;
-            return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
+            return std.fmt.parseInt(usize, std.mem.span(std.c.getenv(name) orelse return default), 10) catch default;
         }
 
         pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, captured: ?[]const u8, o: Options) !Loaded {
@@ -357,6 +374,7 @@ pub fn Namespace(comptime Tri: type) type {
             var it = own.lanes.valueIterator();
             while (it.next()) |l| dropLane(own, l);
             own.lanes.deinit(own.gpa);
+            own.parts.deinit(own.gpa);
             own.engine.round_graph.clear();
             own.logits.free();
             if (own.head) |h| h.deinit();
@@ -374,6 +392,11 @@ pub fn Namespace(comptime Tri: type) type {
             cuda.completion.drain(self.engine.driver, self.stream, "flashnext: a failed or closed lane did not drain");
             if (l.draft) |*d| d.deinit();
             if (self.ranks) |r| r.drop(&l.seq) else if (!self.kv.close(l.from, &l.seq)) l.seq.deinit(self.gpa);
+            // the blocks after both: a state / spare swap may have left views of each in the other
+            if (l.part_draft) |b| Parts.give(&self.parts.drafts, self.gpa, b);
+            if (l.part_seq) |b| Parts.give(&self.parts.seqs, self.gpa, b);
+            l.part_draft = null;
+            l.part_seq = null;
         }
 
         fn of(ptr: *anyopaque) *Cuda {
@@ -383,14 +406,14 @@ pub fn Namespace(comptime Tri: type) type {
         fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
             const self = of(ptr);
             const l = try self.open(s);
-            while (!try self.step(s, l)) {}
+            while (!try self.step(s, l, 0)) {}
         }
 
         /// One chunk of the stream's prompt between the other streams' rounds; the first call opens its caches.
-        fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
+        fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream, _: u32) anyerror!bool {
             const self = of(ptr);
             const l = if (self.lanes.getPtr(s)) |x| (if (x.filled != null) x else try self.open(s)) else try self.open(s);
-            return self.step(s, l);
+            return self.step(s, l, 0);
         }
 
         fn cancelPrefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
@@ -488,7 +511,7 @@ pub fn Namespace(comptime Tri: type) type {
             const self = of(ptr);
             if (self.head == null) return error.NoDraftHead;
             defer lanes_draft.depthLog(self, requests);
-            // greedy chains of a shared round: their heads in one pass a step (the drafts each would get alone)
+            // a shared round's chains: their heads in one pass a step (the drafts each would get alone)
             var batched: [mtp_ops.max_lanes]bool = @splat(false);
             if (lanes_draft.batchHeads() and requests.len > 1 and requests.len <= mtp_ops.max_lanes) try lanes_draft.batched(self, requests, &batched);
             for (requests, 0..) |r, ri| {
@@ -544,57 +567,21 @@ pub fn Namespace(comptime Tri: type) type {
 
         test {
             _ = @import("cuda_images_test.zig").Cases(Cuda, Cuda.open, dropLane);
-            _ = @import("cuda_lanes_restore_test.zig").Cases(Cuda, Cuda.open, snapRestore, dropLane);
+            _ = @import("cuda_lanes_restore_test.zig").Cases(Cuda, Cuda.open, snaps.restore, dropLane);
             _ = @import("cuda_lanes_admission_test.zig").Cases(Cuda, Cuda.open, dropLane);
             _ = @import("cuda_score.zig").CapabilityCases(Cuda);
         }
 
-        test "a bad TF_FLASHNEXT_CHUNK or TF_FLASHNEXT_LOAD_THREADS is refused at load before the loader takes a stream, a module or a buffer" {
+        test "a bad TF_FLASHNEXT_CHUNK, _CHUNK_SOLO or TF_FLASHNEXT_LOAD_THREADS is refused at load before the loader takes a stream, a module or a buffer" {
             const env = @import("sys").env;
             // every driver entry point undefined: the refusal must come before the first call
             var driver: cuda.Driver = undefined;
             const ctx: cuda.Context = .{ .d = &driver, .device = 0, .handle = null };
-            for ([_]struct { [*:0]const u8, [*:0]const u8, anyerror }{ .{ "TF_FLASHNEXT_CHUNK", "0", error.BadChunk }, .{ "TF_FLASHNEXT_CHUNK", "16385", error.BadChunk }, .{ "TF_FLASHNEXT_CHUNK", "4k", error.BadChunk }, .{ "TF_FLASHNEXT_LOAD_THREADS", "0", error.BadLoadThreads }, .{ "TF_FLASHNEXT_LOAD_THREADS", "33", error.BadLoadThreads }, .{ "TF_FLASHNEXT_LOAD_THREADS", "8x", error.BadLoadThreads } }) |bad| {
+            for ([_]struct { [*:0]const u8, [*:0]const u8, anyerror }{ .{ "TF_FLASHNEXT_CHUNK", "0", error.BadChunk }, .{ "TF_FLASHNEXT_CHUNK", "16385", error.BadChunk }, .{ "TF_FLASHNEXT_CHUNK", "4k", error.BadChunk }, .{ "TF_FLASHNEXT_CHUNK_SOLO", "1024", error.BadChunk }, .{ "TF_FLASHNEXT_LOAD_THREADS", "0", error.BadLoadThreads }, .{ "TF_FLASHNEXT_LOAD_THREADS", "33", error.BadLoadThreads }, .{ "TF_FLASHNEXT_LOAD_THREADS", "8x", error.BadLoadThreads } }) |bad| {
                 _ = env.setenv(bad[0], bad[1], 1);
                 defer _ = env.unsetenv(bad[0]);
                 try std.testing.expectError(bad[2], open(std.testing.allocator, std.testing.io, &ctx, "no-such-checkpoint", null, .{ .context = 4096, .drafts = true }));
             }
-        }
-
-        // -- the prompt cache's copies ------------------------------------------------------------------------
-
-        fn snapBytes(ptr: *anyopaque, at: u32) u64 {
-            return snap.bytes(at, of(ptr).head != null);
-        }
-
-        /// The owner stream's state, its prompt pass standing at `at` (a drafting stream's with the head's rows).
-        fn snapSave(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
-            const self = of(ptr);
-            const s: *lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
-            const l = try self.lane(s);
-            if (l.seq.fed != at) return error.NotAtMark;
-            if (self.ranks) |r| {
-                if (l.draft != null) return error.TensorRankDraftSnapshotUnavailable;
-                return try r.save(&l.seq);
-            }
-            return try snap.save(self.gpa, self.engine.driver, self.stream, &l.seq, if (l.draft) |*d| d else null);
-        }
-
-        fn snapRestore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
-            const self = of(ptr);
-            const s: *lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
-            const l = try self.lane(s);
-            if (self.ranks) |r| {
-                if (l.draft != null) return error.NoHeadState;
-                return r.restore(&l.seq, @ptrCast(@alignCast(saved)));
-            }
-            try snap.restore(self.stream, &l.seq, if (l.draft) |*d| d else null, @ptrCast(@alignCast(saved)));
-        }
-
-        fn snapDrop(ptr: *anyopaque, saved: *anyopaque) void {
-            const self = of(ptr);
-            if (self.ranks) |r| return r.dropSaved(@ptrCast(@alignCast(saved)));
-            snap.drop(self.gpa, self.stream, @ptrCast(@alignCast(saved)));
         }
     };
 }

@@ -3,6 +3,7 @@ const std = @import("std");
 const mtl = @import("metal");
 const sources = @import("kernel_sources");
 const frags = @import("../../core/frags.zig");
+const rope_freq = @import("core").rope_freq;
 const st = @import("../../core/safetensors.zig");
 const wts = @import("weights.zig");
 const fwd = @import("forward.zig");
@@ -344,7 +345,7 @@ pub fn bf16(x: f32) u16 {
 /// Each patch's 2-D rotary cos and sin: its row and column in the patch grid times the 16 frequencies 10000^(-k/16).
 fn rotary(v: *Vision, gh: u32, gw: u32) void {
     var inv: [16]f32 = undefined;
-    for (&inv, 0..) |*f, k| f.* = 1.0 / @as(f32, @floatCast(std.math.pow(f64, 10000.0, @as(f64, @floatFromInt(2 * k)) / 32.0)));
+    rope_freq.inverseFrequencies(10000.0, 32, &inv);
     const cs: [*]f32 = @ptrCast(@alignCast(v.cos.addr()));
     const sn: [*]f32 = @ptrCast(@alignCast(v.sin.addr()));
     const wx_n = gw / merge;
@@ -437,14 +438,13 @@ fn loadWeights(gpa: std.mem.Allocator, device: mtl.Device, dir: []const u8) !Wei
     for (plan) |p| total = std.mem.alignForward(usize, total, 256) + p.src.len;
     w.buf = try device.buffer(total, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);
     errdefer w.buf.deinit();
+    var files: @import("weights_fix.zig").Files = .{ .a = gpa };
+    defer files.deinit();
     var at: usize = 0;
     for (plan) |p| {
         at = std.mem.alignForward(usize, at, 256);
         refOf(&w, p.spec.place).* = .{ .buf = w.buf, .off = at };
-        const fd = std.c.open(p.src.path, .{ .ACCMODE = .RDONLY });
-        if (fd < 0) return error.OpenFailed;
-        defer _ = std.c.close(fd);
-        _ = std.c.fcntl(fd, 48, @as(c_int, 1)); // F_NOCACHE, as the language model's shards
+        const fd = try files.open(p.src.path);
         const dst = w.buf.contents()[at..][0..p.src.len];
         try readAll(fd, dst, p.src.off);
         // the patch embedding channel by frame by row by column; the merge's [O, 2, 2, C], four patch rows tap by tap
