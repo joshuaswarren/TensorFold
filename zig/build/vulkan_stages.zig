@@ -555,3 +555,27 @@ pub fn kernelContract(ctx: *Context) void {
     b.step("tf-vulkan-kernel-contract", "Build Vulkan QMM contract runner and planted control shaders without running them").dependOn(&contract_install.step);
     b.step("vulkan-kernel-contract", "Run Vulkan QMM contract gates and planted controls on the selected device").dependOn(&b.addRunArtifact(contract_exe).step);
 }
+
+/// qmm-decode-bench-build: the tf-qmm-decode-bench microbenchmark with the qmm_q4_tile image embedded.
+pub fn decodeBench(ctx: *Context) void {
+    const b = ctx.b;
+    const tile_cmd = b.addSystemCommand(&.{ ctx.glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-o" });
+    const tile = tile_cmd.addOutputFileArg("qmm_q4_tile.spv");
+    tile_cmd.addFileArg(b.path("zig/kernels/vulkan/qmm_q4_tile.comp"));
+    const files = b.addWriteFiles();
+    _ = files.addCopyFile(tile, "qmm_q4_tile.spv");
+    const bench_shaders = b.createModule(.{ .root_source_file = files.add("qmm_bench_shaders.zig", "pub const qmm_q4_tile align(4) = @embedFile(\"qmm_q4_tile.spv\").*;\n") });
+    const bench = b.addExecutable(.{ .name = "tf-qmm-decode-bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/vulkan/qmm_decode_bench.zig"),
+        .target = ctx.target,
+        .optimize = ctx.optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "vulkan", .module = ctx.vulkan },
+            .{ .name = "qmm_bench_shaders", .module = bench_shaders },
+            .{ .name = "stage1_params", .module = ctx.vulkan.import_table.get("stage1_params").? },
+            .{ .name = "qwen35_config", .module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/config.zig"), .target = ctx.target, .optimize = ctx.optimize }) },
+        },
+    }) });
+    b.step("qmm-decode-bench-build", "Build zig-out/bin/tf-qmm-decode-bench with the embedded qmm_q4_tile image, without running GPU work").dependOn(&b.addInstallArtifact(bench, .{}).step);
+}

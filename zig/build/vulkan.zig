@@ -36,6 +36,7 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     vulkan_stages.stage5(&ctx);
     vulkan_stages.contracts(&ctx);
     vulkan_stages.kernelContract(&ctx);
+    vulkan_stages.decodeBench(&ctx);
     // Family host admission: refAllDeclsRecursive over the family modules; house wires attach in build.zig.
     const model_host_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/vulkan_model_host_tests.zig"),
