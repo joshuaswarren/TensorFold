@@ -10,6 +10,7 @@ const cv = @import("cuda_vision.zig");
 
 const be = lanes.backend;
 const Stream = lanes.Stream;
+pub const shared = @import("cuda_shared.zig");
 const Pick = cuda.tree_round.Pick;
 
 /// Prompt rows a step takes: the forward's chunk grid, from position 0.
@@ -23,6 +24,10 @@ const ring = 1024;
 
 const Lane = struct {
     slot: usize,
+    lease: @import("core").kv_pool.Lease = .{},
+    marks: []const u32 = &.{},
+    shared: bool = false,
+    kept: u32 = 0,
     len: u64 = 0, // the cache length: positions [0, len) hold this stream's keys
     base: u64 = 0, // the cache length the last verify started from
     rows: std.ArrayList(u32) = .empty, // the last verify's row tokens
@@ -55,10 +60,16 @@ pub const Gemma = struct {
     meta: cuda.DeviceBuffer, // a draw's first position minus one, a window each
     slot_bufs: []cuda.DeviceBuffer, // a slot's last-row logits, then its rule: two a slot
     next: u64 = 0,
+    pool: ?@import("core").kv_pool.Pool = null,
+    prompts: ?@import("core").kv_prompts.Prompts = null,
+    restore_slot: ?usize = null,
+    restored_at: u32 = 0,
+    relocated: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque) void } = null,
     gen: u64 = 1, // forwards run: a tap is current while its gen is this
     tapped: bool = false, // a drafter reads the last layer's rows (prepare_features)
     vision: ?*cv.Vision = null, // --vision: the embedder a prompt's images go through
     keeper: ?Keeper = null, // a drafter whose context a kept prompt state carries (DFlash's)
+    bits: ?cuda.DeviceBuffer = null, // structured output's allowed-token words, a round's rows, at first use
 
     /// The device bytes `init` allocates: the token and pick rings, metas, each slot's last row and rule.
     pub fn openBytes(slots: usize) usize {
@@ -66,7 +77,7 @@ pub const Gemma = struct {
     }
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, m: *fwd.Model, k: *const kern.Kernels, s: cuda.Stream) !Gemma {
-        const free = try gpa.alloc(bool, m.slots);
+        const free = try gpa.alloc(bool, if (m.paged) round_rows else m.slots);
         errdefer gpa.free(free);
         @memset(free, true);
         const greedy = try gpa.alloc(bool, ring + round_rows);
@@ -78,7 +89,7 @@ pub const Gemma = struct {
         errdefer picks.free();
         var meta = try cuda.DeviceBuffer.alloc(d, round_rows * 16);
         errdefer meta.free();
-        const bufs = try gpa.alloc(cuda.DeviceBuffer, 2 * m.slots);
+        const bufs = try gpa.alloc(cuda.DeviceBuffer, 2 * (if (m.paged) round_rows else m.slots));
         errdefer gpa.free(bufs);
         var made: usize = 0;
         errdefer for (bufs[0..made]) |*b| b.free();
@@ -91,7 +102,12 @@ pub const Gemma = struct {
 
     pub fn deinit(x: *Gemma) void {
         var it = x.lanes.valueIterator();
-        while (it.next()) |l| l.rows.deinit(x.gpa);
+        while (it.next()) |l| {
+            if (x.pool) |*p| p.finish(&l.lease);
+            x.gpa.free(l.marks);
+            l.rows.deinit(x.gpa);
+        }
+        if (x.pool) |*p| p.deinit();
         x.lanes.deinit(x.gpa);
         for (x.slot_bufs) |*b| b.free();
         x.gpa.free(x.slot_bufs);
@@ -100,13 +116,14 @@ pub const Gemma = struct {
         x.tok.free();
         x.picks.free();
         x.meta.free();
+        if (x.bits) |*b| b.free();
     }
 
     pub fn backend(x: *Gemma) be.Backend {
         return .{ .ptr = x, .vtable = &vtable };
     }
 
-    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true, .prepare_features = prepareFeatures, .features = features, .prefill_features = prefillFeatures };
+    const vtable: be.Backend.VTable = .{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true, .prepare_features = prepareFeatures, .features = features, .prefill_features = prefillFeatures };
 
     /// The drafter's taps: those layers' outputs (before the next norm), kept by every forward from now on.
     fn prepareFeatures(ptr: *anyopaque, taps: []const u32) anyerror!void {
@@ -142,7 +159,7 @@ pub const Gemma = struct {
         errdefer x.dropLane(s);
         while (true) {
             const at = l.fill.?;
-            const done = try x.chunk(s, l, true);
+            const done = try x.chunk(s, l, true, 0);
             try sink.take(sink.ptr, s, try x.featuresOf(l.tap, at, @intCast(l.tap.rows)), at);
             x.marked(s, at + l.tap.rows);
             if (done) return;
@@ -163,27 +180,66 @@ pub const Gemma = struct {
 
     /// The round loop's facts: no draft head; host copies verified in windows up to 16 rows, streams sharing a forward.
     pub fn facts(x: *const Gemma) lanes.Model {
-        return .{ .exact_width = max_window, .gpu_tokens = false, .mtp = false, .speculate = false, .hidden_rows = true, .batch_rows = round_rows, .max_streams = @intCast(@min(x.m.slots, round_rows)) };
+        return .{ .exact_width = max_window, .gpu_tokens = false, .mtp = false, .speculate = false, .hidden_rows = true, .batch_rows = round_rows, .max_streams = @intCast(@min(if (x.m.paged) round_rows else x.m.slots, round_rows)) };
     }
 
     fn self(ptr: *anyopaque) *Gemma {
         return @ptrCast(@alignCast(ptr));
     }
 
-    fn upload(x: *Gemma, dst: u64, bytes: []const u8) !void {
+    pub fn upload(x: *Gemma, dst: u64, bytes: []const u8) !void {
         try x.d.check(x.d.api.cuMemcpyHtoDAsync_v2(dst, bytes.ptr, bytes.len, x.s.handle), "cuMemcpyHtoDAsync");
     }
 
-    /// Rows [row0, row0 + rows) of bf16 `logits` into entries [at, at + rows), row r at `position0 + r`.
-    fn drawRows(x: *Gemma, l: *const Lane, logits: u64, row0: usize, rows: usize, position0: u64, at: usize, meta_at: usize) !void {
+    /// A row's allowed-token words (lanes/grammar.zig: token t at bit t % 32 of word t / 32).
+    const words = (cfg.vocab + 31) / 32;
+
+    /// A window's grammar rows at row `row` of the bits on the device, for a sampled draw.
+    fn putBits(x: *Gemma, row: usize, masks: []const u32) !u64 {
+        if (row * words + masks.len > round_rows * words) return error.InvalidGrammarMasks;
+        if (x.bits == null) x.bits = try cuda.DeviceBuffer.alloc(x.d, round_rows * words * 4);
+        const dst = x.bits.?.ptr + row * words * 4;
+        try x.upload(dst, std.mem.sliceAsBytes(masks));
+        return dst;
+    }
+
+    /// Rows [row0, row0 + rows) into entries [at, at + rows); a grammar masks sampled rows, greedy ones go to pickRows.
+    fn drawRows(x: *Gemma, l: *const Lane, logits: u64, row0: usize, rows: usize, position0: u64, at: usize, meta_at: usize, masks: []const u32, bits_row: usize) !void {
         const v = cfg.vocab;
         const src = logits + row0 * v * 2;
+        if (masks.len != 0 and masks.len != rows * words) return error.InvalidGrammarMasks;
         @memset(x.greedy[at..][0..rows], !l.sampled);
-        if (!l.sampled) return x.k.round.argmax(x.s, src, x.picks.ptr + at * @sizeOf(Pick), rows, v, v);
+        if (!l.sampled) {
+            if (masks.len != 0) return x.pickRows(src, rows, masks, at);
+            return x.k.round.argmax(x.s, src, x.picks.ptr + at * @sizeOf(Pick), rows, v, v);
+        }
+        if (masks.len != 0) {
+            var a: cuda.Args = .{};
+            a.add(src);
+            a.add(@as(u32, v));
+            a.add(try x.putBits(bits_row, masks));
+            a.add(@as(u32, words));
+            try cuda.launch.launch(x.k.grammar_mask, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, x.s, &a);
+        }
         const meta = [4]i32{ @intCast(position0 - 1), 0, 0, 0 };
         const mp = x.meta.ptr + meta_at * 16;
         try x.upload(mp, std.mem.asBytes(&meta));
         try x.k.draws.draw(x.s, src, v, l.rule, mp, 0, x.tok.ptr + at * 4, rows, null, null);
+    }
+
+    /// Greedy grammar rows read back and picked on the host, as the argmax kernel reports a masked -inf as non-finite.
+    fn pickRows(x: *Gemma, src: u64, rows: usize, masks: []const u32, at: usize) !void {
+        const row = try x.gpa.alloc(u16, cfg.vocab);
+        defer x.gpa.free(row);
+        var picked: [max_window]u32 = undefined;
+        if (rows > max_window) return error.WindowTooWide;
+        try x.s.synchronize(); // the forward wrote the rows
+        for (0..rows) |r| {
+            try x.d.check(x.d.api.cuMemcpyDtoH_v2(row.ptr, src + r * cfg.vocab * 2, cfg.vocab * 2), "cuMemcpyDtoH");
+            picked[r] = try pickAllowed(row, masks[r * words ..][0..words]);
+        }
+        try x.upload(x.tok.ptr + at * 4, std.mem.sliceAsBytes(picked[0..rows]));
+        @memset(x.greedy[at..][0..rows], false);
     }
 
     /// Entries [at, at + out.len) as tokens, after the stream's work; a pick over non-finite logits is an error.
@@ -202,6 +258,7 @@ pub const Gemma = struct {
         const s: *const Stream = @ptrCast(@alignCast(owner orelse return error.NoOwner));
         const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
         if ((l.fill orelse l.len) != at) return error.NotAtMark; // a state is copied only where the pass stands
+        if (x.prompts != null) return shared.save(x, l.slot, at);
         const k = try snap.save(x.gpa, x.m, x.s, l.slot, at);
         errdefer snap.drop(x.gpa, x.s, k);
         if (x.keeper) |kp| try kp.keep(kp.ctx, s, k);
@@ -209,6 +266,7 @@ pub const Gemma = struct {
     }
 
     pub fn restoreState(x: *Gemma, owner: ?*anyopaque, k: *const snap.Saved) !void {
+        if (x.prompts != null) return shared.restore(x, k);
         const s: *const Stream = @ptrCast(@alignCast(owner orelse return error.NoOwner));
         const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
         try snap.restore(x.m, x.s, l.slot, k);
@@ -216,7 +274,7 @@ pub const Gemma = struct {
     }
 
     pub fn dropState(x: *Gemma, k: *snap.Saved) void {
-        snap.drop(x.gpa, x.s, k);
+        shared.drop(x, k);
     }
 
     fn freeSlot(x: *const Gemma) ?usize {
@@ -224,36 +282,12 @@ pub const Gemma = struct {
     }
 
     /// A prompt pass begins: a slot, the stream's rule, a kept state restored; where its first chunk starts.
-    fn opening(x: *Gemma, s: *Stream) !*Lane {
-        const p = s.prompt();
-        if (p.len == 0) return error.EmptyPrompt;
-        if (p.len + @as(usize, s.max_new) + max_window > x.m.context) return error.PastContext;
-        const got = try x.lanes.getOrPut(x.gpa, s);
-        if (!got.found_existing) {
-            const slot = x.freeSlot() orelse {
-                x.lanes.removeByPtr(got.key_ptr);
-                return error.NoFreeSlot;
-            };
-            x.free[slot] = false;
-            got.value_ptr.* = .{ .slot = slot, .last = x.slot_bufs[2 * slot].ptr, .rule = x.slot_bufs[2 * slot + 1].ptr };
-        }
-        const l = got.value_ptr;
-        l.sampled = false;
-        l.mark = null;
-        if (s.sampling) |sp| if (sp.temperature > 0) {
-            const r = cuda.sample.Rule.from(lanes.gpu_rule.rule(sp));
-            try x.upload(l.rule, std.mem.asBytes(&r));
-            l.sampled = true;
-        };
-        s.cached = 0;
-        if (s.images.len > 0) try x.encodeImages(s, l);
-        l.fill = x.resumeAt(s, l, p.len);
-        s.fill_at.store(@intCast(l.fill.?), .monotonic);
-        return l;
+    pub fn opening(x: *Gemma, s: *Stream) !*Lane {
+        return if (x.pool != null) shared.opening(Lane, x, s) else shared.legacyOpening(Lane, x, s);
     }
 
     /// Every image of the prompt through the embedder into the lane's buffer, in prompt order.
-    fn encodeImages(x: *Gemma, s: *Stream, l: *Lane) !void {
+    pub fn encodeImages(x: *Gemma, s: *Stream, l: *Lane) !void {
         const v = x.vision orelse return error.GemmaServedWithoutVision;
         const p = s.prompt();
         var rows: usize = 0;
@@ -285,7 +319,7 @@ pub const Gemma = struct {
     }
 
     /// The kept state's position, restored into the slot (0: none, or not this prompt's).
-    fn resumeAt(x: *Gemma, s: *Stream, l: *const Lane, len: usize) usize {
+    pub fn resumeAt(x: *Gemma, s: *Stream, l: *const Lane, len: usize) usize {
         const saved = s.reuse.saved orelse return 0;
         const k: *const snap.Saved = @ptrCast(@alignCast(saved));
         // a drafter that keeps context resumes only a state that carries it
@@ -301,13 +335,13 @@ pub const Gemma = struct {
         return k.at;
     }
 
-    /// One chunk from `l.fill` to the next grid line or mark; true once the prompt's last row's logits are written.
-    fn chunk(x: *Gemma, s: *Stream, l: *Lane, streamed: bool) !bool {
+    /// One chunk from `l.fill` to the next grid line, image or mark; true once the prompt's last row is in. `_: u32`.
+    fn chunk(x: *Gemma, s: *Stream, l: *Lane, streamed: bool, _: u32) !bool {
         const p = s.prompt();
         const at = l.fill.?;
         if (s.isCancelled()) return error.Cancelled;
         var end = @min(p.len, (at / prompt_rows + 1) * prompt_rows);
-        for (s.reuse.marks) |mk| if (mk > at and mk < end and !insideImage(s, mk)) {
+        for (if (l.shared) l.marks else s.reuse.marks) |mk| if (mk > at and mk < end and !insideImage(s, mk)) {
             end = mk;
         };
         // never through an image: its rows see each other, so a chunk holds all of them (one is at most 280)
@@ -344,8 +378,11 @@ pub const Gemma = struct {
     }
 
     /// The prompt cache's mark at `end`: the state there is copied (with a drafter's context, once it holds it).
-    fn marked(x: *Gemma, s: *Stream, end: usize) void {
-        _ = x;
+    pub fn marked(x: *Gemma, s: *Stream, end: usize) void {
+        if (x.lanes.getPtr(s)) |l| if (l.shared) {
+            shared.marked(x, s, l, end) catch |err| std.log.warn("gemma4: prompt pages not kept: {s}", .{@errorName(err)});
+            return;
+        };
         if (s.reuse.hook) |hk| if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(end)) != null) hk.at(hk.ptr, s, @intCast(end));
     }
 
@@ -353,10 +390,10 @@ pub const Gemma = struct {
         const x = self(ptr);
         const l = try x.opening(s);
         errdefer x.dropLane(s);
-        while (!try x.chunk(s, l, false)) {}
+        while (!try x.chunk(s, l, false, 0)) {}
     }
 
-    fn prefillStep(ptr: *anyopaque, s: *Stream) anyerror!bool {
+    fn prefillStep(ptr: *anyopaque, s: *Stream, _: u32) anyerror!bool {
         const x = self(ptr);
         const going = if (x.lanes.getPtr(s)) |l| l.fill != null else false;
         const l = if (going) x.lanes.getPtr(s).? else try x.opening(s);
@@ -364,7 +401,7 @@ pub const Gemma = struct {
         if (l.mark) |at| x.marked(s, at); // the drafter's wrapper absorbed the last step's rows: its context is kept too
         l.mark = null;
         const later = x.keeper != null and s.drafts;
-        const done = try x.chunk(s, l, later);
+        const done = try x.chunk(s, l, later, 0);
         if (later) {
             if (done) x.marked(s, s.prompt().len) else l.mark = l.fill;
         }
@@ -382,7 +419,18 @@ pub const Gemma = struct {
         const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
         if (position != l.len or l.fill != null) return error.PositionMismatch;
         const h = x.next;
-        try x.drawRows(l, l.last, 0, 1, position, x.handle(), 0);
+        try x.drawRows(l, l.last, 0, 1, position, x.handle(), 0, &.{}, 0);
+        return h;
+    }
+
+    /// The first draw among `mask`'s allowed tokens, from the prompt's last row.
+    fn firstMasked(ptr: *anyopaque, s: *Stream, position: u64, mask: []const u32) anyerror!u64 {
+        const x = self(ptr);
+        const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
+        if (position != l.len or l.fill != null) return error.PositionMismatch;
+        if (mask.len != words) return error.InvalidGrammarMasks;
+        const h = x.next;
+        try x.drawRows(l, l.last, 0, 1, position, x.handle(), 0, mask, 0);
         return h;
     }
 
@@ -398,11 +446,12 @@ pub const Gemma = struct {
         const l = x.lanes.getPtr(s) orelse return error.UnknownStream;
         const t = try x.value(feed);
         if (position != l.len + 1) return error.PositionMismatch;
+        try shared.reach(x, l, l.len + 1);
         try x.run(&.{.{ .slot = l.slot, .p0 = l.len, .tokens = &.{t} }}, false, 0, 1);
         l.tap = .{ .row = 0, .start = l.len, .rows = 1, .gen = x.gen };
         l.len += 1;
         const h = x.next;
-        try x.drawRows(l, x.m.s.logits, 0, 1, position, x.handle(), 0);
+        try x.drawRows(l, x.m.s.logits, 0, 1, position, x.handle(), 0, &.{}, 0);
         return h;
     }
 
@@ -422,7 +471,6 @@ pub const Gemma = struct {
         for (windows, chains) |w, *c| {
             if (w.held != 0) return error.NoHeldDrafts; // no draft head: every draft comes from the host
             if (w.parents != null) return error.ChainsOnly;
-            if (w.masks.len != 0) return error.StructuresUnsupported;
             const l = x.lanes.getPtr(w.stream) orelse return error.UnknownStream;
             if (w.rows() > max_window) return error.WindowTooWide;
             l.base = l.len;
@@ -430,16 +478,19 @@ pub const Gemma = struct {
             try l.rows.append(x.gpa, w.pending);
             try l.rows.appendSlice(x.gpa, w.tokens);
             for (w.positions, 0..) |pos, r| if (pos != l.base + r + 1) return error.PositionMismatch;
+            try shared.reach(x, l, l.base + l.rows.items.len);
             c.* = .{ .slot = l.slot, .p0 = l.base, .tokens = l.rows.items };
             total += l.rows.items.len;
         }
         if (total > round_rows) return error.RoundTooWide;
+        // before the forward: a refusal after it would strand its rows
+        for (windows) |w| if (w.masks.len != 0 and w.masks.len != w.rows() * words) return error.InvalidGrammarMasks;
         try x.run(chains, false, 0, total);
         var at: usize = 0;
         for (windows, 0..) |w, i| {
             const l = x.lanes.getPtr(w.stream).?;
             l.tap = .{ .row = at, .start = l.base, .rows = l.rows.items.len, .gen = x.gen };
-            try x.drawRows(l, x.m.s.logits, at, l.rows.items.len, w.positions[0], ring + at, i);
+            try x.drawRows(l, x.m.s.logits, at, l.rows.items.len, w.positions[0], ring + at, i, w.masks, at);
             at += l.rows.items.len;
         }
         var got: [round_rows]u32 = undefined;
@@ -474,6 +525,9 @@ pub const Gemma = struct {
         if (x.lanes.fetchRemove(s)) |kv| {
             var l = kv.value;
             x.free[l.slot] = true;
+            if (x.pool) |*p| p.finish(&l.lease);
+            if (x.m.paged) x.m.caps[l.slot] = 0;
+            x.gpa.free(l.marks);
             l.rows.deinit(x.gpa);
             if (l.images) |*b| {
                 x.s.synchronize() catch {};
@@ -486,3 +540,54 @@ pub const Gemma = struct {
         self(ptr).dropLane(s);
     }
 };
+
+/// tf_round_bf16_argmax's pick among `mask`'s allowed tokens: the first largest; a non-finite logit is an error.
+fn pickAllowed(row: []const u16, mask: []const u32) !u32 {
+    var best: f32 = 0;
+    var id: ?u32 = null;
+    for (row, 0..) |bits, t| {
+        const v: f32 = @bitCast(@as(u32, bits) << 16);
+        if (!std.math.isFinite(v)) return error.NonFiniteLogits;
+        if ((mask[t / 32] >> @intCast(t % 32)) & 1 == 0) continue;
+        if (id == null or v > best) {
+            best = v;
+            id = @intCast(t);
+        }
+    }
+    return id orelse error.InvalidGrammarMasks;
+}
+
+test "a greedy pick under a grammar: the first largest allowed token, refusals by name" {
+    const bf = struct {
+        fn of(f: f32) u16 {
+            return @intCast(@as(u32, @bitCast(f)) >> 16);
+        }
+    }.of;
+    var row: [64]u16 = @splat(bf(0.5));
+    row[3] = bf(9);
+    row[40] = bf(2);
+    row[41] = bf(2);
+    var mask = [2]u32{ 0, (1 << 8) | (1 << 9) }; // tokens 40 and 41
+    try std.testing.expectEqual(@as(u32, 40), try pickAllowed(&row, &mask));
+    mask[0] = 1 << 3;
+    try std.testing.expectEqual(@as(u32, 3), try pickAllowed(&row, &mask));
+    try std.testing.expectError(error.InvalidGrammarMasks, pickAllowed(&row, &.{ 0, 0 }));
+    row[10] = 0xFF80; // -inf, even where the grammar refuses it
+    try std.testing.expectError(error.NonFiniteLogits, pickAllowed(&row, &mask));
+}
+
+test "zero grant: Gemma CUDA assistant and DFlash preserve tokens through a long shared skip" {
+    var m: fwd.Model = undefined;
+    m.slots = 16;
+    var b: Gemma = undefined;
+    b.m = &m;
+    try lanes.shared_draft_check.check(b.facts(), true);
+}
+
+test "shared head costs: Gemma CUDA assistant and DFlash retain costed copy grants" {
+    var m: fwd.Model = undefined;
+    m.slots = 16;
+    var b: Gemma = undefined;
+    b.m = &m;
+    try @import("cuda_head_cost_test.zig").check(b.facts());
+}

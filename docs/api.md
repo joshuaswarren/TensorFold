@@ -2,6 +2,9 @@
 
 The base URL is `http://127.0.0.1:8080/v1` with the default server settings.
 
+Native `serve --profile stable` keeps the current defaults. [Profiles](profiles.md) documents its initial
+environment-switch registry, explicit override precedence, and startup reporting.
+
 ## Native chat template override
 
 `tensorfold serve MODEL --chat-template custom-chat.jinja` loads a UTF-8 Jinja template from that file
@@ -15,7 +18,7 @@ Both servers accept repeated `--api-key KEY`, comma-separated `TENSORFOLD_API_KE
 `#` for comments. Set its permissions to `0600`; startup refuses a file readable by other users.
 The server stores SHA-256 digests and compares every configured digest for each authentication attempt.
 
-Send `Authorization: Bearer KEY` from OpenAI-compatible clients, or `x-api-key: KEY` from Messages clients. Missing or invalid credentials return HTTP 401 with `WWW-Authenticate: Bearer` and the route's error format. With keys configured, the native server requires a key on every route by default. Its public exceptions are GET `/`, `/health`, `/slide` and the eight embedded `/slide/` scripts; `--metrics-open` also opens GET `/metrics` and `/v1/metrics`. Other methods and unknown assets require a key. This includes every `/systemone` inference alias and future private routes. `/health` remains open and returns only `{"status":"ok"}` when keys are configured. Public health is read-only, including when a reset query is supplied. With no keys, its health details remain available; a non-loopback bind prints a warning.
+Send `Authorization: Bearer KEY` from OpenAI-compatible clients, or `x-api-key: KEY` from Messages clients. Missing or invalid credentials return HTTP 401 with `WWW-Authenticate: Bearer` and the route's error format. With keys configured, the native server requires a key on every route by default. Its public exceptions are GET `/`, `/health`, `/slide` and the eight embedded `/slide/` scripts; `--metrics-open` also opens GET `/metrics`, `/v1/metrics` and `/v1/load`. Other methods and unknown assets require a key. This includes every `/systemone` inference alias and future private routes. `/health` remains open and returns only `{"status":"ok"}` when keys are configured. Public health is read-only, including when a reset query is supplied. With no keys, its health details remain available; a non-loopback bind prints a warning.
 
 The native server raises its soft open-file limit before listening when the platform permits it. If `accept` runs out of descriptors, it logs one guidance line per burst and keeps a short retry backoff.
 
@@ -43,7 +46,7 @@ different scopes, or scopes a key the flags or environment already give, is refu
 | Scope | Routes |
 | --- | --- |
 | `inference` | POST `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/tokenize`, `/v1/detokenize`, `/v1/audio/speech`, `/v1/embeddings`, `/v1/decisions`, `/v1/systemone`, and the same paths without `/v1` where the server has them; GET `/v1/models`, `/models`, `/v1/voices` |
-| `read` | GET `/metrics`, `/v1/metrics`, `/memory`, `/v1/memory`, `/stats`, `/dashboard`, `/v1/benchmark/manifest`, `/v1/models`, `/models`, `/v1/voices` |
+| `read` | GET `/metrics`, `/v1/metrics`, `/v1/load`, `/memory`, `/v1/memory`, `/stats`, `/dashboard`, `/v1/benchmark/manifest`, `/v1/models`, `/models`, `/v1/voices` |
 
 A scoped key reaches nothing else: not the stored Responses (GET or DELETE `/v1/responses/ID`), Recall, Sliding Weights,
 `/v1/imprint`, another method, or a suffix alias such as `/alt/completions` that the server answers for a full key. The route
@@ -98,6 +101,7 @@ tensorfold-native serve MODEL --allowed-host inference.example --allowed-origin 
 | `GET /health` | Liveness, the served model, the queue and live rates; open with keys (see [Health](#health)) |
 | `GET /memory`, `GET /v1/memory` | Native read-only memory snapshot ([memory diagnostics](memory-diagnostics.md)) |
 | `GET /metrics`, `GET /v1/metrics` | Prometheus text: requests, KV occupancy, drafts and latency (both servers) |
+| `GET /v1/load` | The scheduler load ledger as one JSON object (native server); see [Scheduler load](#scheduler-load) |
 | `GET /dashboard` | Native live dashboard page when `--dashboard` is enabled |
 | `GET /stats` | Native JSON dashboard snapshot when `--dashboard` is enabled |
 | `POST /v1/chat/completions` | Text chat, optional image input, tools and reasoning; streamed or non-streamed |
@@ -132,8 +136,8 @@ Unsupported image input, audio, video and non-text output requests receive HTTP 
 
 ## Decisions
 
-`POST /v1/decisions` is served by the MLX server, by the CUDA GLM engine and by Flash Next on one CUDA GPU.
-Another CUDA engine, one without label scoring, returns HTTP 400.
+`POST /v1/decisions` is served by Flash Next on one CUDA GPU, by LFM2 on CUDA and by Gemma 4 on XPU.
+Every other engine, which includes all Metal families and CUDA GLM today, returns HTTP 400.
 The prompt wording is SGLang's decision prompt format version 1: the input, a blank line, the question, one line per
 option, level, or described yes or no answer, and a closing instruction to answer with one label. Choice labels are
 `A` to `Z`, score labels are `0` to `9`, and a yes/no question uses `yes` and `no`. Each label must be one distinct
@@ -233,8 +237,17 @@ On MLX, `--parallel auto` is the default: requests share rounds within the confi
 budget. Every admitted prompt prefills a chunk at a time beside the others. Each chunk goes to a foreground prompt
 before a background one, then to the prompt with the fewest tokens left, and a prompt passed over for 8 chunks takes
 the next one: a short request starts at the next chunk, and a long prompt still finishes. Running replies take rounds
-between chunks for `--decode-share` of each chunk's time (default 0.25). That flag is the Python 0.6.6 engine's, and the
-native binary refuses it. In that engine, `--decode-share 0` prefills each prompt whole
+between chunks for `--decode-share` of each chunk's time (0.25 is the Python engine's default). On a native server
+the flag is the reply's share, and the prompt owes its complement: it also offers a 512-row cap on a filling
+prompt's chunks to families that declare chunk-independent prompt arithmetic. That offer is gated per family
+behind device token-hash qualification; every native family is gated out today, so no native server caps chunk
+rows yet. Absent the flag the engines keep their own cuts and `TENSORFOLD_PREFILL_SHARE` keeps its old meaning:
+the prompt's share of a fill step's wall time, time only, never smaller chunks. `TENSORFOLD_PREFILL_ORDER=srpt`
+lets running replies with less estimated work left than a filling long prompt take rounds first, the prompt keeping
+at least 10% of the time. With `--decode-share` it keeps that share when the prompt goes first and takes at most 10% when a reply does, and `--decode-share 0` still prefills each prompt whole. The CUDA, qwen27 Metal and
+hip_serve servers pass the flag to their lane host and take its time share; the DeepSeek, Spark-X on Metal, Qwen4
+and XPU servers do not parse or apply the flag. `--decode-share 0` prefills each prompt
+whole
 first, in arrival order, as 0.3.6.2 did. Background work waits behind foreground requests. An active background
 request yields when a foreground request needs its lane or memory, then restarts with already-delivered tokens
 suppressed.
@@ -345,7 +358,8 @@ Drafting stays enabled and uses the same grammar masks as plain decoding.
 
 This requires the loaded backend's structured-output capability and `libtfgrammar`. Nemotron, Qwen3.5-2B,
 Qwen3.8-27B (`qwen27`), Gemma 4 31B, Step-5, LFM2 MoE and Flash Next shared sessions on Metal have that capability; Qwen27 on Intel also has it.
-Flash Next on CUDA has it too.
+Flash Next and Gemma 4 on CUDA have it too. Gemma 4 on CUDA picks a greedy row under a grammar on the host, among the
+allowed tokens of its logits read back; sampled rows are masked on the device before the draw.
 Qwen3.8-27B applies the grammar to its first draw, each verified row and each branch of its draft proposals.
 Structured requests use its shared lane core, including when the ordinary lone-request serial optimization is enabled.
 CUDA determines support from its loaded backend's mask hook. GLM Metal
@@ -489,7 +503,9 @@ reports it, less a reserve of a 32nd of the card and at least 1 GiB. `TENSORFOLD
 `choices[0].message.content` holds the answer. Reasoning uses `reasoning_content`, or
 `delta.reasoning_content` while streaming. Tools use `tool_calls` and `finish_reason: "tool_calls"`.
 When a template supplies no think opener, a reply-written leading `<think>` tag is removed from
-`reasoning_content`; the streamed and finished forms use the same split.
+`reasoning_content`; the streamed and finished forms use the same split. Both strip the reasoning's leading and
+trailing whitespace, so the joined `delta.reasoning_content` pieces equal the finished field byte for byte; a stream
+holds whitespace back until more reasoning follows it.
 Every reply's usage, streamed ones included, carries its prompt, completion and total tokens,
 `prompt_tokens_details.cached_tokens` (the prompt tokens found in a backend's prefix cache; native Zig reports
 zero until its prompt cache is enabled) and
@@ -558,7 +574,8 @@ The readings vLLM also has are repeated under its names (`num_requests_running`,
 `kv_cache_usage_perc`, `spec_decode_num_draft_tokens_total`, `spec_decode_num_accepted_tokens_total`,
 `e2e_request_latency_seconds`, `request_decode_time_seconds`, `request_prefill_time_seconds`) with identical values, so a dashboard copied from vLLM fills by swapping the
 `tensorfold:` prefix for the metric name. `client_disconnections_total` (requests the client walked away from)
-and `preemptions_total` (background work that gave up a lane to a later request) are published where the
+and `preemptions_total` (requests requeued for memory before their first token, plus background passes that
+yielded their lane to foreground work) are published where the
 server counts those events, and never at a fabricated zero.
 An engine that keeps prompt states between requests (Flash Next and GLM-5.3-Flash unless `--prompt-cache-gib 0`)
 adds `prompt_tokens_cached_total` (already vLLM's name), the prompt tokens of finished requests restored from a kept
@@ -567,6 +584,34 @@ An engine that keeps no prompt states leaves all three out.
 
 The native `--dashboard` flag adds a self-contained `/dashboard` page and its `/stats` JSON snapshot; both routes
 return 404 when the flag is off, and the page polls once per second without adding access-log noise.
+
+### Scheduler load
+
+The scrape also carries the scheduler load a traffic shaper needs, from one ledger the server owns. Every server
+publishes `server_info{model,backend,version,instance}` (always 1; `instance` is a random id made at process start,
+so counters restart only with a new `instance`), `process_start_time_seconds`, `engine_parked` (1 while
+`--idle-unload` has closed the engine), `lanes`, and `http_requests_active{route}`: model requests from the end of
+their headers to the end of their reply, by route group (`chat_completions`, `completions`, `responses`,
+`messages`, `embeddings`, `speech`, `other`).
+
+An engine on the shared lane host adds these groups, each complete or absent:
+
+| Group | Families |
+| --- | --- |
+| Requests | `waiting_prompt_tokens` (prompt tokens of queued requests, before any kept prefix restores part of them), `filling_prompt_tokens_left` (absent while a backend without fill progress fills), `requests_started_total`, `requests_requeued_total`, `background_yields_total` |
+| Work | `scheduler_tokens_total{mode}` with `prefill_compute`, `prefill_cache` and `decode` (output tokens after each request's first), counted as the work happens, and `prefill_busy_seconds_total`: engine seconds in prompt calls whose work `prefill_compute` counted. The `prefill_compute` delta over its delta is the prefill rate. A family round planner publishes no work group |
+| Capacity | `kv_capacity_mode{mode}` (`window` or `paged`), `lanes_free`, and for a paged engine `kv_pool_capacity_tokens`, `kv_pool_available_tokens`, `kv_pool_reclaimable_tokens`, `kv_pool_promised_tokens` with `pool="main"`, and `kv_pool_run_available` where the family needs a contiguous run. Published by the CUDA lane host: `window` for an engine without a page plan, `paged` with GLM-5.3-Flash's pool on rank 0; other paged families leave the group out until they name their pool |
+
+In the requests group, `requests_running`, `requests_waiting` and their vLLM mirrors take the ledger's values.
+While the engine is parked, none of these engine values is shown: neither the groups nor `requests_running`,
+`requests_waiting` and `generation_tokens_running`. A missing group means unknown, never zero. While the idle
+unload closes the engine, the engine values are already gone and `engine_parked` is still 0, since a request then
+gets 503 with a retry; it turns 1 once a request can reload the engine.
+
+`GET /v1/load` returns the same ledger as one JSON object from one read: `instance`, `timestamp` (the read's wall
+time), `model`, `parked`, `lanes`, `http_active` by route group, and, when present, the request counts,
+`capacity` with its `pools`, `tokens` and `busy_us`. Keys of a group no host fills are left out. It follows the
+`/metrics` access rule, and `--metrics-open` opens it too.
 
 ## Admission
 
@@ -596,7 +641,22 @@ spent rate; with more than 128 keys starting requests within one refill, a furth
 
 ## Conversations on disk
 
-`--learn-conversations` (it implies `--learn`) writes every prompt state the server keeps in RAM to disk as well: a
+Use `--prompt-cache-disk DIR` to keep conversation prompt states on disk:
+
+```sh
+tensorfold serve MODEL --prompt-cache-disk ./prompt-cache
+```
+
+This is equivalent to `--learn-conversations --learn-dir DIR`; both legacy flags remain supported.
+`--learn-conversations` alone keeps its existing default directory, `~/.cache/tensorfold/learned`.
+Both spellings imply `--learn`. Do not combine `--prompt-cache-disk` with `--learn-dir` or
+`--learn-conversations`: the server refuses either combination, in either order, even if the directories match.
+Repeating the same directory flag keeps its usual last-value behavior.
+The startup line names the disk tier's directory and the device budget reported by the engine; when the engine
+does not report a device budget, the line says so. `--prompt-cache-gib` still controls the in-memory budget,
+and the existing disk limits described below apply to either spelling.
+
+`--prompt-cache-disk DIR` writes every prompt state the server keeps in RAM to disk as well: a
 conversation's history, the end of each reply, the next turn's background prefill and the shared prefixes, all in one
 store for each model and build. That store takes the place of `--learn`'s store of shared prefixes: a server started
 with the flag neither reads nor writes the prefix files a plain `--learn` server keeps, and they stay on disk until the
@@ -667,9 +727,10 @@ it read ahead on an I/O thread, as described above.
 
 Three routes let a client such as the Mac app ask about a conversation. Each takes the body of a chat completion
 (`messages`, `tools`, `chat_template_kwargs`), renders it as that request would be rendered, and answers on the engine's
-thread between rounds. A server started without `--learn-conversations` answers each with 404 and the error message
-"saved conversations are off: start the server with --learn-conversations"; an engine that keeps no prompt states
-answers 501.
+thread between rounds. A server started without `--prompt-cache-disk DIR` or `--learn-conversations` answers each
+with 404 and the error message
+"saved conversations are off: start the server with --prompt-cache-disk DIR (or --learn-conversations)";
+an engine that keeps no prompt states answers 501.
 
 - `POST /v1/imprint/resume` answers how much of the conversation's next request would resume, and from where:
   `tokens` (the rendered prompt), `ram_tokens` and `disk_tokens` (the longest kept state in RAM and on disk),

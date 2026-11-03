@@ -2,6 +2,7 @@
 const std = @import("std");
 
 pub const safetensors = @import("core/safetensors.zig");
+pub const gguf = @import("core/gguf.zig");
 pub const Checkpoint = checkpoint_host.Checkpoint;
 pub const checkpoint_host = @import("core/checkpoint.zig");
 pub const checkpoint_metal = checkpoint;
@@ -35,6 +36,8 @@ pub const exlr8_prompt = @import("core/exlr8_prompt.zig");
 /// The two-Mac pair seam's row split: the transport, its layout and the one-Mac Loopback the stage-2 checks use.
 pub const pair_rows = @import("core/pair_rows.zig");
 pub const glm_dsa = @import("families/glm_dsa/glm_dsa.zig");
+/// DeepSeek-V4.1's Metal family in one export: tf.dsv41_metal.NAME (families/deepseek_v41/metal/contract_exports.zig).
+pub const dsv41_metal = @import("families/deepseek_v41/metal/contract_exports.zig");
 pub const nemotron = @import("families/nemotron/nemotron.zig");
 pub const flashnext_vision_contract = @import("families/flashnext/vision_contract.zig");
 pub const flashnext_fsr_fixture = @import("families/flashnext/fsr_gpu_fixture.zig");
@@ -58,6 +61,7 @@ pub const qwen35 = @import("families/qwen3_5/qwen3_5.zig");
 pub const gemma4 = @import("families/gemma4/gemma4.zig");
 pub const step5 = @import("families/step5/step5.zig");
 pub const spark25_metal = @import("families/spark25/metal.zig");
+pub const minimax_m3 = @import("families/minimax_m3/minimax_m3.zig");
 pub const lfm2_moe = @import("families/lfm2_moe/lfm2_moe.zig");
 pub const flashnext_pack = @import("families/flashnext/pack.zig");
 
@@ -67,6 +71,7 @@ test {
     _ = @import("families/nemotron/prefill_kernels.zig"); // Compile the prompt-chunk sources in tests.
     _ = @import("families/nemotron/simd_attention.zig"); // The pre-M5 attention rewrite finds its lines.
     _ = @import("families/nemotron/weights.zig");
+    _ = @import("families/nemotron/zero_budget_test.zig");
     _ = @import("families/nemotron/kernels.zig");
     _ = @import("families/nemotron/living_test.zig"); // saved lessons and their routers, beside the shards
     _ = @import("families/nemotron/pocket_shards_test.zig"); // learned neurons in the shards themselves
@@ -87,6 +92,7 @@ test {
     _ = @import("families/qwen3_5/backend.zig");
     _ = @import("families/step5/step5.zig");
     _ = @import("families/spark25/metal.zig");
+    _ = @import("families/minimax_m3/minimax_m3.zig");
     _ = @import("families/lfm2_moe/config.zig");
     _ = @import("families/lfm2_moe/backend.zig");
     _ = @import("families/lfm2_moe/state.zig");
@@ -100,6 +106,8 @@ pub const recurrent_forks = @import("core/recurrent_forks.zig");
 pub const shared_kv = @import("core/shared_kv.zig");
 
 pub const kv_pool = @import("core/kv_pool.zig");
+
+pub const rope_freq = @import("core/rope_freq.zig");
 
 pub const shared_attention = @import("core/shared_attention.zig");
 

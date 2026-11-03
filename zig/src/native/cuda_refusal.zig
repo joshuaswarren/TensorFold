@@ -3,6 +3,7 @@ const std = @import("std");
 const api = @import("engine_api");
 const nemotron = @import("nemotron");
 pub const deepseek_release_message = "DeepSeek-V4.1 is not served by this release's CUDA server; its whole-model gate is #827";
+const glm_model_type = "glm5_next"; // GLM-5.3-Flash's (glm.cuda_native.model_type): its Options take mtp_confidence
 
 /// Flags refused whatever the family; null when `o` may open.
 pub fn backend(o: api.Open) ?[]const u8 {
@@ -10,22 +11,37 @@ pub fn backend(o: api.Open) ?[]const u8 {
         return deepseek_release_message;
     if (o.mtp_drafts) |n| if (n > nemotron.native.max_drafts) return std.fmt.comptimePrint("--mtp-drafts: the CUDA engine drafts at most {d}", .{nemotron.native.max_drafts});
     if (o.mtp_confidence) |c| if (!(c >= 0 and c <= 1)) return "--mtp-confidence must be from 0 to 1";
-    if (o.mtp_drafts != null or o.mtp_confidence != null) {
+    if (std.mem.eql(u8, o.model_type, glm_model_type)) {
+        if (o.mtp_drafts != null) return "--mtp-drafts: GLM-5.3-Flash's MTP head drafts at the lanes' depth; serve it without --mtp-drafts (--mtp-confidence stops its chains)";
+        if (o.mtp_confidence != null and o.drafter != null) return "--mtp-confidence stops the MTP head's chains, and with --drafter DFlash2 drafts instead: serve without one of them";
+    } else if (o.mtp_drafts != null or o.mtp_confidence != null) {
         if (!std.mem.eql(u8, o.model_type, nemotron.native.model_type) and
             !std.mem.eql(u8, o.model_type, nemotron.omni.model_type))
             return "--mtp-drafts: this CUDA family's drafts are not tunable; serve it without --mtp-drafts or --mtp-confidence";
     }
     if (o.policy.len > 0) return "--policy is not supported by this CUDA build";
     if (@import("disk_spill.zig").refusal(o, "")) |why| return why;
+    if (o.rope_yarn != null and !std.mem.eql(u8, o.model_type, "qwen3_5") and !std.mem.eql(u8, o.model_type, "qwen3_5_moe"))
+        return "--rope-yarn: this CUDA family has no YaRN rope; serve it without --rope-yarn";
     if (o.learn != null and !o.learn_conversations) return "--learn learns shared prompt prefixes on Macs only; CUDA keeps conversation states on disk with --learn-conversations: serve with it, or without --learn, --learn-dir or --learn-gib";
     if (o.speed_up != null) return "--speed-up links two Macs: serve without --speed-up on CUDA";
     if (o.prompt_cache_over_cap) return "--prompt-cache-over-cap lifts a Mac's 70% cap: on CUDA the prompt cache takes at most the memory the weights and streams leave, so serve without it";
+    // Fish and Qwen4 open outside family(), so their --tp is refused here
+    if (std.mem.eql(u8, o.model_type, "fish_omni") or std.mem.eql(u8, o.model_type, "qwen4") or std.mem.eql(u8, o.model_type, "qwen4_text"))
+        if (unranked(o)) |why| return why;
     return null;
 }
 
 /// LFM2 reads a checkpoint's pictures through its own tower without --vision: the flag is refused, not ignored.
 pub fn lfm2(o: api.Open) ?[]const u8 {
-    return if (o.vision != null) lfm2_vision else null;
+    return if (o.vision != null) lfm2_vision else unranked(o);
+}
+
+pub const no_ranks = "this CUDA family has no tensor-parallel ranks: serve without --tp";
+
+/// --tp for a family that opens outside `family()` (Fish, Qwen4, LFM2): refused, never ignored.
+pub fn unranked(o: api.Open) ?[]const u8 {
+    return if (o.tp != 1) no_ranks else null;
 }
 
 const lfm2_vision = "--vision: LFM2 reads the checkpoint's images through its own tower without the flag; " ++
@@ -36,7 +52,7 @@ pub fn family(comptime F: type, o: api.Open) ?[]const u8 {
     if (o.vision != null and !(@hasDecl(F, "Options") and @hasField(F.Options, "vision")))
         return "--vision: this CUDA family reads no images; serve it without --vision";
     const ranked = @hasDecl(F, "Options") and @hasField(F.Options, "rank");
-    if (o.tp != 1 and !ranked) return "this CUDA family has no tensor-parallel ranks: serve without --tp";
+    if (o.tp != 1 and !ranked) return no_ranks;
     if (@hasDecl(F, "tp_draft_snapshots")) {
         if (!F.tp_draft_snapshots and o.tp > 1 and o.drafts and (o.prompt_cache_gib orelse 1) > 0)
             return "Flash Next tensor-rank MTP snapshots are unavailable: use --prompt-cache-gib 0 with --tp and drafting";
@@ -64,12 +80,42 @@ test "a family must consume rank options before tensor parallelism is admitted" 
     };
     try std.testing.expectStringStartsWith(family(Single, .{ .dir = "d", .model_type = "m", .tp = 2 }) orelse "", "this CUDA family has no tensor-parallel ranks");
     try std.testing.expect(family(Ranked, .{ .dir = "d", .model_type = "m", .tp = 2 }) == null);
+    try std.testing.expectEqualStrings(no_ranks, family(Single, .{ .dir = "d", .model_type = "m", .tp = 2 }).?);
+    // the families past family(): one rank opens, two are refused by the same words
+    try std.testing.expect(unranked(.{ .dir = "d", .model_type = "qwen4", .tp = 1 }) == null);
+    try std.testing.expectEqualStrings(no_ranks, unranked(.{ .dir = "d", .model_type = "qwen4", .tp = 2 }).?);
+    try std.testing.expectEqualStrings(no_ranks, lfm2(.{ .dir = "d", .model_type = "lfm2", .tp = 2 }).?);
+    for ([_][]const u8{ "fish_omni", "qwen4", "qwen4_text" }) |m| {
+        try std.testing.expect(backend(.{ .dir = "d", .model_type = m, .tp = 1 }) == null);
+        try std.testing.expectEqualStrings(no_ranks, backend(.{ .dir = "d", .model_type = m, .tp = 2 }).?);
+    }
+}
+
+test "the CUDA server serves --tp, and Flash Next's two ranks pass family admission" {
+    try std.testing.expect(for (@import("cuda.zig").serves) |x| {
+        if (std.mem.eql(u8, x, "--tp")) break true;
+    } else false);
+    const flashnext = @import("flashnext").native;
+    try std.testing.expect(family(flashnext, .{ .dir = "d", .model_type = flashnext.model_type, .tp = 2, .prompt_cache_gib = 0 }) == null);
 }
 
 test "--learn is refused whatever the family, and --slide or a learned-disk size alone is not" {
     try std.testing.expectStringStartsWith(backend(.{ .dir = "d", .model_type = "nemotron_h", .learn = "/x" }) orelse "", "--learn learns shared prompt prefixes on Macs only");
     try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h", .learn = "/x", .learn_conversations = true }) == null);
     try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h", .slide = true, .learn_gib = 8, .learn_min_free_gib = 2 }) == null);
+}
+
+test "GLM-5.3-Flash takes --mtp-confidence alone: --mtp-drafts, or a drafter beside it, is refused by name" {
+    try std.testing.expect(backend(.{ .dir = "d", .model_type = "glm5_next", .mtp_confidence = 0.3 }) == null);
+    try std.testing.expectStringStartsWith(backend(.{ .dir = "d", .model_type = "glm5_next", .mtp_drafts = 2 }) orelse "", "--mtp-drafts: GLM-5.3-Flash's");
+    try std.testing.expectStringStartsWith(backend(.{ .dir = "d", .model_type = "glm5_next", .mtp_confidence = 0.3, .drafter = "x" }) orelse "", "--mtp-confidence stops");
+}
+
+test "--rope-yarn opens only Qwen3.5 and 3.6, before any family branch (the routes past openWith too)" {
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe" }) |t| try std.testing.expect(backend(.{ .dir = "d", .model_type = t, .rope_yarn = 4 }) == null);
+    for ([_][]const u8{ "fish_omni", "qwen4", "qwen4_text", "lfm2_vl", "nemotron_h", "glm4_moe" }) |t|
+        try std.testing.expectStringStartsWith(backend(.{ .dir = "d", .model_type = t, .rope_yarn = 4 }) orelse "", "--rope-yarn");
+    try std.testing.expect(backend(.{ .dir = "d", .model_type = "qwen4" }) == null);
 }
 
 test "flags with nothing to do on CUDA are refused, not ignored" {
@@ -179,8 +225,8 @@ test "CUDA MTP controls refuse unsupported families before device work" {
     for ([_][]const u8{ "glm5_next", "lfm2_vl" }) |model_type| {
         try std.testing.expect(backend(.{ .dir = "d", .model_type = model_type }) == null);
         try std.testing.expectStringStartsWith(backend(.{ .dir = "d", .model_type = model_type, .mtp_drafts = 0 }) orelse "", "--mtp-drafts");
-        try std.testing.expectStringStartsWith(backend(.{ .dir = "d", .model_type = model_type, .mtp_confidence = 0 }) orelse "", "--mtp-drafts");
     }
+    try std.testing.expectStringStartsWith(backend(.{ .dir = "d", .model_type = "lfm2_vl", .mtp_confidence = 0 }) orelse "", "--mtp-drafts");
 }
 
 test "policy options are refused by families that do not implement them" {

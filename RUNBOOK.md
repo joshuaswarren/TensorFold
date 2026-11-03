@@ -19,7 +19,7 @@ For an archive installation, download the arm64 asset and its companion checksum
 [latest release](https://github.com/ashhart/TensorFold/releases/latest), with `V` set to its version:
 
 ```sh
-V=1.1.9
+V=1.2.1
 curl -fLO https://github.com/ashhart/TensorFold/releases/download/v$V/tensorfold-$V-macos-arm64.tar.gz
 curl -fLO https://github.com/ashhart/TensorFold/releases/download/v$V/tensorfold-$V-macos-arm64.tar.gz.sha256
 shasum -a 256 -c tensorfold-$V-macos-arm64.tar.gz.sha256
@@ -134,10 +134,10 @@ and `live.waiting`, the queued requests. Subtract waiting from connections to ge
 For example, 8 connections with 4 waiting means 4 active and 4 queued.
 When API authentication is enabled, `/health` returns only status.
 
-## Prompt prefill share and budget
+## Prompt prefill share, budget and admission policy
 
-The native server reads two environment variables when it opens its lane host.
-Both are optional. Set them before starting the server.
+The native server reads four environment variables when it opens its lane host.
+All are optional. Set them before starting the server.
 `TENSORFOLD_PREFILL_SHARE` takes a number from 0.01 to 1.
 The default is 1. Any other text gives the default.
 It is the share of wall time long prompt steps get while other streams are decoding.
@@ -165,12 +165,26 @@ Lowering it gives those streams their next round sooner.
 That costs more passes to finish the prompts.
 With the default 0 no cap applies: short prompts run as one burst beside decoders, bounded at a lane's worth of newly begun prompts while other work waits.
 
+`TENSORFOLD_PREFILL_POLICY` takes `fcfs`.
+Unset, or any other text, keeps the default order described above.
+Under `fcfs` the host fills only the oldest long prompt (more than 512 uncached rows) on each visit, in chunks of `TENSORFOLD_PREFILL_TOKENS` rows, and the decoding streams take one round after each chunk.
+A long prompt with no stream decoding beside it takes the engine's own cut, so a lone request runs exactly as without the policy.
+Short prompts run as they do without the policy. `TENSORFOLD_PREFILL_BUDGET` does not apply under a policy; `TENSORFOLD_PREFILL_SHARE` is checked once per visit.
+
+`TENSORFOLD_PREFILL_TOKENS` takes a whole number of prompt rows from 64 to 16384. Values outside the range are clamped.
+The default is 2048. Empty text, 0, or text that is not a whole number gives the default.
+It only matters when `TENSORFOLD_PREFILL_POLICY` is set.
+Smaller chunks shorten each pause the decoding streams see while a prompt fills; larger chunks let later prompts start sooner.
+On flashnext Metal with eight 14336-row prompts arriving together, `fcfs` at 2048 paused decoders about 1.7 s per chunk with the last first token at about 94 s;
+4096 gave about 3.1 s and 87 s; 8192 gave about 5.9 s and 83 s. 16384 matches 8192 at that prompt length.
+
 ## Linux and CUDA
 
 For source builds with `zig build native` (including `--prefix` installs): Structured output and required tool calls need the release archive's `lib/` or `zig build grammar -Dxgrammar=DIR`; prepare DIR with `git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar` (use the native build's same `--prefix` for grammar).
 
 Choose `linux-aarch64` for an arm64 host or `linux-x86_64` for an x86_64 host.
-The archives require glibc 2.28 or newer and an NVIDIA driver providing `libcuda.so.1`.
+The archives require glibc 2.28 or newer and NVIDIA driver R580 or newer (CUDA 13.0), providing `libcuda.so.1`.
+Their kernels are built with CUDA 13, so TensorFold refuses an older driver at startup; `nvidia-smi` shows the installed one.
 CUDA serves Nemotron 3.5 Lightning, qualified on GB10 (`linux-aarch64`, greedy and sampled) and on Ampere cards with
 compute capability 8.6 (`linux-x86_64`, greedy: the RTX 30 series, RTX A6000, A10 and A40), and checked on an RTX PRO 6000 Blackwell (compute
 capability 12.0, `linux-x86_64`).
@@ -180,7 +194,7 @@ Flash Next also serves on CUDA from its MLX 4-bit checkpoint, on the built-in ke
 On a GB10 arm64 host (an x86_64 host uses `linux-x86_64` in the same commands):
 
 ```sh
-V=1.1.9
+V=1.2.1
 curl -fLO https://github.com/ashhart/TensorFold/releases/download/v$V/tensorfold-$V-linux-aarch64.tar.gz
 curl -fLO https://github.com/ashhart/TensorFold/releases/download/v$V/tensorfold-$V-linux-aarch64.tar.gz.sha256
 sha256sum -c tensorfold-$V-linux-aarch64.tar.gz.sha256
@@ -218,6 +232,29 @@ On three GB10s serving GLM-5.3-Flash NVFP4 at TP=3, a 1,035,295-token prompt wit
 zone at 94 C or more for most of the prompt (97.7 C at the top); `TF_HEAT_HIGH=92` and `TF_HEAT_LOW=88` held all three
 at 93.0 C or under, and the first token came 10% later.
 Archives whose names contain `host-only` are CPU verification artifacts and cannot serve CUDA inference.
+
+### Build a server for one GPU
+
+`zig build -Dgpu=<gpu>` builds only `tensorfold-native`, with kernel code for that one GPU architecture and every model family, stripped by default:
+
+```sh
+zig build -Dgpu=spark -Dnvcc=/usr/local/cuda/bin/nvcc            # zig-out/native/bin/tensorfold-native
+zig build -Dgpu=gfx1201 -Dhipcc=/opt/rocm/core/bin/hipcc          # zig-out/native-hip/bin/tensorfold-native
+```
+
+- `-Dgpu`: `sm_80`, `sm_86`, `sm_89`, `sm_120`, `sm_121`, `spark` (GB10, sm_121), or an exact HIP architecture from `zig/src/hip/caps.zig`. It replaces `-Dsm`, `-Dhip` and `-Dhip-arch`.
+- `sm_89` builds, but the release set (sm_80, 86, 120, 121) holds no image qualified on it.
+- The server refuses a GPU of another architecture at startup and names the `-Dgpu` that fits it (HIP already refuses one at device open).
+- CUDA needs `-Dnvcc`, or `-Dfatbins` with prebuilt images; each prebuilt image must hold exactly the one SASS profile its kernel needs on that GPU. `-Dstrip=false` keeps debug info.
+- The build offers no other step: tests, tools and `grammar` need the development build (no `-Dgpu`). Structured output needs `libtfgrammar` in the server's `../lib` (release archive `lib/`, or `zig build grammar -Dxgrammar=DIR`, which installs `native/lib`; copy it to `native-hip/lib` for HIP).
+
+Measured on 2026-11-02 (aarch64 for CUDA, x86_64 for HIP), every model family in every server:
+
+| Hardware GPU | Generic server | `-Dgpu` server | Saved |
+| --- | --- | --- | --- |
+| RTX PRO 6000 (`sm_120`, nvcc 13.3) | 145.5 MB (sm_80, 86, 120, 121) | 44.9 MB | 100.6 MB (69.2%) |
+| GB10 DGX Spark (`spark`, nvcc 13.4) | 146.1 MB (sm_80, 86, 120, 121) | 44.8 MB | 101.3 MB (69.3%) |
+| Radeon AI PRO R9700 (`gfx1201`, ROCm 7.16) | 48.9 MB (`native-hip`, unstripped) | 20.6 MB | 28.3 MB (58.0%) |
 
 ### GB10 CPU pinning for long CUDA runs
 
@@ -373,7 +410,11 @@ After a memory refusal, reduce the context or reply limit, or choose a smaller q
 `--learn` writes a shared prompt state to disk only while the disk keeps `--learn-min-free-gib` free, 4 GiB by default.
 Below that, learning pauses with a log line and serving goes on; a refused write is tried again after 1 to 60 seconds, sooner when space comes back.
 Each learned file carries a checksum over its header and contents, so a damaged, truncated or older file is refused and learned again.
-`--learn-conversations` writes every kept prompt state behind, while the engine idles, and a SIGTERM stop writes what waits within 20 seconds.
+`--prompt-cache-disk DIR` writes every kept prompt state behind to that directory, while the engine idles,
+and a SIGTERM stop writes what waits within 20 seconds. It is equivalent to `--learn-conversations --learn-dir DIR`;
+the old flags remain supported, and `--learn-conversations` alone keeps its existing default directory.
+Use either spelling: combining `--prompt-cache-disk` with `--learn-dir` or `--learn-conversations` is refused.
+The startup line names the disk directory and the device budget when the engine reports one.
 Stop a server with SIGTERM, not SIGKILL, so its last turn is kept.
 `--learn-daily-gib` caps those writes a day (32 GiB by default); `DELETE /v1/imprint` forgets one model's conversation states.
 
@@ -393,3 +434,4 @@ Python 0.6.6 remains a separate release line.
 | Packed Metal runtime compilation fails | 1.0.0 probes and selects its prebuilt fallback; include chip, macOS version and startup error in a report. |
 
 For a bug report, include the version, checkpoint revision, public reproducing request, exact command and relevant startup/request logs.
+`TENSORFOLD_LOG_TIME=1` starts each server log line, the `[tensorfold]` lines and every engine's warnings, with its UTC time (`2026-10-30T18:54:04.123Z [tensorfold] ...`), to match the log against other records.

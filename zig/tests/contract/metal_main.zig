@@ -6,6 +6,7 @@ const contract = @import("contract");
 const rows_k = @import("metal_rows.zig");
 const affine_k = @import("metal_affine.zig");
 const topk_k = @import("metal_topk.zig");
+const ling_route = @import("metal_ling_route.zig");
 const tile_k = @import("metal_tile.zig");
 const limits_k = @import("metal_limits.zig");
 const h3_k = @import("metal_h3.zig");
@@ -13,12 +14,14 @@ const h3_topk = @import("metal_h3_topk.zig");
 const drama3_k = @import("metal_drama3.zig");
 const drama_nvfp4 = @import("metal_drama3_nvfp4.zig");
 const drama_router = @import("metal_drama_router.zig");
+const dsv41 = @import("metal_dsv41_main.zig");
 const drama_combine = @import("metal_drama_combine.zig");
 const drama_cfg = @import("metal_drama_cfg.zig");
 const glm_eh_k = @import("metal_glm_eh.zig");
 const glm_rows_k = @import("metal_glm_rows.zig");
 const pair_k = @import("metal_pair.zig");
 const pair_controls = @import("metal_pair_controls.zig");
+const minimax_k = @import("metal_minimax.zig");
 
 const flash_pool = @import("metal_flashnext_pool.zig");
 const flash = @import("metal_flashnext.zig");
@@ -334,6 +337,12 @@ pub fn main(init: std.process.Init) !u8 {
         topk = try topk_k.TopK.init(a, device, queue);
         try kernels.append(a, topk.?.kernel());
     }
+    var ling: ?ling_route.Route = null;
+    defer if (ling) |*x| x.deinit();
+    if (wanted(o, ling_route.spec().name)) {
+        ling = try ling_route.Route.init(a, device, queue);
+        try kernels.append(a, ling.?.kernel());
+    }
     for ([_][]const Reg{ &common, if (tensor) &m5_only else &.{} }) |list| for (list) |v| {
         if (!wanted(o, v.name)) continue;
         const p = try a.create(affine_k.Proj);
@@ -380,6 +389,33 @@ pub fn main(init: std.process.Init) !u8 {
     var nemotron_attention: @import("metal_nemotron_attention.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
     defer nemotron_attention.deinit();
     try nemotron_attention.collect(o.only);
+    var nemotron_prompt: @import("metal_nemotron_prompt_range.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer nemotron_prompt.deinit();
+    try nemotron_prompt.collect(o.only);
+    var flashnext_attn: @import("metal_flashnext_attn.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer flashnext_attn.deinit();
+    try flashnext_attn.collect(o.only);
+    var spark25_attention: @import("metal_spark25_attention.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer spark25_attention.deinit();
+    try spark25_attention.collect(o.only);
+    var gemma_attention: @import("metal_gemma4_attention.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer gemma_attention.deinit();
+    try gemma_attention.collect(o.only);
+    var nemotron_unroll: @import("metal_nemotron_unroll.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer nemotron_unroll.deinit();
+    try nemotron_unroll.collect(o.only);
+    var minimax: minimax_k.Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer minimax.deinit();
+    try minimax.collect(o.only);
+    var mma_operand: @import("metal_mma_operand.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer mma_operand.deinit();
+    try mma_operand.collect(o.only);
+    var nemotron_ssd: @import("metal_nemotron_ssd_gemm.zig").Suite = .{ .a = a, .device = device, .queue = queue, .kernels = &kernels };
+    defer nemotron_ssd.deinit();
+    try nemotron_ssd.collect(o.only);
+    var attention_pv: @import("metal_attention_pv.zig").Suite = .{};
+    defer attention_pv.deinit();
+    try attention_pv.collect(a, device, queue, &kernels, o.only);
     const weight_only = @import("metal_weight_only.zig");
     const weight_source = try weight_only.text(a);
     defer a.free(weight_source);
@@ -420,11 +456,16 @@ pub fn main(init: std.process.Init) !u8 {
     defer native_gdn.destroy();
     const moss_image = try @import("metal_moss_image.zig").Suite.create(a, device, queue, &kernels, o.only);
     defer moss_image.destroy();
+    const moss_image_decoder = try @import("metal_moss_image_decoder.zig").Suite.create(a, device, queue, &kernels, o.only);
+    defer moss_image_decoder.destroy();
+    var dsv41_suites = try dsv41.Suites.create(a, device, queue, &kernels, o.only);
+    defer dsv41_suites.destroy();
     var t: g.Tally = .{};
     const t0 = std.Io.Clock.awake.now(init.io);
     if (o.gates) {
         try g.runAll(a, kernels.items, o.seed, &t);
         for (flash_list[0..flash_made]) |*probe| try probe.rowCountInvariant();
+        try dsv41_suites.gates(init.io, o.seed, &t);
     }
     const t1 = std.Io.Clock.awake.now(init.io);
     var lim: usize = 0;

@@ -12,6 +12,7 @@ const pocket = @import("cuda_pocket.zig");
 const profile = @import("cuda_startup_profile.zig");
 const modelopt = @import("cuda_modelopt.zig");
 const x3w = @import("cuda_exl3_weights.zig");
+const hosted = @import("cuda_host_embed.zig");
 pub const recurrent = @import("cuda_recurrent.zig");
 
 pub const Geometry = geometry.Geometry;
@@ -81,6 +82,8 @@ pub const Engine = struct {
     stream: cuda.Stream,
     mods: [19]cuda.Module,
     kv8: bool, // attention caches as e4m3 rows with a scale each
+    rope_table: u64 = 0, // YaRN's attention factor and 32 frequencies on the device (cuda_rope.zig); 0: plain rope
+    rope_buf: ?cuda.DeviceBuffer = null, // the table's buffer (cuda_rope_table.zig)
     fp8: Kv8,
     prompt_attn: @import("cuda_prompt.zig").Fns, // a prompt chunk's attention tiles and delta-rule chain
     int8: @import("cuda_prompt_int8.zig").State = .{}, // prompt projections with int8 activations, when on
@@ -105,6 +108,7 @@ pub const Engine = struct {
     embed_s: u64,
     embed_b: u64,
     embed_bits: u8, // the embedding's rows' width: 4 or 8 (16: bf16 rows, an EXL3 checkpoint's)
+    host_embed: ?cuda.HostBuffer = null, // an EXL3 checkpoint's rows in mapped host memory: the card had no room
     kit: ?*x3w.Kit = null, // an EXL3 checkpoint's kernels (g.exl3)
     head: Proj,
     final_norm: u64,
@@ -169,7 +173,7 @@ pub const Engine = struct {
     pub const mpos_at = Round.mpos_at;
     const tables_len = Round.bytes;
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kv8: bool) !*Engine {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kv8: bool, fit: ?hosted.Fit) !*Engine {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         const started = profile.now(io);
         const g = try Geometry.read(gpa, io, dir);
@@ -191,9 +195,13 @@ pub const Engine = struct {
         e.geo = .{ .hid = @intCast(g.hidden), .nk = @intCast(g.k_heads), .nv = @intCast(g.v_heads), .qh = @intCast(g.q_heads), .kvh = @intCast(g.kv_heads), .nl = @intCast(g.deltas()) };
         e.verify_rows = most_verify;
         e.kv8 = kv8;
+        e.rope_table = 0; // plain rope until cuda_rope.zig uploads a YaRN table (the engine starts undefined)
+        e.rope_buf = null;
         e.window_rows = most_window;
         e.arena_at = 0;
         e.graphs = .empty;
+        try @import("cuda_rope_table.zig").set(e, g.rope); // a YaRN config's table, before any weight or forward
+        errdefer @import("cuda_rope_table.zig").free(e);
         e.penalties = .{};
         e.rec_scratch = recurrent.Pool.init(gpa, @intFromPtr(e));
         e.n_taps = 0;
@@ -201,11 +209,9 @@ pub const Engine = struct {
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
         var ck = try core.Checkpoint.openModel(gpa, io, dir);
-        defer ck.close();
-        // an EXL3 checkpoint's weights are sized by a dry run of its loader (trellis widths come from the tensors)
-        const wbytes = if (g.exl3) try x3w.measure(e, &ck) else weights.total(g);
-        e.arena = try DeviceBuffer.alloc(d, wbytes + try e.scratch(.measure));
-        errdefer e.arena.free();
+        defer core.checkpoint.cache.close(&ck);
+        e.arena = try hosted.arena(e, io, ctx, &ck, fit);
+        errdefer hosted.release(e);
         try e.arena.fill8(0, null); // touched once now: the driver commits memory on first touch, slowly
         const kk = cuda.kernels;
         const images = [_][]const u8{ kk.qmm_group, kk.qmm_prefill, kk.lane_gemv, kk.affine4_pack, kk.qwen35, kk.sample, kk.qwen35_keep, kk.affine8, kk.affine_prefill, kk.qwen35_kv8, kk.experts, kk.experts_prefill, kk.experts_pack, kk.moe, kk.experts3, kk.experts3_prefill, kk.prefill_attention, kk.gdn_prefill, kk.w4a8_prefill };
@@ -240,7 +246,7 @@ pub const Engine = struct {
         e.prompt_attn = try @import("cuda_prompt.zig").resolve(e.mods[16], e.mods[17]);
         try e.int8.resolve(e.mods[18]);
         e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .attn_rows = try e.mods[9].function("tf_q35_attn_rows8"), .attn_partial8_whole = try e.mods[9].function("tf_q35_attn_partial8_whole"), .attn_rows8_whole = try e.mods[9].function("tf_q35_attn_rows8_whole"), .compact = try e.mods[9].function("tf_q35k_compact8") };
-        e.mo = if (g.kinds.modelopt) try modelopt.Kernels.load(d, @intCast(10 * major + minor)) else null;
+        e.mo = if (g.kinds.modelopt) try modelopt.Kernels.load(d, @intCast(10 * major + minor), sms, g.moe()) else null;
         errdefer if (e.mo) |*m| m.unload();
         e.layers = try gpa.alloc(Layer, g.layers);
         errdefer gpa.free(e.layers);
@@ -282,6 +288,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         recurrent.shutdown(e);
+        @import("cuda_rope_table.zig").free(e);
         if (e.kit) |k| k.deinit(e.gpa);
         e.pockets.deinit();
         var it = e.graphs.valueIterator();
@@ -291,7 +298,7 @@ pub const Engine = struct {
         e.host_logits.free();
         e.staged.free();
         e.tables.free();
-        e.arena.free();
+        hosted.release(e);
         e.gpa.free(e.layers);
         e.gpa.free(e.dir);
         e.affine.deinit();
@@ -305,7 +312,7 @@ pub const Engine = struct {
 
     /// A stream's device bytes at a `cap`-token window: recurrences, convolution tails, keys and values, taps, log.
     pub fn streamBytes(e: *const Engine, cap: usize) usize {
-        return 2 * e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + e.g.logBytes(most_window);
+        return 2 * e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + e.g.logBytes(most_window) + @import("cuda_cache.zig").pendBytes(e.g);
     }
 
     /// A stream's tap ring: tap_rows rows of the tapped layers' residuals.
@@ -447,11 +454,13 @@ pub const Engine = struct {
         const slot_peak = try Round.build(st, parts, record);
         for (parts) |p| {
             try p.cache.settle(e);
+            // pending kept rows ride in a recorded slot scan; any other pass reads the state as written
+            if (!(record and keep != .hidden)) try p.cache.flush(e);
             try recurrent.prepare(e, p.cache, p.rows, record);
         }
         var row0: usize = 0;
         for (parts, 0..) |p, i| {
-            segs[i] = p.cache.seg(e, p.cache.len, row0, p.rows);
+            segs[i] = p.cache.fold(p.cache.seg(e, p.cache.len, row0, p.rows));
             row0 += p.rows;
         }
         if (keep == .draws) {

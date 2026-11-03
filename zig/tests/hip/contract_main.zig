@@ -5,17 +5,22 @@ const core = @import("core");
 const controls = @import("hip_controls");
 const gate5 = @import("contract_limits.zig");
 const rows_k = @import("contract_rows.zig");
+const wide_k = @import("contract_rms_wide.zig");
 const stream_k = @import("contract_stream.zig");
 const mamba_k = @import("contract_mamba.zig");
 const scan_k = @import("contract_scan.zig");
 const moe_k = @import("contract_nemo_moe.zig");
 const walk_k = @import("contract_walk.zig");
+const prefill_k = @import("contract_prefill.zig");
 const add_rms_k = @import("contract_add_rms.zig");
 const window_k = @import("contract_window.zig");
 const relu2_k = @import("contract_relu2.zig");
 const kv_k = @import("contract_kv_write.zig");
 const argmax_k = @import("contract_argmax.zig");
 const pair_k = @import("contract_relu2_pair.zig");
+const gate_k = @import("contract_moe_gate.zig");
+const router_k = @import("contract_router.zig");
+const kit = @import("contract_kit.zig");
 
 const g = core.contract.gates;
 
@@ -93,6 +98,9 @@ fn run(a: std.mem.Allocator, io: std.Io) !usize {
     for (&moes, [_]moe_k.Which{ .relu2, .combine, .combine_f32 }) |*m, w| m.* = .init(a, &r, s, &l, w);
     defer for (&moes) |*m| m.deinit();
     for (&moes) |*m| try kernels.append(a, m.kernel());
+    var wide = wide_k.Wide.init(a, &r, s, &l);
+    defer wide.deinit();
+    try kernels.append(a, wide.kernel());
     var walk = walk_k.Walk.init(a, &r, s, &l);
     defer walk.deinit();
     try kernels.append(a, walk.kernel());
@@ -108,6 +116,10 @@ fn run(a: std.mem.Allocator, io: std.Io) !usize {
     }
     defer for (&attends) |*w| w.deinit();
     for (&attends) |*w| try kernels.append(a, w.kernel());
+    var prefills: [2]prefill_k.Prefill = undefined;
+    for (&prefills, [_]bool{ true, false }) |*p, paged| p.* = .init(a, &r, s, &l, paged);
+    defer for (&prefills) |*p| p.deinit();
+    for (&prefills) |*p| try kernels.append(a, p.kernel());
     var add_rms: [3]add_rms_k.AddRms = undefined;
     for (&add_rms, std.enums.values(add_rms_k.Mode)) |*m, w| m.* = .init(a, &r, s, &l, w);
     defer for (&add_rms) |*m| m.deinit();
@@ -136,6 +148,15 @@ fn run(a: std.mem.Allocator, io: std.Io) !usize {
     var pair = pair_k.Pair.init(a, &r, s, &l);
     defer pair.deinit();
     try kernels.append(a, pair.kernel());
+    var gates: [3]gate_k.Gate = undefined;
+    for (&gates, std.enums.values(gate_k.Which)) |*m, w| m.* = .init(a, &r, s, &l, w);
+    defer for (&gates) |*m| m.deinit();
+    for (&gates) |*m| try kernels.append(a, m.kernel());
+    // both activation kinds: the rows are bf16 whichever one the chip's activations are
+    var routers: [2]router_k.Router = undefined;
+    for (&routers, [_]kit.Kind{ .f16, .bf16 }) |*x, k| x.* = router_k.Router.init(a, &r, s, &l, k);
+    defer for (&routers) |*x| x.deinit();
+    for (&routers) |*x| try kernels.append(a, x.kernel());
     var t: g.Tally = .{};
     const t0 = ms(io);
     try g.runAll(a, kernels.items, 0x6b63, &t);

@@ -46,6 +46,8 @@ pub const ConvArgs = conv.ConvArgs;
 pub const PlanArgs = plan.PlanArgs;
 pub const PlanRef = plan.PlanRef;
 pub const PlanKeep = plan.Keep;
+/// The stream tile's columns a lane, for launches that copy its geometry.
+pub const stream_pick = @import("launches/stream_pick.zig");
 
 pub const Launcher = struct {
     r: *const runtime.Runtime,
@@ -60,6 +62,8 @@ pub const Launcher = struct {
     moe_select: Function,
     moe_act: [2]Function,
     moe_combine: Triple,
+    /// the same sum with a shared expert run beside the stack, weighted by wts' last slot
+    moe_combine_gate: Function,
     gdn_gate: Triple,
     gated_delta_tile: [2]Function, // dk 128, 16
     gated_delta_wave: [2]Function,
@@ -94,6 +98,8 @@ pub const Launcher = struct {
         kv_write_act: Function,
         score: [2]Function, // fp16, bf16
         score_act: [2]Function,
+        score2: [2]Function, // the same at two keys a warp, for short spans
+        score2_act: [2]Function,
         sum_act: Function,
         attend: [2]Function,
         apply: [2]Function,
@@ -107,6 +113,8 @@ pub const Launcher = struct {
 
     const Decode = struct {
         router: [2]Function, // fp16, bf16
+        /// The router over the stored bf16 rows: the same logits' bits from half the bytes.
+        router_bf16: [2]Function, // fp16, bf16
         tail: Function,
         conv_split: Function,
         rms2: Function,
@@ -168,12 +176,14 @@ pub const Launcher = struct {
         const pl = l.mods[@backingInt(kernels.Group.plan)];
         l.fuse = choices.fuse;
         l.wide = choices.wide;
-        l.dec = .{ .router = .{ try dec.function("tf_router_decode_f16"), try dec.function("tf_router_decode_bf16") }, .tail = try dec.function("tf_tail"), .conv_split = try dec.function("tf_conv_split"), .rms2 = try dec.function("tf_rms2"), .gnorm_out = try dec.function("tf_gnorm_out"), .select = try dec.function("tf_select_decode") };
+        l.dec = .{ .router = .{ try dec.function("tf_router_decode_f16"), try dec.function("tf_router_decode_bf16") }, .router_bf16 = .{ try dec.function("tf_router_bf16_f16"), try dec.function("tf_router_bf16") }, .tail = try dec.function("tf_tail"), .conv_split = try dec.function("tf_conv_split"), .rms2 = try dec.function("tf_rms2"), .gnorm_out = try dec.function("tf_gnorm_out"), .select = try dec.function("tf_select_decode") };
         l.plan = .{
             .kv_write = try pl.function("tf_plan_kv_write"),
             .kv_write_act = try pl.function("tf_plan_kv_write_act"),
             .score = .{ try pl.function("tf_plan_score_f16"), try pl.function("tf_plan_score_bf16") },
             .score_act = .{ try pl.function("tf_plan_score_act_f16"), try pl.function("tf_plan_score_act_bf16") },
+            .score2 = .{ try pl.function("tf_plan_score2_f16"), try pl.function("tf_plan_score2_bf16") },
+            .score2_act = .{ try pl.function("tf_plan_score2_act_f16"), try pl.function("tf_plan_score2_act_bf16") },
             .sum_act = try pl.function("tf_sum_partials_act"),
             .attend = .{ try pl.function("tf_plan_attend_f16"), try pl.function("tf_plan_attend_bf16") },
             .apply = .{ try pl.function("tf_plan_apply_f16"), try pl.function("tf_plan_apply_bf16") },
@@ -241,6 +251,7 @@ pub const Launcher = struct {
             try act.function(ns ++ "18moe_combine_kernelI6__halfEEvPKfS4_PT_ii"),
             try act.function(ns ++ "18moe_combine_kernelI12hip_bfloat16EEvPKfS4_PT_ii"),
         };
+        l.moe_combine_gate = try act.function("tf_moe_combine_gate");
         l.gdn_gate = .{
             try act.function(ns ++ "15gdn_gate_kernelIfEEvPKT_S4_PKfS6_PfS7_ii"),
             try act.function(ns ++ "15gdn_gate_kernelI6__halfEEvPKT_S5_PKfS7_PfS8_ii"),
@@ -303,12 +314,14 @@ pub const Launcher = struct {
     pub const tf_rope_decode = rope.tf_rope_decode;
     pub const tf_rope_prefill = rope.tf_rope_prefill;
     pub const routerTile = moe.routerTile;
+    pub const routerBf16 = moe.routerBf16;
     pub const routerWith = moe.routerWith;
     pub const routerWindow = moe.routerWindow;
     pub const tf_moe_router = moe.tf_moe_router;
     pub const tf_moe_select = moe.tf_moe_select;
     pub const tf_moe_act = moe.tf_moe_act;
     pub const tf_moe_combine = moe.tf_moe_combine;
+    pub const tf_moe_combine_gate = moe.tf_moe_combine_gate;
     pub const tf_moe_route = moe.tf_moe_route;
     pub const tf_causal = attention.tf_causal;
     pub const tf_attn_gate = attention.tf_attn_gate;
@@ -350,6 +363,8 @@ pub const Launcher = struct {
     pub const fn_hc_gates = flashnext.hcGates;
     pub const fn_hc_mix = flashnext.hcMix;
     pub const fn_rms_wide = flashnext.rmsWide;
+    pub const fn_wide_width = flashnext.wide_width;
+    pub const fn_wide_waves = flashnext.wide_waves;
     pub const fn_ple_gate = flashnext.pleGate;
     pub const fn_ple_conv = flashnext.pleConv;
     pub const fn_ngram_ids = flashnext.ngramIds;
