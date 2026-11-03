@@ -158,7 +158,7 @@ pub const Pipeline = struct {
         p.bound = true;
     }
 
-    /// Records one dispatch, then a barrier making its writes visible to a later dispatch or transfer.
+    /// Records one dispatch, then a compute barrier making its writes visible to the next dispatch; copies carry their own.
     pub fn record(p: *const Pipeline, cmd: c.VkCommandBuffer, push: []const u8, groups: [3]u32) Error!void {
         if (!p.bound) return error.BadBindings;
         if (push.len != p.layout.push_bytes) return error.BadPushSize;
@@ -172,9 +172,9 @@ pub const Pipeline = struct {
         api.vkCmdBindDescriptorSets(cmd, c.VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout, 0, 1, &p.sets[p.slot], 0, null);
         if (push.len > 0) api.vkCmdPushConstants(cmd, p.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, p.layout.push_bytes, push.ptr);
         api.vkCmdDispatch(cmd, groups[0], groups[1], groups[2]);
-        const reads = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT | c.VK_ACCESS_TRANSFER_READ_BIT | c.VK_ACCESS_TRANSFER_WRITE_BIT;
-        const stages = c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | c.VK_PIPELINE_STAGE_TRANSFER_BIT;
-        commands.barrier(p.dev, cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_ACCESS_SHADER_WRITE_BIT, stages, reads);
+        const stage = c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        const access = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT;
+        commands.barrier(p.dev, cmd, stage, c.VK_ACCESS_SHADER_WRITE_BIT, stage, access);
     }
 
     /// Records one dispatch into the open command buffer; submitted with half a batch, or with the next copy or fill.
