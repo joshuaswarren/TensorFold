@@ -201,9 +201,11 @@ pub const Pipeline = struct {
         const cmd = try cmds.begin();
         if (cmds.hazards.conflicts(reads[0..n_reads], writes[0..n_writes])) {
             commands.dispatchBarrier(p.dev, cmd);
+            commands.counted_barriers += 1;
             cmds.hazards.clear();
         }
         try p.dispatchOnly(cmd, push, groups);
+        commands.counted_dispatches += 1;
         cmds.hazards.add(reads[0..n_reads], writes[0..n_writes]);
         cmds.pending += 1;
         if (cmds.pending >= batch_flush) try cmds.submit(timeout_ns);

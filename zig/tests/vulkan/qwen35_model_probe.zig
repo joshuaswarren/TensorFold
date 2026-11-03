@@ -349,12 +349,14 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     std.debug.print("MILESTONE run1-done elapsed_ms={d}\n", .{clock.ms()});
+    q35v.engine.printCounters("after-run1");
     try engine.reset();
     greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_b, rows_b, row_len) catch |e| {
         std.debug.print("FAIL run2: {s}\n", .{@errorName(e)});
         return 1;
     };
     std.debug.print("MILESTONE run2-done elapsed_ms={d}\n", .{clock.ms()});
+    q35v.engine.printCounters("after-run2");
 
     // within-Vulkan determinism: fresh cache, real reset, identical bytes
     const ids_equal = std.mem.eql(u32, ids_a, ids_b);

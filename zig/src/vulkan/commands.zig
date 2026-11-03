@@ -9,6 +9,10 @@ const Hazards = @import("hazard.zig").Hazards;
 const Error = runtime.Error;
 const check = runtime.check;
 
+/// Throwaway counters: dispatches run and barriers recorded for them since the process started.
+pub var counted_dispatches: u64 = 0;
+pub var counted_barriers: u64 = 0;
+
 pub const Commands = struct {
     dev: *const Device,
     pool: c.VkCommandPool,

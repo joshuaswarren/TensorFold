@@ -11,6 +11,11 @@ const View = vk.tensor.View;
 
 pub const max_prefill_rows = fwd.max_prefill_rows;
 
+/// Throwaway: prints the dispatch and barrier counters of the Vulkan runtime.
+pub fn printCounters(label: []const u8) void {
+    std.debug.print("BARRIERS {s} dispatches={d} barriers={d}\n", .{ label, vk.commands.counted_dispatches, vk.commands.counted_barriers });
+}
+
 // Chunk cut = min(done+32,total), pure, host-tested; totals 32/33/63/64/65 cut at 32 / 32,33 / 32,63 / 32,64 / 32,64,65
 pub fn chunkEnd(done: usize, total: usize) usize {
     return @min(done +| max_prefill_rows, total);
