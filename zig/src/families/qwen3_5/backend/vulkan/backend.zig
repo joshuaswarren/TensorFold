@@ -145,9 +145,7 @@ pub const Vulkan = struct {
             .handle => |h| std.math.cast(u32, h) orelse return error.InvalidQwenToken,
         };
         if (token >= pinned.vocab) return error.InvalidQwenToken;
-        // reply-only counts (the prompt is never counted): the committed
-        // reply plus this fed token, staged before the draw applies them on
-        // the GPU; inactive penalties stage nothing
+        // reply-only counts (the prompt is never counted): the committed reply plus this fed token, staged for the draw
         try self.engine.penalties.stage(stream, self.engine.visible(), token, stream.penalties);
         try self.engine.decode(token);
         return try self.engine.draw();
@@ -169,8 +167,7 @@ pub const Vulkan = struct {
         if (self.owner != w.stream) return error.UnknownQwenStream;
         if (w.positions.len != 1 or w.positions[0] != self.engine.visible() + 1) return error.InvalidQwenPosition;
         if (samplingRefused(w.stream)) return error.UnsupportedQwenSampling;
-        // the same reply-only staging as queueFn: one row, the pending
-        // token, no drafts and no paths on this engine
+        // the same reply-only staging as queueFn: one row, the pending token, no drafts and no paths on this engine
         try self.engine.penalties.stage(w.stream, self.engine.visible(), w.pending, w.stream.penalties);
         try self.engine.decode(w.pending);
         o.sampled[0] = try self.engine.draw();

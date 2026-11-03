@@ -1,23 +1,4 @@
-// The penalize kernel's planted controls for the Vulkan kernel contract: four
-// faults compiled from this COPY of penalize.comp's structure, so the
-// production zig/kernels/vulkan/penalize.comp itself stays untouched (the
-// same rule as contract_controls_greedy.comp). Each control must go red at
-// exactly its registered gate:
-//   -DTF_CTL_DOUBLE=1   applies each entry twice (the amount subtracted
-//                       twice): the penalized word is wrong, the shapes gate's
-//                       exact check refuses it.
-//   -DTF_CTL_BF16=1     rounds the logit and the amount to bf16 BEFORE the
-//                       subtract: a different rounding chain than the CUDA
-//                       formula (exact widening, one fp32 subtract), the
-//                       shapes gate's exact check refuses it.
-//   -DTF_CTL_SCRIBBLE=1 also writes the word beside the named token (the
-//                       entries are staged over distinct even tokens, so the
-//                       neighbor is never an entry): the repeat gate's
-//                       untouched-word and guard check refuses it.
-//   -DTF_CTL_TAIL=1     drops the last entry: its token stays unpenalized,
-//                       the shapes gate's exact check refuses it.
-// Bindings, push block, workgroup size and grid are penalize.comp's: the
-// control rides the same dispatch model, only the arithmetic differs.
+// Planted controls (TF_CTL_DOUBLE, TF_CTL_BF16, TF_CTL_SCRIBBLE, TF_CTL_TAIL) compiled from a copy of penalize.comp.
 #version 460
 
 #extension GL_EXT_shader_16bit_storage : require
@@ -47,8 +28,7 @@ uint16_t bf16_store(float value) {
   return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
 }
 
-// A bf16 round trip of an fp32 value (the fault TF_CTL_BF16 plants): not the
-// CUDA formula's exact widening — this rounding is what the gate must catch.
+// A bf16 round trip of an fp32 value (the TF_CTL_BF16 fault); the gate must catch this rounding.
 float bf16_round(float value) {
   uint bits = floatBitsToUint(value);
   return uintBitsToFloat((bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u);

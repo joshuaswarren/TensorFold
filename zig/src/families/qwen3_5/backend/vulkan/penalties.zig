@@ -1,23 +1,4 @@
-//! Presence and frequency penalties for the Vulkan engine: the CUDA lane's
-//! staged entries (cuda_penalties.zig) on the single-sequence backend. The
-//! host stages, per decode, the reply-only counts — `stream.context`'s
-//! tokens from the prompt's end through `cache_len`, plus the pending token
-//! exactly once; the prompt is never counted — and one (token, amount)
-//! entry per distinct token, `lanes.Penalties.of(count)` from the staged
-//! counts. Vulkan supports no paths and no drafts: one row, no path.
-//!
-//! The engine applies the staged entries on the GPU after the head and
-//! before the greedy finite/argmax scan: recorded into the open batched
-//! command buffer on the decode path (`recordInto`), or in its own fenced
-//! submission before `Greedy.select` on the immediate draw path
-//! (`runOnce`) — applied exactly once either way. The penalize shader
-//! widens the bf16 logit exactly to fp32, subtracts once and rounds once
-//! to bf16 RNE. Inactive or zero penalties stage nothing, upload nothing
-//! and dispatch nothing: the zero-penalty batch (
-//! bytes, submits) and the output bytes are unchanged. The staged lists
-//! clear after every apply and on `reset`; the bounded device entry buffer
-//! is engine-owned and grows lazily, so an engine that never penalizes
-//! never allocates it.
+//! Presence and frequency penalties for the Vulkan engine: the host stages reply-only counts, the GPU applies them.
 const std = @import("std");
 const lanes = @import("lanes");
 const pinned = @import("../../config.zig");
@@ -29,17 +10,13 @@ const Buffer = vk.Buffer;
 const Commands = vk.commands.Commands;
 const View = vk.tensor.View;
 
-/// Entries one decode can stage at most: every committed token plus the
-/// pending one, against the capacity ceiling (state.zig).
+/// Entries one decode can stage at most: every committed token plus the pending one (ceiling in state.zig).
 pub const max_entries: u32 = @intCast(state.max_capacity + 1);
 
-/// One staging call's outcome; the engine apply surface adds only
-/// dispatch errors (the grow's device allocation rides dispatch.Error).
+/// One staging call's outcome; the engine apply surface adds only dispatch errors.
 pub const StageError = error{ OutOfMemory, NonFinite, InvalidQwenPosition, InvalidQwenToken };
 
-/// Byte offset of the amounts inside a table of `cap` entries: the toks' bytes
-/// rounded up to 256, so the amounts binding's offset is aligned on any device.
-/// Pure and host-tested.
+/// Byte offset of the amounts in a table of `cap` entries: the toks' bytes rounded up to 256, aligned for the binding.
 pub fn amountsAt(cap: u32) u64 {
     return (@as(u64, cap) * 4 + 255) / 256 * 256;
 }
@@ -47,26 +24,17 @@ pub fn amountsAt(cap: u32) u64 {
 pub const Penalties = struct {
     gpa: Allocator,
     dev: *const vk.Device,
-    /// The penalize pipeline over the one logits row (binding 0, written)
-    /// and the staged entry table (bindings 1 and 2, read-only ranges).
+    /// The penalize pipeline: the logits row (binding 0) and the entry table (bindings 1 and 2, read-only).
     pipe: vk.dispatch.Pipeline = undefined,
     /// The staged entries for the next apply: one per distinct reply token.
     toks: std.ArrayList(u32) = .empty,
     subs: std.ArrayList(f32) = .empty,
     counts: std.AutoArrayHashMapUnmanaged(u32, u32) = .empty,
-    /// The device entry table: toks u32[cap] at 0, then amounts f32[cap] at
-    /// `amountsAt(cap)`, a 256-byte multiple (the largest
-    /// minStorageBufferOffsetAlignment Vulkan allows: a storage binding's
-    /// offset must be aligned, so the amounts never start at `n * 4`); null
-    /// until a first apply grows it.
+    /// The device entry table: toks u32[cap] at 0, amounts f32[cap] at `amountsAt(cap)`; null until first use.
     entries: ?Buffer = null,
     cap: u32 = 0,
 
-    /// Frees the staged lists and the device entry table; call only when no
-    /// submission using the entries is pending (the orExit discipline
-    /// guarantees it). The pipeline's deinit is the owner's: the host tests
-    /// exercise staging with no pipeline at all, so `deinit` never touches
-    /// `pipe` (engine.deinit tears it down right before this).
+    /// Frees the staged lists and the device entry table; the pipeline's deinit is the owner's.
     pub fn deinit(p: *Penalties) void {
         p.toks.deinit(p.gpa);
         p.subs.deinit(p.gpa);
@@ -74,11 +42,7 @@ pub const Penalties = struct {
         if (p.entries) |*b| b.deinit();
     }
 
-    /// The staged entries for the next decode: the reply's tokens before
-    /// `cache_len`, then `next`, the token at `cache_len` (counted once).
-    /// Inactive penalties stage nothing, even over a broken position. A
-    /// position before the reply's start or past the committed tokens, a
-    /// non-finite control or an out-of-vocabulary token refuses.
+    /// The staged entries for the next decode: the reply's tokens before `cache_len`, then `next` (counted once).
     pub fn stage(p: *Penalties, stream: *const lanes.Stream, cache_len: usize, next: u32, pen: lanes.Penalties) StageError!void {
         if (!pen.active()) return;
         if (!std.math.isFinite(pen.presence) or !std.math.isFinite(pen.frequency)) return error.NonFinite;
@@ -115,18 +79,14 @@ pub const Penalties = struct {
         gop.value_ptr.* += 1;
     }
 
-    /// The staged entries into the device table: toks at 0, amounts after,
-    /// each its own staging slice (the lists are separate allocations).
+    /// The staged entries into the device table: toks at 0, amounts after, each its own staging slice.
     fn uploadEntries(p: *Penalties, cmds: *Commands, staging: Buffer, n: u32, timeout_ns: u64) !void {
         const e = p.entries.?;
         try vk.upload(cmds, e, 0, staging, std.mem.sliceAsBytes(p.toks.items[0..n]), timeout_ns);
         try vk.upload(cmds, e, amountsAt(p.cap), staging, std.mem.sliceAsBytes(p.subs.items[0..n]), timeout_ns);
     }
 
-    /// The device entry table for `n` entries: grown (never shrunk) to at
-    /// least `n`, refused past the structural bound. Only called when the
-    /// previous submission's fence has been waited, so replacing the buffer
-    /// frees nothing in flight.
+    /// The device entry table for `n` entries: grown (never shrunk) to at least `n`, refused past the bound.
     fn grow(p: *Penalties, n: u32) !void {
         if (p.entries != null and p.cap >= n) return;
         if (n > max_entries) return error.Invalid;
@@ -147,10 +107,7 @@ pub const Penalties = struct {
         });
     }
 
-    /// The staged entries on the immediate draw path: one fenced upload and
-    /// one fenced dispatch before the caller's `Greedy.select`, applied
-    /// exactly once. A no-op with nothing staged; the staged lists clear on
-    /// every return.
+    /// The staged entries on the immediate draw path: one fenced upload and one fenced dispatch before `Greedy.select`.
     pub fn runOnce(p: *Penalties, cmds: *Commands, staging: Buffer, logits: View, timeout_ns: u64) !void {
         const n = p.staged();
         defer p.clear();

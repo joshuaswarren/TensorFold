@@ -1,14 +1,4 @@
-//! tf-contract-penalties: the penalize kernel through the kernel contract's
-//! gates 1-4 on a real Vulkan GPU — one registration of penalize.comp (the
-//! CUDA tf_penalize_rows primitive behind presence/frequency penalties), four
-//! planted controls compiled from a COPY of the penalize source (double,
-//! bf16-subtract, scribble, tail), and the fp32-denormal row as its own gate:
-//! a flush there reads as a KNOWN finding exactly when every mismatch is a
-//! named token read as its unchanged input AND the device reports
-//! shaderDenormPreserveFloat32 = 0; anything else FAILs. The RESULT line is
-//! always printed — a gate that raises is that case's FAIL, never the run's
-//! death. Exit 0 only when every gate passed or ended KNOWN and every control
-//! went red; 1 otherwise, 2 usage, 124 a fence timeout.
+//! tf-contract-penalties: penalize.comp through gates 1-4 with four planted controls, plus the fp32-denormal row gate.
 const std = @import("std");
 const vk = @import("vulkan");
 const contract = @import("contract");
@@ -95,8 +85,7 @@ fn body(a: std.mem.Allocator, clock: Elapsed, vendor: ?u32, timeout: u64) !bool 
     if (!refused) {
         var cmds = try vk.Commands.init(&dev);
         defer cmds.deinit();
-        // the largest contract shell rides staging: the 248320-word row plus
-        // its guards is under half a megabyte, the entry table under 64 KiB
+        // the largest contract shell (248320-word row plus guards) is under half a megabyte, so it rides staging
         var staging = try vk.Buffer.init(&dev, .staging, 1 << 20);
         defer staging.deinit();
         var real = fx.Penalize.init(a, &dev, &cmds, staging, timeout, &shaders.penalize, .kernel, .double);
@@ -137,8 +126,7 @@ fn body(a: std.mem.Allocator, clock: Elapsed, vendor: ?u32, timeout: u64) !bool 
     return acct.ok;
 }
 
-/// The denormal gate wrapped so a raised error is that case's FAIL, never the
-/// run's death; the verdict is the caller's to count.
+/// A raised error is that case's FAIL, never the run's death; the verdict is the caller's to count.
 fn subnormal(f: *fx.Penalize, preserve32: bool, gate_seed: u64) !fx.Verdict {
     if (!try f.prepare(.{ .rows = 1, .n = fx.vocab, .k = 0 }, .random, gate_seed)) return error.Refused;
     return f.subnormalGate(preserve32);

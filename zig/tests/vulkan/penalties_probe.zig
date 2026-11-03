@@ -1,16 +1,4 @@
-//! Vulkan penalties bring-up: presence/frequency penalization over one BF16
-//! logits row at the fixture's fixed CUDA-formula words, through the same
-//! dispatch the engine records, on a real GPU. Exit 0 pass, 1 fail, 2
-//! usage, 124 fence timeout. Bring-up only: no model, no performance claim.
-//! Every expected word is read back from the GPU and compared against the
-//! fixture's independent CUDA-arithmetic literals (exact bf16 widening, one
-//! fp32 subtract, one bf16 RNE) — never recomputed on the host, so a device
-//! that diverges (the fp32-subnormal flush on some drivers, an RNE drift)
-//! fails its gate honestly. The greedy gates run the production Greedy
-//! after the penalize dispatch: the winner-change row must select the
-//! untouched token, and the finite-guard row must refuse NonFinite. Every
-//! GPU call after submit goes through vk.orExit; the expected NonFinite is
-//! caught explicitly and never reported as a GPU failure.
+//! Vulkan penalties bring-up: penalizes one BF16 row on a real GPU and compares every word with the fixture's literals.
 const std = @import("std");
 const vk = @import("vulkan");
 const shaders = @import("penalties_shaders");

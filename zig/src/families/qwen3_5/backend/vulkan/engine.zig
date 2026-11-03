@@ -34,8 +34,7 @@ pub const ShaderBundle = struct {
     attention: vk.attention.Shaders,
     gdn: vk.gdn.Shaders,
     greedy: vk.greedy.Shaders,
-    /// The penalties' single-pass penalize image (the build compiles
-    /// penalize.comp; the engine only checks and pipelines it).
+    /// The penalties' single-pass penalize image (the build compiles penalize.comp; the engine only pipelines it).
     penalize: []align(4) const u8,
 };
 
@@ -72,8 +71,7 @@ pub const Engine = struct {
     attn: vk.Attention,
     gdn: vk.Gdn,
     greedy: vk.Greedy,
-    /// Presence/frequency penalties staged by the backend, applied by the
-    /// draw before the greedy scan (penalties.zig).
+    /// Presence/frequency penalties staged by the backend, applied by the draw before the greedy scan (penalties.zig).
     penalties: penalties.Penalties,
     arena: vk.arena.Arena,
     model: weights.Model,
@@ -225,8 +223,7 @@ pub const Engine = struct {
     // Ash draw picks the largest finite logit; ties (+0/-0) go lowest index. Any NaN/Inf refuses and poisons.
     pub fn draw(e: *Engine) Error!u32 {
         try logitsReady(e.poisoned, e.state.visible());
-        // staged penalties first, in their own fenced submission, applied
-        // exactly once before the scan (a no-op with nothing staged)
+        // staged penalties first, in their own fenced submission, applied exactly once before the scan
         try vk.orExit(e.penalties.runOnce(e.cmds, e.staging, e.logits, e.timeout_ns));
         return vk.orExit(e.greedy.select(e.cmds, e.staging, e.logits, e.timeout_ns)) catch |err| {
             if (err == error.NonFinite) e.poisoned = true;

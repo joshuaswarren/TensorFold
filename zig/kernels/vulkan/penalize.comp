@@ -1,12 +1,4 @@
-// Presence and frequency penalties over one BF16 logits row: the CUDA
-// tf_penalize_rows primitive on the single-sequence engine (every entry is
-// row 0, so no ROW table). Entry i widens the logit of TOK[i] exactly to
-// fp32 (bits << 16), subtracts SUB[i] once in fp32 and rounds once to BF16
-// RNE — the same single-store rounding the repo's bf16_store applies — so
-// the greedy finite/argmax scan reads the penalized row. The host stages one
-// entry per DISTINCT reply token, so no two threads write the same uint16
-// halfword: plain read-modify-write, no atomics, no packed-u32 races.
-// Grid: x = ceil(count / 256).
+// CUDA tf_penalize_rows on BF16: widen to fp32, subtract SUB[i] once, round once to BF16 RNE; distinct tokens.
 
 #version 460
 
