@@ -4,6 +4,12 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- DeepSeek-V4.1 on Metal, part one: its kernels, the decoder over every layer, Engram, prompt chunks and DSpark drafts, each checked against float64 references (#1710-#1719). Serving it on Metal follows with #1720-#1722. Thanks to @gilby.
+
+- Docs: the cache benchmark receipts say which tool-call content they count (#1999). Thanks to @garvrao80.
+
+- `zig build test-info-config` runs info's issue-934 test again: it was built from the CUDA CLI root, which never reached it (#2006). Thanks to @jishnuvenugopal.
+
 - The Vulkan engine reads Qwen3.5's 4-bit projection weights and activations 16 bytes at a time (`qmm_q4_vec4`) when both are 16-byte aligned, and keeps the scalar kernel otherwise. Each output keeps the same sum in the same order, so the logits are byte-identical. On a 13-inch M1 with Qwen3.5-2B 4-bit, a run (prefill, 63 decode steps and the per-step logits readback) took 40% to 52% less time on three inputs: a 24-token prompt, and documents of 256 and 1,024 tokens. The kernel contract checks the new kernel with the same gates as `qmm_bf16`. Receipts: [docs/receipts/vulkan-qmm-vec4-m1](docs/receipts/vulkan-qmm-vec4-m1/README.md).
 
 - The Nemotron XPU loader and the XPU safetensors reader read shard headers through core, so a malformed or oversized header is refused before anything is read (#1919). Thanks to @jschmied.
