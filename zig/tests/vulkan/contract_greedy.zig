@@ -276,7 +276,7 @@ pub const Greedy = struct {
                 });
                 var push: [4]u8 align(4) = undefined;
                 std.mem.writeInt(u32, &push, @intCast(n), .little);
-                const cmd = try self.cmds.begin();
+                const cmd = try self.cmds.sync();
                 try pipe.record(cmd, &push, .{ @intCast(rows), 1, 1 });
                 try self.cmds.submit(self.timeout);
                 try vk.orExit(vk.download(self.cmds, maxima.*, 0, self.staging, self.rig.outs.items, self.timeout));
