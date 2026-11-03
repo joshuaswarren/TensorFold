@@ -103,7 +103,7 @@ pub fn projectTiled(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scale
     const pipe = if (many) &o.qmm_q4_tile_rows else &o.qmm_q4_tile;
     try pipe.bind(&.{ x.bind(), w.bind(), scales.bind(), biases.bind(), out.bind() });
     const p = try q4Push(g.m, g.n, k);
-    const threads = if (many) try ops_mod.cast32((g.m + tile_rows - 1) / tile_rows * ((g.n + 31) / 32 * 16)) else p.count;
+    const threads = if (many) try ops_mod.cast32((g.m + tile_rows - 1) / tile_rows * ((g.n + 31) / 32 * 8)) else p.count;
     try pipe.run(cmds, std.mem.asBytes(&p), ops_mod.dispatchGroups(threads, pipe.local[0]), timeout_ns);
 }
 
