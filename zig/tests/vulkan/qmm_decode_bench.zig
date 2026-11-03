@@ -20,6 +20,8 @@ const usage = "usage: tf-qmm-decode-bench [--vendor ID] [--timeout-ms MS] [--rep
     "  --reps N          timed dispatches per shape and label (default 400)\n" ++
     "  --shader L=P.spv  load another qmm_q4_tile-compatible image as variant LABEL\n" ++
     "  --nobarrier       also time the dispatches without the per-dispatch compute barrier, both modes in one run\n" ++
+    "  --narrow          also time a compute-to-compute barrier without transfer stages, added to the modes run\n" ++
+    "  --chain           barrier and narrow timed dispatches all write one output slot, a WAW chain the barrier orders\n" ++
     "  --shapes small    only the three smallest shapes, and reps 50 unless --reps is given\n";
 
 /// One decode projection: n outputs, k inputs, dispatches per decode step, and the loader names it came from.
@@ -136,7 +138,7 @@ const Fixture = struct {
 };
 
 const ArgShader = struct { label: []const u8, path: []const u8 };
-const bench_modes: [2][]const u8 = .{ "barrier", "nobarrier" };
+const bench_modes: [3][]const u8 = .{ "barrier", "narrow", "nobarrier" };
 
 const Options = struct {
     vendor: ?u32 = null,
@@ -144,6 +146,8 @@ const Options = struct {
     reps: usize = 400,
     small: bool = false,
     nobarrier: bool = false,
+    narrow: bool = false,
+    chain: bool = false,
     explicit_reps: bool = false,
     shader_args: [max_variants]ArgShader = undefined,
     shader_count: usize = 0,
@@ -173,6 +177,10 @@ pub fn main(init: std.process.Init) !u8 {
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--nobarrier")) {
             o.nobarrier = true;
+        } else if (std.mem.eql(u8, args[i], "--narrow")) {
+            o.narrow = true;
+        } else if (std.mem.eql(u8, args[i], "--chain")) {
+            o.chain = true;
         } else if (std.mem.eql(u8, args[i], "--shader")) {
             const split = std.mem.indexOfScalar(u8, value, '=') orelse break;
             if (split == 0 or o.shader_count == max_variants) break;
@@ -248,7 +256,7 @@ fn run(init: std.process.Init, o_in: Options) !u8 {
         std.debug.print("DEVICE variant \"{s}\" {d} bytes local={d}\n", .{ arg.label, code.len, pipe.local[0] });
     }
 
-    var step_us = try a.alloc(f64, label_count * 2);
+    var step_us = try a.alloc(f64, label_count * 3);
     defer a.free(step_us);
     @memset(step_us, 0);
     for (picked, 0..) |s, shape_index| {
@@ -299,6 +307,17 @@ fn run(init: std.process.Init, o_in: Options) !u8 {
             std.debug.print("EXACT {s} n={d} k={d} mode=barrier {s}\n", .{ l.name, s.n, s.k, if (same) "ok" else "DIFFERENT" });
             if (!same) return 1;
         }
+        if (o.narrow) for (labels[0..label_count]) |l| {
+            const got = try a.alloc(u16, s.n);
+            defer a.free(got);
+            l.pipe.narrow = true;
+            try dispatchOne(&l, &cmds, &xbuf, &wbufs[0], &sbufs[0], &bbufs[0], &outbufs[0], &p, groups, timeout);
+            l.pipe.narrow = false;
+            try vk.orExit(vk.download(&cmds, outbufs[0], 0, staging, std.mem.sliceAsBytes(got), timeout));
+            const same = std.mem.eql(u16, want, got);
+            std.debug.print("EXACT {s} n={d} k={d} mode=narrow {s}\n", .{ l.name, s.n, s.k, if (same) "ok" else "DIFFERENT" });
+            if (!same) return 1;
+        };
         if (o.nobarrier) for (labels[0..label_count]) |l| {
             const got = try a.alloc(u16, s.n);
             defer a.free(got);
@@ -322,19 +341,21 @@ fn run(init: std.process.Init, o_in: Options) !u8 {
         // timing: cycle the weight and output copies to defeat caches, batched through the engine's submit path
         const bytes = shapeBytes(s);
         const clock = init.io;
-        const mode_count: usize = if (o.nobarrier) 2 else 1;
+        const mode_count: usize = 1 + @as(usize, if (o.narrow) 1 else 0) + @as(usize, if (o.nobarrier) 1 else 0);
+        if (o.chain) std.debug.print("DEVICE chain=one-output-slot for barrier and narrow; nobarrier stays independent\n", .{});
         for (labels[0..label_count], 0..) |l, li| {
             for (bench_modes[0..mode_count], 0..) |mode, mi| {
-                l.pipe.barrier = mi == 0;
+                l.pipe.barrier = mi != 2;
+                l.pipe.narrow = mi == 1;
                 var c: usize = 0;
                 for (0..warmup_dispatches) |_| {
-                    try dispatchOne(&l, &cmds, &xbuf, &wbufs[c], &sbufs[c], &bbufs[c], &outbufs[c], &p, groups, timeout);
+                    try dispatchOne(&l, &cmds, &xbuf, &wbufs[c], &sbufs[c], &bbufs[c], &outbufs[chainSlot(o.chain, mi, c)], &p, groups, timeout);
                     c = (c + 1) % copies;
                 }
                 try vk.orExit(cmds.submit(timeout));
                 const t0 = std.Io.Clock.awake.now(clock);
                 for (0..o.reps) |_| {
-                    try dispatchOne(&l, &cmds, &xbuf, &wbufs[c], &sbufs[c], &bbufs[c], &outbufs[c], &p, groups, timeout);
+                    try dispatchOne(&l, &cmds, &xbuf, &wbufs[c], &sbufs[c], &bbufs[c], &outbufs[chainSlot(o.chain, mi, c)], &p, groups, timeout);
                     c = (c + 1) % copies;
                 }
                 try vk.orExit(cmds.submit(timeout));
@@ -342,16 +363,22 @@ fn run(init: std.process.Init, o_in: Options) !u8 {
                 const us = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(o.reps)) / 1000.0;
                 const gbps = @as(f64, @floatFromInt(bytes)) * @as(f64, @floatFromInt(o.reps)) / @as(f64, @floatFromInt(ns));
                 std.debug.print("BENCH {s} n={d} k={d} count={d} us={d:.3} gbps={d:.2} mode={s}\n", .{ l.name, s.n, s.k, s.count, us, gbps, mode });
-                step_us[li * 2 + mi] += us * @as(f64, @floatFromInt(s.count)) / 1000.0;
+                step_us[li * 3 + mi] += us * @as(f64, @floatFromInt(s.count)) / 1000.0;
             }
             l.pipe.barrier = true;
+            l.pipe.narrow = false;
         }
     }
-    const mode_count: usize = if (o.nobarrier) 2 else 1;
+    const mode_count: usize = 1 + @as(usize, if (o.narrow) 1 else 0) + @as(usize, if (o.nobarrier) 1 else 0);
     for (labels[0..label_count], 0..) |l, li| for (bench_modes[0..mode_count], 0..) |mode, mi| {
-        std.debug.print("STEP {s} mode={s} step_ms={d:.3}\n", .{ l.name, mode, step_us[li * 2 + mi] });
+        std.debug.print("STEP {s} mode={s} step_ms={d:.3}\n", .{ l.name, mode, step_us[li * 3 + mi] });
     };
     return 0;
+}
+
+/// In --chain runs the ordered modes all write slot 0 (a WAW chain the barrier orders); nobarrier keeps cycling slots.
+fn chainSlot(chain: bool, mode_index: usize, cycling: usize) usize {
+    return if (chain and mode_index != 2) 0 else cycling;
 }
 
 /// One dispatch: bind the given copy, record, and let the batched submission flush at half a batch.

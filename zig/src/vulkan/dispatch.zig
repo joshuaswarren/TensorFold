@@ -37,6 +37,8 @@ pub const Pipeline = struct {
     bound: bool = false,
     /// When false, record skips the post-dispatch compute barrier (decode bench overlap mode only); default stays true.
     barrier: bool = true,
+    /// When true with barrier set, record emits a compute-only barrier without transfer stages; bench narrow mode only.
+    narrow: bool = false,
 
     /// Checks the module and the device's limits before creating anything; a failure destroys what was made.
     pub fn init(dev: *const Device, spirv: []align(4) const u8, layout: Layout) Error!Pipeline {
@@ -175,9 +177,13 @@ pub const Pipeline = struct {
         if (push.len > 0) api.vkCmdPushConstants(cmd, p.pipeline_layout, c.VK_SHADER_STAGE_COMPUTE_BIT, 0, p.layout.push_bytes, push.ptr);
         api.vkCmdDispatch(cmd, groups[0], groups[1], groups[2]);
         if (p.barrier) {
-            const reads = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT | c.VK_ACCESS_TRANSFER_READ_BIT | c.VK_ACCESS_TRANSFER_WRITE_BIT;
-            const stages = c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | c.VK_PIPELINE_STAGE_TRANSFER_BIT;
-            commands.barrier(p.dev, cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_ACCESS_SHADER_WRITE_BIT, stages, reads);
+            if (p.narrow) {
+                commands.barrier(p.dev, cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_ACCESS_SHADER_WRITE_BIT, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT);
+            } else {
+                const reads = c.VK_ACCESS_SHADER_READ_BIT | c.VK_ACCESS_SHADER_WRITE_BIT | c.VK_ACCESS_TRANSFER_READ_BIT | c.VK_ACCESS_TRANSFER_WRITE_BIT;
+                const stages = c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | c.VK_PIPELINE_STAGE_TRANSFER_BIT;
+                commands.barrier(p.dev, cmd, c.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, c.VK_ACCESS_SHADER_WRITE_BIT, stages, reads);
+            }
         }
     }
 
