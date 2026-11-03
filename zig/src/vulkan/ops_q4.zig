@@ -90,7 +90,7 @@ pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: Vi
 }
 
 /// Rows of x one thread of qmm_q4_tile_rows computes; a prompt chunk of at least this many rows takes that image.
-pub const tile_rows: u64 = 4;
+pub const tile_rows: u64 = 8;
 
 /// `project` over weights repacked by `tile`: one dispatch, so w must fit one binding and start 16-byte aligned.
 pub fn projectTiled(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: View, biases: View, k: u64, timeout_ns: u64) Error!void {

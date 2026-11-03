@@ -1,5 +1,5 @@
 #version 460
-// qmm_q4_tile with four rows of x a thread, so each weight is dequantized once for four outputs; same sums and order.
+// qmm_q4_tile with eight rows of x a thread, so each weight is dequantized once for eight outputs; same sums and order.
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 
@@ -57,9 +57,11 @@ float bf16_value(uint16_t x) {
   return uintBitsToFloat(uint(x) << 16u);
 }
 
+const uint R = 8u;
+
 void main() {
   uint groups_per_row = params.matrix_k / 64u;
-  uint blocks = (params.matrix_m + 3u) / 4u;
+  uint blocks = (params.matrix_m + R - 1u) / R;
   uint total = blocks * params.matrix_n;
   uint stride = gl_NumWorkGroups.x * 256u;
   uint last_row = params.matrix_m - 1u;
@@ -71,14 +73,12 @@ void main() {
     uint w_base = tile * params.matrix_k + lane;
     uint param_base = tile * (groups_per_row * 32u) + lane;
     uint row_vectors = params.matrix_k / 8u;
-    uint x0 = min(block * 4u, last_row) * row_vectors;
-    uint x1 = min(block * 4u + 1u, last_row) * row_vectors;
-    uint x2 = min(block * 4u + 2u, last_row) * row_vectors;
-    uint x3 = min(block * 4u + 3u, last_row) * row_vectors;
-    float acc0 = 0.0;
-    float acc1 = 0.0;
-    float acc2 = 0.0;
-    float acc3 = 0.0;
+    uint xb[R];
+    float acc[R];
+    for (uint r = 0u; r < R; ++r) {
+      xb[r] = min(block * R + r, last_row) * row_vectors;
+      acc[r] = 0.0;
+    }
     for (uint group = 0u; group < groups_per_row; ++group) {
       float scale = bf16_value(scales.values[param_base + group * 32u]);
       float bias = bf16_value(biases.values[param_base + group * 32u]);
@@ -87,29 +87,24 @@ void main() {
         for (uint t = 0u; t < 4u; ++t) {
           uint word = w4[t];
           uint at = group * 8u + half_group * 4u + t;
-          uvec4 xa = input_x.values[x0 + at];
-          uvec4 xb = input_x.values[x1 + at];
-          uvec4 xc = input_x.values[x2 + at];
-          uvec4 xd = input_x.values[x3 + at];
+          uvec4 xs[R];
+          for (uint r = 0u; r < R; ++r) {
+            xs[r] = input_x.values[xb[r] + at];
+          }
           for (uint pair = 0u; pair < 4u; ++pair) {
             float low = scale * float((word >> (pair * 8u)) & 0xfu) + bias;
             float high = scale * float((word >> (pair * 8u + 4u)) & 0xfu) + bias;
-            acc0 += uintBitsToFloat(xa[pair] << 16u) * low;
-            acc0 += uintBitsToFloat(xa[pair] & 0xffff0000u) * high;
-            acc1 += uintBitsToFloat(xb[pair] << 16u) * low;
-            acc1 += uintBitsToFloat(xb[pair] & 0xffff0000u) * high;
-            acc2 += uintBitsToFloat(xc[pair] << 16u) * low;
-            acc2 += uintBitsToFloat(xc[pair] & 0xffff0000u) * high;
-            acc3 += uintBitsToFloat(xd[pair] << 16u) * low;
-            acc3 += uintBitsToFloat(xd[pair] & 0xffff0000u) * high;
+            for (uint r = 0u; r < R; ++r) {
+              acc[r] += uintBitsToFloat(xs[r][pair] << 16u) * low;
+              acc[r] += uintBitsToFloat(xs[r][pair] & 0xffff0000u) * high;
+            }
           }
         }
       }
     }
-    uint row = block * 4u;
-    output_data.values[params.output_offset + row * params.matrix_n + column] = bf16_store(acc0);
-    if (row + 1u < params.matrix_m) output_data.values[params.output_offset + (row + 1u) * params.matrix_n + column] = bf16_store(acc1);
-    if (row + 2u < params.matrix_m) output_data.values[params.output_offset + (row + 2u) * params.matrix_n + column] = bf16_store(acc2);
-    if (row + 3u < params.matrix_m) output_data.values[params.output_offset + (row + 3u) * params.matrix_n + column] = bf16_store(acc3);
+    uint row = block * R;
+    for (uint r = 0u; r < R; ++r) {
+      if (row + r < params.matrix_m) output_data.values[params.output_offset + (row + r) * params.matrix_n + column] = bf16_store(acc[r]);
+    }
   }
 }
