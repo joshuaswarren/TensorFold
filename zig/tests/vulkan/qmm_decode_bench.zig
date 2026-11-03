@@ -19,6 +19,7 @@ const usage = "usage: tf-qmm-decode-bench [--vendor ID] [--timeout-ms MS] [--rep
     "  --timeout-ms MS   bound on every fence wait, 1 to 600000 (default 10000); a timeout ends the process\n" ++
     "  --reps N          timed dispatches per shape and label (default 400)\n" ++
     "  --shader L=P.spv  load another qmm_q4_tile-compatible image as variant LABEL\n" ++
+    "  --nobarrier       also time the dispatches without the per-dispatch compute barrier, both modes in one run\n" ++
     "  --shapes small    only the three smallest shapes, and reps 50 unless --reps is given\n";
 
 /// One decode projection: n outputs, k inputs, dispatches per decode step, and the loader names it came from.
@@ -135,12 +136,14 @@ const Fixture = struct {
 };
 
 const ArgShader = struct { label: []const u8, path: []const u8 };
+const bench_modes: [2][]const u8 = .{ "barrier", "nobarrier" };
 
 const Options = struct {
     vendor: ?u32 = null,
     timeout_ms: u64 = 10_000,
     reps: usize = 400,
     small: bool = false,
+    nobarrier: bool = false,
     explicit_reps: bool = false,
     shader_args: [max_variants]ArgShader = undefined,
     shader_count: usize = 0,
@@ -168,6 +171,8 @@ pub fn main(init: std.process.Init) !u8 {
             if (!std.mem.eql(u8, value, "small")) break;
             o.small = true;
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--nobarrier")) {
+            o.nobarrier = true;
         } else if (std.mem.eql(u8, args[i], "--shader")) {
             const split = std.mem.indexOfScalar(u8, value, '=') orelse break;
             if (split == 0 or o.shader_count == max_variants) break;
@@ -243,7 +248,7 @@ fn run(init: std.process.Init, o_in: Options) !u8 {
         std.debug.print("DEVICE variant \"{s}\" {d} bytes local={d}\n", .{ arg.label, code.len, pipe.local[0] });
     }
 
-    var step_us = try a.alloc(f64, label_count);
+    var step_us = try a.alloc(f64, label_count * 2);
     defer a.free(step_us);
     @memset(step_us, 0);
     for (picked, 0..) |s, shape_index| {
@@ -252,11 +257,13 @@ fn run(init: std.process.Init, o_in: Options) !u8 {
         var wbufs: [copies_cap]vk.Buffer = undefined;
         var sbufs: [copies_cap]vk.Buffer = undefined;
         var bbufs: [copies_cap]vk.Buffer = undefined;
+        var outbufs: [copies_cap]vk.Buffer = undefined;
         var made: usize = 0;
         defer for (0..made) |c| {
             wbufs[c].deinit();
             sbufs[c].deinit();
             bbufs[c].deinit();
+            outbufs[c].deinit();
         };
         const per_copy: u64 = @intCast(f.w_tiled.len + f.scales_tiled.len + f.biases_tiled.len);
         const copies: usize = @max(1, @min(copies_cap, (copies_bytes + per_copy - 1) / per_copy));
@@ -264,6 +271,7 @@ fn run(init: std.process.Init, o_in: Options) !u8 {
             wbufs[made] = try vk.Buffer.init(&dev, .device, f.w_tiled.len);
             sbufs[made] = try vk.Buffer.init(&dev, .device, f.scales_tiled.len);
             bbufs[made] = try vk.Buffer.init(&dev, .device, f.biases_tiled.len);
+            outbufs[made] = try vk.Buffer.init(&dev, .device, s.n * 2);
             made += 1;
             try vk.orExit(vk.upload(&cmds, wbufs[made - 1], 0, staging, f.w_tiled, timeout));
             try vk.orExit(vk.upload(&cmds, sbufs[made - 1], 0, staging, f.scales_tiled, timeout));
@@ -273,26 +281,35 @@ fn run(init: std.process.Init, o_in: Options) !u8 {
         var xbuf = try vk.Buffer.init(&dev, .device, f.x.len * 2);
         defer xbuf.deinit();
         try vk.orExit(vk.upload(&cmds, xbuf, 0, staging, std.mem.sliceAsBytes(f.x), timeout));
-        var outbuf = try vk.Buffer.init(&dev, .device, s.n * 2);
-        defer outbuf.deinit();
 
         const p = Params{ .count = @intCast(s.n), .operation = 4, .reduce_size = @intCast(group), .output_size = @intCast(s.n), .matrix_m = 1, .matrix_n = @intCast(s.n), .matrix_k = @intCast(s.k), .shape = .{ 1, 0, 0, 0 } };
         const groups: u32 = @intCast((s.n + default_pipe.local[0] - 1) / default_pipe.local[0]);
 
-        // correctness: every variant must reproduce the default's output bytes exactly
+        // correctness: every label's output must reproduce the default barrier-mode output bytes exactly, both modes
         const want = try a.alloc(u16, s.n);
         defer a.free(want);
-        try dispatchOne(&labels[0], &cmds, &xbuf, &wbufs[0], &sbufs[0], &bbufs[0], &outbuf, &p, groups, timeout);
-        try vk.orExit(vk.download(&cmds, outbuf, 0, staging, std.mem.sliceAsBytes(want), timeout));
+        try dispatchOne(&labels[0], &cmds, &xbuf, &wbufs[0], &sbufs[0], &bbufs[0], &outbufs[0], &p, groups, timeout);
+        try vk.orExit(vk.download(&cmds, outbufs[0], 0, staging, std.mem.sliceAsBytes(want), timeout));
         for (labels[1..label_count]) |l| {
             const got = try a.alloc(u16, s.n);
             defer a.free(got);
-            try dispatchOne(&l, &cmds, &xbuf, &wbufs[0], &sbufs[0], &bbufs[0], &outbuf, &p, groups, timeout);
-            try vk.orExit(vk.download(&cmds, outbuf, 0, staging, std.mem.sliceAsBytes(got), timeout));
+            try dispatchOne(&l, &cmds, &xbuf, &wbufs[0], &sbufs[0], &bbufs[0], &outbufs[0], &p, groups, timeout);
+            try vk.orExit(vk.download(&cmds, outbufs[0], 0, staging, std.mem.sliceAsBytes(got), timeout));
             const same = std.mem.eql(u16, want, got);
-            std.debug.print("EXACT {s} n={d} k={d} {s}\n", .{ l.name, s.n, s.k, if (same) "ok" else "DIFFERENT" });
+            std.debug.print("EXACT {s} n={d} k={d} mode=barrier {s}\n", .{ l.name, s.n, s.k, if (same) "ok" else "DIFFERENT" });
             if (!same) return 1;
         }
+        if (o.nobarrier) for (labels[0..label_count]) |l| {
+            const got = try a.alloc(u16, s.n);
+            defer a.free(got);
+            l.pipe.barrier = false;
+            try dispatchOne(&l, &cmds, &xbuf, &wbufs[0], &sbufs[0], &bbufs[0], &outbufs[0], &p, groups, timeout);
+            l.pipe.barrier = true;
+            try vk.orExit(vk.download(&cmds, outbufs[0], 0, staging, std.mem.sliceAsBytes(got), timeout));
+            const same = std.mem.eql(u16, want, got);
+            std.debug.print("EXACT {s} n={d} k={d} mode=nobarrier {s}\n", .{ l.name, s.n, s.k, if (same) "ok" else "DIFFERENT" });
+            if (!same) return 1;
+        };
         if (shape_index == 0) {
             const ref = try a.alloc(u16, s.n);
             defer a.free(ref);
@@ -302,30 +319,38 @@ fn run(init: std.process.Init, o_in: Options) !u8 {
             if (!same) return 1;
         }
 
-        // timing: cycle the weight copies so the working set defeats caches, batched through the engine's submit path
+        // timing: cycle the weight and output copies to defeat caches, batched through the engine's submit path
         const bytes = shapeBytes(s);
         const clock = init.io;
+        const mode_count: usize = if (o.nobarrier) 2 else 1;
         for (labels[0..label_count], 0..) |l, li| {
-            var c: usize = 0;
-            for (0..warmup_dispatches) |_| {
-                try dispatchOne(&l, &cmds, &xbuf, &wbufs[c], &sbufs[c], &bbufs[c], &outbuf, &p, groups, timeout);
-                c = (c + 1) % copies;
+            for (bench_modes[0..mode_count], 0..) |mode, mi| {
+                l.pipe.barrier = mi == 0;
+                var c: usize = 0;
+                for (0..warmup_dispatches) |_| {
+                    try dispatchOne(&l, &cmds, &xbuf, &wbufs[c], &sbufs[c], &bbufs[c], &outbufs[c], &p, groups, timeout);
+                    c = (c + 1) % copies;
+                }
+                try vk.orExit(cmds.submit(timeout));
+                const t0 = std.Io.Clock.awake.now(clock);
+                for (0..o.reps) |_| {
+                    try dispatchOne(&l, &cmds, &xbuf, &wbufs[c], &sbufs[c], &bbufs[c], &outbufs[c], &p, groups, timeout);
+                    c = (c + 1) % copies;
+                }
+                try vk.orExit(cmds.submit(timeout));
+                const ns: u64 = @intCast(t0.durationTo(std.Io.Clock.awake.now(clock)).toNanoseconds());
+                const us = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(o.reps)) / 1000.0;
+                const gbps = @as(f64, @floatFromInt(bytes)) * @as(f64, @floatFromInt(o.reps)) / @as(f64, @floatFromInt(ns));
+                std.debug.print("BENCH {s} n={d} k={d} count={d} us={d:.3} gbps={d:.2} mode={s}\n", .{ l.name, s.n, s.k, s.count, us, gbps, mode });
+                step_us[li * 2 + mi] += us * @as(f64, @floatFromInt(s.count)) / 1000.0;
             }
-            try vk.orExit(cmds.submit(timeout));
-            const t0 = std.Io.Clock.awake.now(clock);
-            for (0..o.reps) |_| {
-                try dispatchOne(&l, &cmds, &xbuf, &wbufs[c], &sbufs[c], &bbufs[c], &outbuf, &p, groups, timeout);
-                c = (c + 1) % copies;
-            }
-            try vk.orExit(cmds.submit(timeout));
-            const ns: u64 = @intCast(t0.durationTo(std.Io.Clock.awake.now(clock)).toNanoseconds());
-            const us = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(o.reps)) / 1000.0;
-            const gbps = @as(f64, @floatFromInt(bytes)) * @as(f64, @floatFromInt(o.reps)) / @as(f64, @floatFromInt(ns));
-            std.debug.print("BENCH {s} n={d} k={d} count={d} us={d:.3} gbps={d:.2}\n", .{ l.name, s.n, s.k, s.count, us, gbps });
-            step_us[li] += us * @as(f64, @floatFromInt(s.count)) / 1000.0;
+            l.pipe.barrier = true;
         }
     }
-    for (labels[0..label_count], 0..) |l, i| std.debug.print("STEP {s} step_ms={d:.3}\n", .{ l.name, step_us[i] });
+    const mode_count: usize = if (o.nobarrier) 2 else 1;
+    for (labels[0..label_count], 0..) |l, li| for (bench_modes[0..mode_count], 0..) |mode, mi| {
+        std.debug.print("STEP {s} mode={s} step_ms={d:.3}\n", .{ l.name, mode, step_us[li * 2 + mi] });
+    };
     return 0;
 }
 
