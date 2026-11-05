@@ -96,8 +96,7 @@ pub const Vulkan = struct {
         self.owner = stream;
     }
 
-    // Each 32-row call checks ids and capacity before reset; visible() tracks progress.
-    // max_rows is the lanes batched-step bound; this serial backend always steps one row (facts().batch_rows == 1).
+    // Each 32-row call checks ids and capacity before reset; max_rows is the lanes bound, this backend steps one row.
     fn prefillStepFn(ptr: *anyopaque, stream: *lanes.Stream, max_rows: u32) !bool {
         _ = max_rows;
         const self = cast(ptr);
