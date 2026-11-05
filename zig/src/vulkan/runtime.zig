@@ -14,6 +14,9 @@ pub const Error = error{
     Timeout,
     /// A submit or fence wait failed with the work's state unknown: the GPU may still use it; the caller exits.
     InFlight,
+    /// A post-wait fence reset failed and left the fence signaled: the command stream is poisoned,
+    /// every later submit refuses, and the caller exits at once.
+    FencePoisoned,
     DeviceLost,
     NoDevice,
     SoftwareDevice,
