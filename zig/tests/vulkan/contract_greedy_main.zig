@@ -10,7 +10,8 @@ const greedy_k = @import("contract_greedy.zig");
 const usage = "usage: tf-vulkan-greedy-contract [--vendor ID] [--timeout-ms MS] | --help\n" ++
     "  --help          show this text and exit without opening a loader or device\n" ++
     "  --vendor ID     refuse a device whose Vulkan vendorID differs (decimal or 0x hex; no default)\n" ++
-    "  --timeout-ms MS bound on every fence wait, 1 to 600000 (default 10000); a timeout ends the process\n";
+    "  --timeout-ms MS bound on every fence wait, 1 to 600000 (default 10000); a timeout ends the process\n" ++
+    "  patched build: fence-exit and discard guards; not the exact 2038 head\n";
 
 pub fn main(init: std.process.Init) !u8 {
     const a = init.gpa;
