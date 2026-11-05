@@ -52,6 +52,16 @@ pub const Commands = struct {
         self.* = undefined;
     }
 
+    /// Drops unsubmitted records without running them; call before freeing any buffer an open
+    /// command buffer may reference. Nothing recorded was ever submitted, so the fence is untouched.
+    pub fn discard(self: *Commands) void {
+        if (!self.recording) return;
+        _ = self.dev.api.vkResetCommandBuffer(self.cmd, 0);
+        self.recording = false;
+        self.pending = 0;
+        self.hazards.clear();
+    }
+
     /// The open command buffer; begun (and reset) only when nothing recorded earlier still waits for a submission.
     pub fn begin(self: *Commands) Error!c.VkCommandBuffer {
         if (self.recording) return self.cmd;
@@ -238,6 +248,27 @@ test "only a successful submit and a signalled fence let the caller free a submi
     try std.testing.expectError(error.InFlight, waited(c.VK_ERROR_OUT_OF_HOST_MEMORY));
     try std.testing.expectError(error.InFlight, waited(c.VK_ERROR_DEVICE_LOST));
     try std.testing.expectError(error.InFlight, waited(c.VK_NOT_READY));
+}
+
+test "discard drops the open command buffer's records and clears the batch state" {
+    const Calls = struct {
+        var resets: usize = 0;
+        fn reset(_: c.VkCommandBuffer, _: c.VkCommandBufferResetFlags) callconv(.c) c.VkResult {
+            resets += 1;
+            return c.VK_SUCCESS;
+        }
+    };
+    var api: DeviceApi = undefined;
+    api.vkResetCommandBuffer = Calls.reset;
+    var dev: Device = undefined;
+    dev.api = api;
+    var cmds: Commands = .{ .dev = &dev, .pool = undefined, .cmd = @ptrFromInt(0x1000), .fence = undefined, .recording = true, .pending = 7 };
+    cmds.discard();
+    try std.testing.expectEqual(@as(usize, 1), Calls.resets);
+    try std.testing.expectEqual(false, cmds.recording);
+    try std.testing.expectEqual(@as(u32, 0), cmds.pending);
+    cmds.discard(); // nothing recording: no second reset call
+    try std.testing.expectEqual(@as(usize, 1), Calls.resets);
 }
 
 test "fill geometry refuses torn, empty and out-of-range fills" {

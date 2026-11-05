@@ -8,6 +8,7 @@ const g = core.gates;
 const records = core.vulkan_records;
 
 pub fn main(init: std.process.Init) !u8 {
+    std.debug.print("BUILD patched: fence-exit and discard guards; not the exact 2038 head\n", .{});
     var rt = try vk.Runtime.open();
     defer rt.close();
     var dev = try vk.Device.open(&rt, .{ .features = .{ .storage16 = true } });
