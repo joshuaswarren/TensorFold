@@ -113,6 +113,9 @@ pub const Fixture = struct {
         f.reset();
     }
     fn reset(f: *Fixture) void {
+        // A hook error between a recorded dispatch and its submit leaves the buffer open:
+        // drop those records so the freed buffers below are never referenced by a later submit.
+        f.cmds.discard();
         while (f.made > 0) {
             f.made -= 1;
             f.buffers[f.made].deinit();
@@ -330,6 +333,8 @@ pub const Control = struct {
         f.reset();
     }
     fn reset(f: *Control) void {
+        // Same rule as the fixture reset: no freed buffer may stay referenced by open records.
+        f.cmds.discard();
         if (f.x_device) |*b| b.deinit();
         if (f.w_device) |*b| b.deinit();
         if (f.y_device) |*b| b.deinit();
