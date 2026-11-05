@@ -1,5 +1,6 @@
 //! One command buffer and fence on the device's queue, and staged uploads and readbacks through it.
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("vk");
 const runtime = @import("runtime.zig");
 const memory = @import("memory.zig");
@@ -20,6 +21,8 @@ pub const Commands = struct {
     pending: u32 = 0,
     /// Ranges the open command buffer's dispatches read or wrote since the last barrier; empty after a submission.
     hazards: Hazards = .{},
+    /// Set by a failed post-wait reset: the fence stays signaled, so every later submit refuses.
+    poisoned: bool = false,
 
     pub fn init(dev: *const Device) Error!Commands {
         const api = &dev.api;
@@ -88,6 +91,7 @@ pub const Commands = struct {
 
     /// Submits what is recorded (nothing if none); timeout_ns covers the whole batch; Timeout and InFlight need orExit.
     pub fn submit(self: *Commands, timeout_ns: u64) Error!void {
+        if (self.poisoned) return error.FencePoisoned;
         if (!self.recording) return;
         const api = &self.dev.api;
         try check(api.vkEndCommandBuffer(self.cmd));
@@ -108,7 +112,14 @@ pub const Commands = struct {
             std.log.err("vulkan: vkWaitForFences returned {d} within {d} ns of a submission", .{ waited_on, timeout_ns });
             return e;
         };
-        try check(api.vkResetFences(self.dev.handle, 1, &self.fence));
+        const reset_done = api.vkResetFences(self.dev.handle, 1, &self.fence);
+        if (reset_done != c.VK_SUCCESS) {
+            // The wait succeeded, so the fence stays signaled: resubmitting it is invalid usage.
+            // Poison the stream and classify the failure as terminal; orExit ends the process.
+            self.poisoned = true;
+            if (!builtin.is_test) std.log.err("vulkan: vkResetFences returned {d} after a signaled wait; the command stream is poisoned", .{reset_done});
+            return error.FencePoisoned;
+        }
     }
 };
 
@@ -134,6 +145,7 @@ pub fn orExit(result: anytype) @TypeOf(result) {
     _ = result catch |e| {
         if (e == error.Timeout) std.process.exit(124);
         if (e == error.InFlight) std.process.exit(1);
+        if (e == error.FencePoisoned) std.process.exit(1);
         return e;
     };
     return result;
@@ -309,6 +321,53 @@ test "a failed reset still clears the batch state, and reuse fails without recor
     try std.testing.expectEqual(@as(usize, 2), Calls.resets);
     try std.testing.expectEqual(@as(usize, 0), Calls.begins);
     try std.testing.expectEqual(false, cmds.recording);
+}
+
+test "a vkResetFences failure after a signaled wait poisons the stream terminally" {
+    const Calls = struct {
+        var ends: usize = 0;
+        var queues: usize = 0;
+        var waits: usize = 0;
+        var resets: usize = 0;
+        fn end(_: c.VkCommandBuffer) callconv(.c) c.VkResult {
+            ends += 1;
+            return c.VK_SUCCESS;
+        }
+        fn queueSubmit(_: c.VkQueue, _: c_uint, _: [*c]const c.VkSubmitInfo, _: c.VkFence) callconv(.c) c.VkResult {
+            queues += 1;
+            return c.VK_SUCCESS;
+        }
+        fn wait(_: c.VkDevice, _: c_uint, _: [*c]const c.VkFence, _: c.VkBool32, _: c_ulonglong) callconv(.c) c.VkResult {
+            waits += 1;
+            return c.VK_SUCCESS;
+        }
+        fn reset(_: c.VkDevice, _: c_uint, _: [*c]const c.VkFence) callconv(.c) c.VkResult {
+            resets += 1;
+            return c.VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+    };
+    var api: @import("device.zig").DeviceApi = undefined;
+    api.vkEndCommandBuffer = Calls.end;
+    api.vkQueueSubmit = Calls.queueSubmit;
+    api.vkWaitForFences = Calls.wait;
+    api.vkResetFences = Calls.reset;
+    var dev: Device = undefined;
+    dev.api = api;
+    dev.handle = @ptrFromInt(0x2000);
+    dev.queue = @ptrFromInt(0x3000);
+    var cmds: Commands = .{ .dev = &dev, .pool = undefined, .cmd = @ptrFromInt(0x1000), .fence = @ptrFromInt(0x4000), .recording = true, .pending = 3 };
+    std.testing.log_level = .err; // the poison path logs the reset failure, as it is meant to
+    defer std.testing.log_level = .warn;
+    // The wait succeeded, so the fence is signaled; the failed reset must not surface as an
+    // ordinary recoverable error, and no later submit may reuse the signaled fence.
+    try std.testing.expectError(error.FencePoisoned, cmds.submit(0));
+    try std.testing.expectEqual(@as(usize, 1), Calls.queues);
+    try std.testing.expectEqual(@as(usize, 1), Calls.waits);
+    try std.testing.expectEqual(@as(usize, 1), Calls.resets);
+    try std.testing.expectEqual(false, cmds.recording);
+    cmds.pending = 3; // pretend records arrived after the poisoning
+    try std.testing.expectError(error.FencePoisoned, cmds.submit(0));
+    try std.testing.expectEqual(@as(usize, 1), Calls.queues); // no second submission ever reached the queue
 }
 
 test "fill geometry refuses torn, empty and out-of-range fills" {
