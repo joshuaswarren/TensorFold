@@ -272,6 +272,38 @@ test "discard drops the open command buffer's records and clears the batch state
     try std.testing.expectEqual(@as(usize, 1), Calls.resets);
 }
 
+test "a failed host allocation before submit still drops the recorded batch through discard" {
+    const Calls = struct {
+        var resets: usize = 0;
+        var submits: usize = 0;
+        fn reset(_: c.VkCommandBuffer, _: c.VkCommandBufferResetFlags) callconv(.c) c.VkResult {
+            resets += 1;
+            return c.VK_SUCCESS;
+        }
+        fn submit(_: c.VkQueue, _: c_uint, _: [*c]const c.VkSubmitInfo, _: c.VkFence) callconv(.c) c.VkResult {
+            submits += 1;
+            return c.VK_SUCCESS;
+        }
+    };
+    var api: @import("device.zig").DeviceApi = undefined;
+    api.vkResetCommandBuffer = Calls.reset;
+    api.vkQueueSubmit = Calls.submit;
+    var dev: Device = undefined;
+    dev.api = api;
+    var cmds: Commands = .{ .dev = &dev, .pool = undefined, .cmd = @ptrFromInt(0x1000), .fence = undefined, .recording = true, .pending = 2 };
+    // Plant the failed allocation a contract hit between its recorded dispatch and the submit
+    // that drains it (the qmm fixture's staging alloc): the rig catches the error, and only a
+    // discard before its frees keeps the freed buffers unreferenced.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, failing.allocator().alloc(u8, 16));
+    cmds.discard();
+    try std.testing.expectEqual(false, cmds.recording);
+    try std.testing.expectEqual(@as(u32, 0), cmds.pending);
+    // The planted failure must never leave a queued dispatch behind on the freed buffers.
+    try cmds.submit(0);
+    try std.testing.expectEqual(@as(usize, 0), Calls.submits);
+}
+
 test "a failed reset still clears the batch state, and reuse fails without recording or submitting" {
     const Calls = struct {
         var resets: usize = 0;
