@@ -18,8 +18,9 @@ pub const Commands = struct {
     recording: bool = false,
     /// Dispatches in the open command buffer; Pipeline.run submits when it reaches half a batch.
     pending: u32 = 0,
-    /// Set by a failed post-wait reset: the fence stays signaled, so every later submit refuses.
-    poisoned: bool = false,
+    /// Set by a state-corrupting failure (signaled fence or invalid buffer): every later
+    /// begin and submit refuses with the stored terminal error.
+    poison: ?Error = null,
 
     pub fn init(dev: *const Device) Error!Commands {
         const api = &dev.api;
@@ -59,11 +60,11 @@ pub const Commands = struct {
         _ = self.dev.api.vkResetCommandBuffer(self.cmd, 0);
         self.recording = false;
         self.pending = 0;
-        self.hazards.clear();
     }
 
     /// The open command buffer; begun (and reset) only when nothing recorded earlier still waits for a submission.
     pub fn begin(self: *Commands) Error!c.VkCommandBuffer {
+        if (self.poison) |p| return p;
         if (self.recording) return self.cmd;
         try check(self.dev.api.vkResetCommandBuffer(self.cmd, 0));
         const info: c.VkCommandBufferBeginInfo = .{
@@ -77,10 +78,18 @@ pub const Commands = struct {
 
     /// Submits what is recorded (nothing if none); timeout_ns covers the whole batch; Timeout and InFlight need orExit.
     pub fn submit(self: *Commands, timeout_ns: u64) Error!void {
-        if (self.poisoned) return error.FencePoisoned;
+        if (self.poison) |p| return p;
         if (!self.recording) return;
         const api = &self.dev.api;
-        try check(api.vkEndCommandBuffer(self.cmd));
+        const ended = api.vkEndCommandBuffer(self.cmd);
+        if (ended != c.VK_SUCCESS) {
+            // The buffer is invalid after a failed end; a caught error must never reach a
+            // recording begin. Poison the stream; orExit ends the process.
+            self.poison = error.CommandBufferInvalid;
+            self.recording = false;
+            if (!builtin.is_test) std.log.err("vulkan: vkEndCommandBuffer returned {d}; the command stream is poisoned", .{ended});
+            return error.CommandBufferInvalid;
+        }
         self.recording = false;
         self.pending = 0;
         const info: c.VkSubmitInfo = .{
@@ -102,7 +111,7 @@ pub const Commands = struct {
         if (reset_done != c.VK_SUCCESS) {
             // The wait succeeded, so the fence stays signaled: resubmitting it is invalid usage.
             // Poison the stream and classify the failure as terminal; orExit ends the process.
-            self.poisoned = true;
+            self.poison = error.FencePoisoned;
             if (!builtin.is_test) std.log.err("vulkan: vkResetFences returned {d} after a signaled wait; the command stream is poisoned", .{reset_done});
             return error.FencePoisoned;
         }
@@ -132,6 +141,7 @@ pub fn orExit(result: anytype) @TypeOf(result) {
         if (e == error.Timeout) std.process.exit(124);
         if (e == error.InFlight) std.process.exit(1);
         if (e == error.FencePoisoned) std.process.exit(1);
+        if (e == error.CommandBufferInvalid) std.process.exit(1);
         return e;
     };
     return result;
@@ -347,6 +357,49 @@ test "a vkResetFences failure after a signaled wait poisons the stream terminall
     cmds.pending = 3; // pretend records arrived after the poisoning
     try std.testing.expectError(error.FencePoisoned, cmds.submit(0));
     try std.testing.expectEqual(@as(usize, 1), Calls.queues); // no second submission ever reached the queue
+}
+
+test "a failed vkEndCommandBuffer poisons the stream: a caught error cannot reach a recording begin" {
+    const Calls = struct {
+        var ends: usize = 0;
+        var begins: usize = 0;
+        var queues: usize = 0;
+        fn end(_: c.VkCommandBuffer) callconv(.c) c.VkResult {
+            ends += 1;
+            return c.VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        fn begin(_: c.VkCommandBuffer, _: [*c]const c.VkCommandBufferBeginInfo) callconv(.c) c.VkResult {
+            begins += 1;
+            return c.VK_SUCCESS;
+        }
+        fn queueSubmit(_: c.VkQueue, _: c_uint, _: [*c]const c.VkSubmitInfo, _: c.VkFence) callconv(.c) c.VkResult {
+            queues += 1;
+            return c.VK_SUCCESS;
+        }
+    };
+    var api: @import("device.zig").DeviceApi = undefined;
+    api.vkEndCommandBuffer = Calls.end;
+    api.vkBeginCommandBuffer = Calls.begin;
+    api.vkQueueSubmit = Calls.queueSubmit;
+    var dev: Device = undefined;
+    dev.api = api;
+    dev.handle = @ptrFromInt(0x2000);
+    dev.queue = @ptrFromInt(0x3000);
+    var cmds: Commands = .{ .dev = &dev, .pool = undefined, .cmd = @ptrFromInt(0x1000), .fence = @ptrFromInt(0x4000), .recording = true, .pending = 5 };
+    std.testing.log_level = .err; // the poison path logs the end failure, as it is meant to
+    defer std.testing.log_level = .warn;
+    // A gate wrapper catches this error and continues; the buffer's state is invalid and
+    // must never be handed out again.
+    try std.testing.expectError(error.CommandBufferInvalid, cmds.submit(0));
+    try std.testing.expectEqual(@as(usize, 1), Calls.ends);
+    try std.testing.expectEqual(@as(usize, 0), Calls.queues);
+    try std.testing.expectEqual(false, cmds.recording);
+    // The caught-and-continued path: begin must refuse, not return the invalid open buffer.
+    try std.testing.expectError(error.CommandBufferInvalid, cmds.begin());
+    try std.testing.expectEqual(@as(usize, 0), Calls.begins);
+    // And submit refuses without queueing the poisoned records.
+    try std.testing.expectError(error.CommandBufferInvalid, cmds.submit(0));
+    try std.testing.expectEqual(@as(usize, 0), Calls.queues);
 }
 
 test "fill geometry refuses torn, empty and out-of-range fills" {
