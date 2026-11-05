@@ -17,6 +17,9 @@ pub const Error = error{
     /// A post-wait fence reset failed and left the fence signaled: the command stream is poisoned,
     /// every later submit refuses, and the caller exits at once.
     FencePoisoned,
+    /// A command-buffer end failed and left the buffer invalid: the stream is poisoned, begin and
+    /// submit refuse, and the caller exits at once.
+    CommandBufferInvalid,
     DeviceLost,
     NoDevice,
     SoftwareDevice,
