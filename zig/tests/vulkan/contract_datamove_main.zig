@@ -12,7 +12,8 @@ const seed: u64 = 0xda7a;
 const usage = "usage: tf-stage1-datamove [--vendor ID] [--timeout-ms MS] | --help\n" ++
     "  --help          show this text and exit without opening a loader or device\n" ++
     "  --vendor ID     refuse a device whose Vulkan vendorID differs (decimal or 0x hex; no default)\n" ++
-    "  --timeout-ms MS bound on every submission and transfer, 1 to 600000 (default 10000)\n";
+    "  --timeout-ms MS bound on every submission and transfer, 1 to 600000 (default 10000)\n" ++
+    "  patched build: fence-exit guard (vk.orExit) on every GPU call; not the exact 2038 head\n";
 
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
