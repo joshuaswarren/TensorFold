@@ -258,7 +258,7 @@ test "discard drops the open command buffer's records and clears the batch state
             return c.VK_SUCCESS;
         }
     };
-    var api: DeviceApi = undefined;
+    var api: @import("device.zig").DeviceApi = undefined;
     api.vkResetCommandBuffer = Calls.reset;
     var dev: Device = undefined;
     dev.api = api;
@@ -269,6 +269,46 @@ test "discard drops the open command buffer's records and clears the batch state
     try std.testing.expectEqual(@as(u32, 0), cmds.pending);
     cmds.discard(); // nothing recording: no second reset call
     try std.testing.expectEqual(@as(usize, 1), Calls.resets);
+}
+
+test "a failed reset still clears the batch state, and reuse fails without recording or submitting" {
+    const Calls = struct {
+        var resets: usize = 0;
+        var begins: usize = 0;
+        var submits: usize = 0;
+        fn reset(_: c.VkCommandBuffer, _: c.VkCommandBufferResetFlags) callconv(.c) c.VkResult {
+            resets += 1;
+            return c.VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        fn begin(_: c.VkCommandBuffer, _: [*c]const c.VkCommandBufferBeginInfo) callconv(.c) c.VkResult {
+            begins += 1;
+            return c.VK_SUCCESS;
+        }
+        fn submit(_: c.VkQueue, _: c_uint, _: [*c]const c.VkSubmitInfo, _: c.VkFence) callconv(.c) c.VkResult {
+            submits += 1;
+            return c.VK_SUCCESS;
+        }
+    };
+    var api: @import("device.zig").DeviceApi = undefined;
+    api.vkResetCommandBuffer = Calls.reset;
+    api.vkBeginCommandBuffer = Calls.begin;
+    api.vkQueueSubmit = Calls.submit;
+    var dev: Device = undefined;
+    dev.api = api;
+    var cmds: Commands = .{ .dev = &dev, .pool = undefined, .cmd = @ptrFromInt(0x1000), .fence = undefined, .recording = true, .pending = 7 };
+    // Discard ignores the reset result on purpose: nothing recorded was ever submitted.
+    cmds.discard();
+    try std.testing.expectEqual(@as(usize, 1), Calls.resets);
+    try std.testing.expectEqual(false, cmds.recording);
+    try std.testing.expectEqual(@as(u32, 0), cmds.pending);
+    // Reuse is fenced: submit is a no-op while nothing is recording, and begin's checked
+    // reset fails before any record, so stale records cannot reach the queue.
+    try cmds.submit(0);
+    try std.testing.expectEqual(@as(usize, 0), Calls.submits);
+    try std.testing.expectError(error.OutOfMemory, cmds.begin());
+    try std.testing.expectEqual(@as(usize, 2), Calls.resets);
+    try std.testing.expectEqual(@as(usize, 0), Calls.begins);
+    try std.testing.expectEqual(false, cmds.recording);
 }
 
 test "fill geometry refuses torn, empty and out-of-range fills" {
