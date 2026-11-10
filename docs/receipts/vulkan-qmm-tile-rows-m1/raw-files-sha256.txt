@@ -17,6 +17,7 @@
 25b8ef4ece4527e651c76edf0b3f51fdd5c7ec864cf11d82f3d93229bf9d7848  pair-rows8-document256/log--pr3-old.err
 25d4d75a9e31a84d36f98bf915259555da69b392d1a2ed2d1ba5d43b16c245ea  pair-rows8-document1024/out/document-1024--p1-free/result.json
 25f8ad34d5b6fdfe784392b2cf42f9d66e916e147152d3dc3725ce27a6a168b3  pair-rows8-document256/log--pr0-old.err
+28331a2fa7c5d9e7970cf446e8cea8c2ffaa56482352fa0180d18f0048d45b74  contract-m1/run.err
 28e032f04664bf4cc0e7b8f37a44553796c7fa40782de737f4f2d39a240a06b0  pair-rows8-document256/log--pr4-old.err
 2b0cdb77019bd86c876c0f09dab605b417cd71d1ccb17e6b5f2fc56fe7a36d65  pair-unicode24/out/unicode-24--p3-free/result.json
 2e5a001edabb85dc9a878819efd2a0330d528c6141fa9792cc9f165fcf881d84  pair-unicode24/out/unicode-24--p1-free/result.json
@@ -31,7 +32,6 @@
 3db7855a1f51d869632f65acdb6ae8fed459690084356681bf8486a2d78f08e5  pair-document1024/out/document-1024--p2-free/result.json
 3f0aef2865283b237f8bbb36d6b1d78e965004bc977fb7f352edf2393ce5e423  pair-rows8-document1024/out/document-1024--p5-free/result.json
 3f0d0c12aa68ff8e2e6c45e0b698c6428270431b30565480ec6eed50e3f1f8de  pair-rows8-document1024/log--pr0-old.err
-4119009bcc1c72b4a4b40d23feb6554aed33640c21b98ddf2b7f77c21d7d8d5a  contract-m1/env.txt
 4206f434d3784201d946ed6d1bffd3fe75254da65937f1d7d8e689d256799beb  pair-rows8u-document1024/log--pr2-new.err
 44c76ea7929d5908e4c3d1a50c94c73824cf21393a17d8183f4755c971bbecfb  pair-rows8-document1024/out/document-1024--p4-free/result.json
 46f171029a14ae983bcdd2afbdb94fd4b747185b60be4954dcb9417c26ea4fbf  pair-unicode24/log--pr1-new.err
@@ -61,7 +61,6 @@
 682872042a3ba22be0abae4761f9b87a394646f43297041700c90d85fc5035e2  pair-unicode24/timing.tsv
 69b1f6769a9656ae73dc57388cbed4dbcd970a7604beb0baf17ed763ca79d8f8  pair-rows4-document1024/log--pr3-old.err
 6aa7f2577861a59e91c38a2ced881daad5888b2cbcf624b38e3c5c467cdca1a1  pair-unicode24/out/unicode-24--p4-free/result.json
-6b173b855c144248f0b784bd6e386d09c5b082951cd183ae0cbfb476166b0bcb  contract-m1/run.err
 6c9ad9d5e469990d6ffc96ba0d67a61697a45dd16bdb91a4eeb9311a8ba854c2  pair-document1024/out/document-1024--p5-free/result.json
 71e4cce381864a6dbae7c65ae23c07a8078a222fc28f4b1f9af20d41c95d410f  pair-rows8-document1024/timing.tsv
 734301e8049ea68cea6f2fbf8d1c32c0f92b4d3e8722d8090787a081b95f9daa  pair-rows4-document1024/timing.tsv
@@ -84,7 +83,6 @@
 954b4f841c7aef72a374b10dbc2ec69c985c075cbcc9dd48ab99e62ca72e2f72  id-m1/run.err
 97330c44c6a356541499a6cb03c6e590b900f2aa50c0d34b61843263cf34ba63  pair-document1024/out/document-1024--p1-free/result.json
 9755a4c64ad8e4f00cbd1e366855e2f7263ff0de8c17821ef10b1ad1d17117f4  pair-rows8-document256/result.json
-9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa  contract-m1/run.rc
 9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa  id-m1/run.rc
 9a645b89555f8198ed2dc6a3164661308ede8d38de98ca2add2b958f5f606dfd  pair-document256/timing.tsv
 9ba60143a6d616fe30f212c25f0841f3c8515783e8dd067dc07859d3624c2c8c  pair-rows8-document1024/result.json
@@ -113,7 +111,6 @@ df726f4342ec8c3dc119664b764891af4be7f51a7cf96617a388e6fce5c29758  pair-rows8u-do
 e1305fe5d97d331c4fe4b074f730876d77084bd799c934916947b87b81c33caa  pair-rows4-document256/out/document-256--p0-free/result.json
 e17cd156b0263bbd06e8ecebdf9b3719add8d79bf22ee74444c2a1422d9b74cd  pair-unicode24/result.json
 e2f3c49af0468aae7d3ef5a1d91995bc7d59012003b115138d597e0ee76f9178  pair-rows8u-document256/log--pr1-new.err
-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  contract-m1/run.out
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  id-m1/run.out
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  pair-document1024/log--pr0-old.out
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  pair-document1024/log--pr1-new.out
@@ -175,10 +172,10 @@ ea638bf61ca480b6aa1c3cd6f86b8ba370ca02242220670bb7aac4b1693a873d  pair-rows4-doc
 ee8a3c0f865ac2e50f41a413aa1516d97b5490bea3b326902a25415f54c32eab  pair-document256/out/document-256--p1-free/result.json
 f0d4a91acc1cd370ccdd25b96626511037fa8dbb366464272e4db2da20f79a87  pair-rows4-document256/log--pr1-new.err
 f104b1c5c94c64a6ccf5e6bd0f9a5d23ae65d3c0431e9f2cd738bbfaf9c91d3f  pair-rows8-document256/out/document-256--p4-free/result.json
+f2e10d0dd5ebecd7f3d3464bc5f9b853343b024255782c189d3ffca9605a40e8  contract-m1/env.txt
 f33e176cf06c55d3ffacf8fce31d453e9d6c1c4b688d4d87b6b7869a1d482887  pair-document1024/out/document-1024--p0-free/result.json
 f4bcadbae94bc0197226e7d7957cd3fbdc61f44c3c706ddaa122ef5893b3a948  pair-rows4-document256/log--pr2-new.err
 f54529df056466ac2a35290021e34cb83db6c80102b76a3d41b8ff2dc7ed8b48  pair-rows8u-document256/out/document-256--p4-free/result.json
-f718bb5143ff5eeb0b6f1cd4256dca3d63e3a96ee2c811ad7cd51f4afafb6108  contract-m1/SHA256SUMS
 f7f67bf2c74881dcc0695640a840d48b6ff61fa5e94153652a3e308422a92381  pair-rows8u-document1024/out/document-1024--p1-free/result.json
 f8e1255acd6adc4eae56b9eb5c06858ee531fe2780bc7795c0444109f0bb2dee  pair-rows8u-document256/out/document-256--p3-free/result.json
 f9811982899c25f862bb3fbc3832e317cca76fecc124b3eb7125d2d1b9c3596e  pair-rows4-document256/timing.tsv
