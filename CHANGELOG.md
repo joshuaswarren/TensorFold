@@ -8,6 +8,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 - The Vulkan engine reads Qwen3.5's 4-bit projection weights and activations 16 bytes at a time (`qmm_q4_vec4`) when both are 16-byte aligned, and keeps the scalar kernel otherwise. Each output keeps the same sum in the same order, so the logits are byte-identical. On a 13-inch M1 with Qwen3.5-2B 4-bit, a run (prefill, 63 decode steps and the per-step logits readback) took 40% to 52% less time on three inputs: a 24-token prompt, and documents of 256 and 1,024 tokens. The kernel contract checks the new kernel with the same gates as `qmm_bf16`. Receipts: [docs/receipts/vulkan-qmm-vec4-m1](docs/receipts/vulkan-qmm-vec4-m1/README.md).
 
+- The Vulkan engine stores each Qwen3.5 4-bit projection in tiles of 32 columns, repacked once at load, and reads them with `qmm_q4_tile`: a group of 32 lanes then loads one contiguous 512-byte run instead of 32 rows a kilobyte apart. The loop, the sums and their order are `qmm_q4_vec4`'s, so the logits are byte-identical. A projection is padded to whole tiles, and the tied output head is a second, tiled copy of the embedding table (about 320 MB more device memory). On a 13-inch M1 with Qwen3.5-2B 4-bit, a run took 19% less time than with `qmm_q4_vec4` on a 24-token prompt, 50% less on a 256-token document and 63% less on a 1,024-token document. The kernel contract checks `qmm_q4_tile` with the same gates as `qmm_bf16`. Receipts: [docs/receipts/vulkan-qmm-tile-m1](docs/receipts/vulkan-qmm-tile-m1/README.md).
+
 
 ## 1.2.7
 
