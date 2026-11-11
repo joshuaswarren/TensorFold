@@ -2,6 +2,13 @@
 
 Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
 
+## Unreleased
+
+- Vulkan: the native dense Qwen3.5-2B greedy engine and its operator gates, the second part of the opt-in Vulkan backend built only with `-Dvulkan=true`: checked BF16 tensor operations, the norm/MLP, attention (RoPE, causal GQA SDPA, output gate) and GatedDeltaNet gates, one GDN path for prefill and decode, prefill chunked within the context ceiling, and the kernel contract extended to every operator's SPIR-V through gates 1 to 4 with planted controls and recorded device findings (residual denormals, the preserve-add subnormal flush, the gated norm at the production per-head geometry). `zig build vulkan-kernel-contract -Dvulkan=true` runs it; default builds are unchanged (#1544). Thanks to @joshuaswarren.
+
+- The Vulkan engine reads Qwen3.5's 4-bit projection weights and activations 16 bytes at a time (`qmm_q4_vec4`) when both are 16-byte aligned, and keeps the scalar kernel otherwise. Each output keeps the same sum in the same order, so the logits are byte-identical. On a 13-inch M1 with Qwen3.5-2B 4-bit, a run (prefill, 63 decode steps and the per-step logits readback) took 40% to 52% less time on three inputs: a 24-token prompt, and documents of 256 and 1,024 tokens. The kernel contract checks the new kernel with the same gates as `qmm_bf16`. Receipts: [docs/receipts/vulkan-qmm-vec4-m1](docs/receipts/vulkan-qmm-vec4-m1/README.md).
+
+
 ## 1.2.7
 
 - GLM-5.3-Flash on CUDA: with `TF_GLM_LAYERS=N`, serve's start-up memory check counts the weights by tensor from the shard headers, only those the load reads (the first N layers, the MTP layer when drafts are on, the embedding, norm and head), where it counted every checkpoint file. A 20-layer thin load of the 163.6 GiB checkpoint now counts 66.6 GiB without drafts. Unset, the count is the files' as before (#2788, fixes #2745). Thanks to @wojo.
