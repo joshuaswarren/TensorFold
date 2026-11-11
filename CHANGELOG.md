@@ -10,6 +10,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 - The Vulkan engine stores each Qwen3.5 4-bit projection in tiles of 32 columns, repacked once at load, and reads them with `qmm_q4_tile`: a group of 32 lanes then loads one contiguous 512-byte run instead of 32 rows a kilobyte apart. The loop, the sums and their order are `qmm_q4_vec4`'s, so the logits are byte-identical. A projection is padded to whole tiles, and the tied output head is a second, tiled copy of the embedding table (about 320 MB more device memory). On a 13-inch M1 with Qwen3.5-2B 4-bit, a run took 19% less time than with `qmm_q4_vec4` on a 24-token prompt, 50% less on a 256-token document and 63% less on a 1,024-token document. The kernel contract checks `qmm_q4_tile` with the same gates as `qmm_bf16`. Receipts: [docs/receipts/vulkan-qmm-tile-m1](docs/receipts/vulkan-qmm-tile-m1/README.md).
 
+- The Vulkan engine records its dispatches into one command buffer and submits when 128 are waiting, or when the next upload, download or fill needs the queue, instead of one submission and fence wait per dispatch. Each pipeline holds a ring of 256 descriptor sets. No kernel changes, so the logits are byte-identical. On a 13-inch M1 with Qwen3.5-2B 4-bit and tiled projections, a run took 68% less time on a 24-token prompt, 49% less on a 256-token document and 30% less on a 1,024-token document. Receipts: [docs/receipts/vulkan-submit-batch-m1](docs/receipts/vulkan-submit-batch-m1/README.md).
+
 
 ## 1.2.7
 
@@ -919,10 +921,6 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 - Docs: the cache benchmark receipts say which tool-call content they count (#1999). Thanks to @garvrao80.
 
 - `zig build test-info-config` runs info's issue-934 test again: it was built from the CUDA CLI root, which never reached it (#2006). Thanks to @jishnuvenugopal.
-
-- The Vulkan engine records its dispatches into one command buffer and submits when 128 are waiting, or when the next upload, download or fill needs the queue, instead of one submission and fence wait per dispatch. Each pipeline holds a ring of 256 descriptor sets. No kernel changes, so the logits are byte-identical. On a 13-inch M1 with Qwen3.5-2B 4-bit and tiled projections, a run took 68% less time on a 24-token prompt, 49% less on a 256-token document and 30% less on a 1,024-token document. Receipts: [docs/receipts/vulkan-submit-batch-m1](docs/receipts/vulkan-submit-batch-m1/README.md).
-
-- The Nemotron XPU loader and the XPU safetensors reader read shard headers through core, so a malformed or oversized header is refused before anything is read (#1919). Thanks to @jschmied.
 
 - Windows: a cost-cache read that lands mid-replace is counted as a miss (safe: the window is priced again), so its concurrency test no longer flakes (#2001).
 
