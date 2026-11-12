@@ -82,6 +82,7 @@ fn bundle() fam.engine.ShaderBundle {
             .qmm_f32 = &sh.qmm_f32,
             .qmm_q4_tile = &sh.qmm_q4_tile,
             .qmm_q4_tile_rows = &sh.qmm_q4_tile_rows,
+            .qmm_q4_tile_f32 = &sh.qmm_q4_tile_f32,
             .dequant_bf16 = &sh.dequant_bf16,
             .gather_u32 = &sh.gather_u32,
             .gather_u16 = &sh.gather_u16,
