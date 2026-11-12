@@ -498,6 +498,9 @@ pub fn kernelContract(ctx: *Context) void {
     const qmm_tile_rows_cmd = b.addSystemCommand(&.{ ctx.glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-o" });
     const qmm_tile_rows = qmm_tile_rows_cmd.addOutputFileArg("qmm_q4_tile_rows.spv");
     qmm_tile_rows_cmd.addFileArg(b.path("zig/kernels/vulkan/qmm_q4_tile_rows.comp"));
+    const qmm_tile_f32_cmd = b.addSystemCommand(&.{ ctx.glslang, "-V", "--target-env", "vulkan1.2", "-S", "comp", "-DACT_F32=1", "-o" });
+    const qmm_tile_f32 = qmm_tile_f32_cmd.addOutputFileArg("qmm_q4_tile_f32.spv");
+    qmm_tile_f32_cmd.addFileArg(b.path("zig/kernels/vulkan/qmm_q4_tile.comp"));
     const variants = .{
         .{ "qmm_fmax", "-DTF_CTL_QMM_FMAX=1" },
         .{ "atomic_sum", "-DTF_CTL_ATOMIC_SUM=1" },
@@ -520,6 +523,7 @@ pub fn kernelContract(ctx: *Context) void {
     _ = contract_files.addCopyFile(qmm_vec4, "qmm_q4_vec4.spv");
     _ = contract_files.addCopyFile(qmm_tile, "qmm_q4_tile.spv");
     _ = contract_files.addCopyFile(qmm_tile_rows, "qmm_q4_tile_rows.spv");
+    _ = contract_files.addCopyFile(qmm_tile_f32, "qmm_q4_tile_f32.spv");
     inline for (variants, 0..) |variant, i| {
         _ = contract_files.addCopyFile(controls[i], variant[0] ++ ".spv");
     }
@@ -527,6 +531,7 @@ pub fn kernelContract(ctx: *Context) void {
         "pub const qmm_q4_vec4 align(4) = @embedFile(\"qmm_q4_vec4.spv\").*;\n" ++
         "pub const qmm_q4_tile align(4) = @embedFile(\"qmm_q4_tile.spv\").*;\n" ++
         "pub const qmm_q4_tile_rows align(4) = @embedFile(\"qmm_q4_tile_rows.spv\").*;\n" ++
+        "pub const qmm_q4_tile_f32 align(4) = @embedFile(\"qmm_q4_tile_f32.spv\").*;\n" ++
         "pub const qmm_fmax align(4) = @embedFile(\"qmm_fmax.spv\").*;\n" ++
         "pub const atomic_sum align(4) = @embedFile(\"atomic_sum.spv\").*;\n" ++
         "pub const scribble_sum align(4) = @embedFile(\"scribble_sum.spv\").*;\n" ++
