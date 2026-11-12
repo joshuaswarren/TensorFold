@@ -4,7 +4,7 @@ Qwen3.5-2B 4-bit, 64 greedy steps, two runs per process. Old build is the batche
 The kernel computes four rows of x and two columns (16 apart in a 32-column tile) a thread. Each case ran three old and three new processes, interleaved in both orders.
 Run 2 is the prefill plus 63 decode steps plus the per-step logits readback.
 
-Two runs of the same comparison are below. The second one is the current stack after the rebase onto main, on a newer kernel and the Honeykrisp build packaged with omarchy-mlx-vulkan 0.7.40. Both arms are slower there than in the first run, and the gain is smaller.
+Two runs of the same comparison are below. The second one is the current stack after the rebase onto main. It differs from the first in three things: the two builds (the first run's ELFs were smaller, 5.79 and 5.81 MB against 6.33 and 6.36 MB, and each process peaked at 0.3 GB resident against 1.5 GB), the kernel, and the Honeykrisp build (the one packaged with omarchy-mlx-vulkan 0.7.40). Both arms are slower in the second run, and the gain is smaller. Which of the three causes the slowdown has not been measured.
 
 Rerun, Linux 7.3.0-2-20261110.1-lab-ARCH, old build = #2016 head (`0cd105e10`, ELF sha256 `b441aa55...`), new build = #2017 head (`e496c6880`, ELF sha256 `05f07f45...`). Raw timing tables: `rerun-linux-7.3.0/`.
 
