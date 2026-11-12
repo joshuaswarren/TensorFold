@@ -1,8 +1,22 @@
 # qmm_q4_tile_rows receipts, Apple M1 (13-inch)
 
-Qwen3.5-2B 4-bit, 64 greedy steps, two runs per process. Old build is the batched-submission build (`b7770d64`), new build has `qmm_q4_tile_rows` (`9eef5a52`).
+Qwen3.5-2B 4-bit, 64 greedy steps, two runs per process. Old build is the batched-submission build, new build has `qmm_q4_tile_rows`.
 The kernel computes four rows of x and two columns (16 apart in a 32-column tile) a thread. Each case ran three old and three new processes, interleaved in both orders.
 Run 2 is the prefill plus 63 decode steps plus the per-step logits readback.
+
+Two runs of the same comparison are below. The second one is the current stack after the rebase onto main, on a newer kernel and the Honeykrisp build packaged with omarchy-mlx-vulkan 0.7.40. Both arms are slower there than in the first run, and the gain is smaller.
+
+Rerun, Linux 7.3.0-2-20261110.1-lab-ARCH, old build = #2016 head (`0cd105e10`, ELF sha256 `b441aa55...`), new build = #2017 head (`e496c6880`, ELF sha256 `05f07f45...`). Raw timing tables: `rerun-linux-7.3.0/`.
+
+| Case | Old run 2 (median) | New run 2 (median) | Gain: median (pair range) | Logits digest, all six processes |
+|---|---:|---:|---|---|
+| unicode-24 | 3.4 s | 3.3 s | 3.8% (3.7 to 4.1) | `e946185d64ae` |
+| document-256 | 9.9 s | 8.7 s | 11.9% (11.9 to 12.4) | `3188aaae7d11` |
+| document-1024 | 32.3 s | 27.5 s | 14.8% (14.8 to 15.0) | `82c353787e89` |
+
+All six digests in each case are equal and equal the declared reference for that input. They differ from the first run's digests below, so the two runs are not comparable bit for bit.
+
+First run, Linux 7.1.12-2-20261013.18-sep-ARCH, Mesa 26.3.0-devel (git-9323171c12), old build `b7770d64`, new build `9eef5a52`:
 
 | Case | Old run 2 (median) | New run 2 (median) | Gain: median (pair range) | Logits digest, all six processes |
 |---|---:|---:|---|---|
@@ -32,4 +46,4 @@ Files:
 - `raw-files-sha256.txt` lists the SHA-256 of every raw run file the summary was generated from.
 
 Byte identity: each process writes the SHA-256 of its full logits stream. A case passes only if all six digests are equal and the ids match the pinned ids.
-The digests equal the ones the scalar, vec4, tile and batched builds gave on the same inputs.
+The first run's digests equal the ones the scalar, vec4, tile and batched builds gave on the same inputs.
