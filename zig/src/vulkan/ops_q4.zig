@@ -91,7 +91,7 @@ pub fn project(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scales: Vi
     return projectAs(o, null, cmds, out, x, w, scales, biases, k, scratch, timeout_ns);
 }
 
-/// The tiled images read and store packed bf16, or f32 for both x and out (the wide layers); qmm_q4_tile_rows is bf16 only.
+/// The tiled images take bf16, or f32 for both x and out; qmm_q4_tile_rows is bf16 only.
 pub fn tiledActivation(out: View, x: View) Error!void {
     if (out.kind != x.kind or (x.kind != .bf16 and x.kind != .f32)) return error.Invalid;
 }
