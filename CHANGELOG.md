@@ -2049,6 +2049,9 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## 1.2.2
 
+- The Nemotron XPU loader and the XPU safetensors reader read shard headers through core, so a malformed or oversized header is refused before anything is read (#1919). Thanks to @jschmied.
+
+
 - CUDA lanes: Gemma 4, MiniMax M3, Kolibri-1, Spark 2.5 and Dory can verify root and context copies as Nemotron does, opt-in: set `TF_GEMMA4_COPIES`, `TF_MINIMAX_COPIES`, `TF_KOLIBRI_COPIES`, `TF_SPARK_COPIES` or `TF_DORY_COPIES` to 1. Replies equal `"draft": false`, and unset is the old policy (#2022, part of #1910).
 
 - The dense Qwen3.5 Metal loader takes its shape from the checkpoint's config rather than the 27B's fixed geometry, checked against the 27B, 9B and 2B with identical tokens (#1817).
