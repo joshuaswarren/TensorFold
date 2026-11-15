@@ -7,6 +7,7 @@ const memory = @import("memory.zig");
 const Device = @import("device.zig").Device;
 const Buffer = memory.Buffer;
 const Hazards = @import("hazard.zig").Hazards;
+const dispatch = @import("dispatch.zig");
 const Error = runtime.Error;
 const check = runtime.check;
 
@@ -77,6 +78,7 @@ pub const Commands = struct {
             .flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         };
         try check(self.dev.api.vkBeginCommandBuffer(self.cmd, &info));
+        if (dispatch.timing) |t| try t.batchBegin(self.cmd); // pool reset + stamp 0: the window's anchor
         if (self.submitted_before) dispatchBarrier(self.dev, self.cmd);
         self.recording = true;
         return self.cmd;
@@ -127,6 +129,7 @@ pub const Commands = struct {
             self.poison = e;
             return e;
         };
+        if (dispatch.timing) |t| try t.collect(); // after the fence: stamps are final, fold the deltas
         const reset_done = api.vkResetFences(self.dev.handle, 1, &self.fence);
         if (reset_done != c.VK_SUCCESS) {
             // The fence stays signaled after a good wait: poison the stream; orExit ends the process.

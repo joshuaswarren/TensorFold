@@ -28,6 +28,10 @@ pub const Error = error{
     TooLarge,
     NotMapped,
     Invalid,
+    /// The timing instrument's bounded stamp or tally table is full: the run refuses instead of dropping kernels.
+    TimingOverflow,
+    /// The queue family cannot timestamp or the tick length is unknown: the instrument refuses.
+    TimestampUnsupported,
 };
 
 /// The C function pointer behind a `PFN_vk*` typedef.

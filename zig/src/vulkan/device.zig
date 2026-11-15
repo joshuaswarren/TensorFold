@@ -50,6 +50,11 @@ pub const DeviceApi = struct {
     vkDestroyDescriptorPool: Fn(c.PFN_vkDestroyDescriptorPool),
     vkAllocateDescriptorSets: Fn(c.PFN_vkAllocateDescriptorSets),
     vkUpdateDescriptorSets: Fn(c.PFN_vkUpdateDescriptorSets),
+    vkCreateQueryPool: Fn(c.PFN_vkCreateQueryPool),
+    vkDestroyQueryPool: Fn(c.PFN_vkDestroyQueryPool),
+    vkCmdResetQueryPool: Fn(c.PFN_vkCmdResetQueryPool),
+    vkCmdWriteTimestamp: Fn(c.PFN_vkCmdWriteTimestamp),
+    vkGetQueryPoolResults: Fn(c.PFN_vkGetQueryPoolResults),
 };
 
 /// Optional shader features a caller's kernels use; each is one Vulkan feature bit in `feature_bits`.
