@@ -357,6 +357,19 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer engine.deinit();
     std.debug.print("MILESTONE engine-ready elapsed_ms={d} capacity={d} model_context={d} logits_bytes={d}\n", .{ clock.ms(), engine.capacity(), engine.modelContext(), engine.logitsLen() });
+
+    // TF_VK_KTIME=1 opts into per-dispatch GPU timestamps for the prefill and
+    // the steady decode window of both runs; anything that refuses is named
+    // and the run continues uninstrumented. The destroy defer registered here
+    // runs before engine.deinit's, so the pool dies while the device lives.
+    var kt: ?*q35v.vk.dispatch.Timing = null;
+    if (std.c.getenv("TF_VK_KTIME")) |v| if (std.mem.eql(u8, std.mem.span(v), "1")) {
+        kt = q35v.vk.dispatch.Timing.create(a, engine.dev) catch |err| blk: {
+            std.debug.print("KTIME refused: {s}\n", .{@errorName(err)});
+            break :blk null;
+        };
+    };
+    defer if (kt) |t| t.destroy(a);
     if (opts.vendor) |want| if (engine.vendorId() != want) {
         std.debug.print("FAIL device: vendor 0x{x:0>4} is not the requested 0x{x:0>4}\n", .{ engine.vendorId(), want });
         return 1;
@@ -371,14 +384,18 @@ pub fn main(init: std.process.Init) !u8 {
     defer a.free(ids_a);
     const ids_b = try a.alloc(u32, expected.len);
     defer a.free(ids_b);
+    const samples_a = try a.alloc(SteadySample, expected.len - 1);
+    defer a.free(samples_a);
+    const samples_b = try a.alloc(SteadySample, expected.len - 1);
+    defer a.free(samples_b);
 
-    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_a, rows_a, row_len) catch |e| {
+    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_a, rows_a, row_len, samples_a, io, a, "run_a", kt) catch |e| {
         std.debug.print("FAIL run1: {s}\n", .{@errorName(e)});
         return 1;
     };
     std.debug.print("MILESTONE run1-done elapsed_ms={d}\n", .{clock.ms()});
     try engine.reset();
-    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_b, rows_b, row_len) catch |e| {
+    greedyRun(engine, opts.teacher_forced, opts.sequential_prefill, prompt, expected, ids_b, rows_b, row_len, samples_b, io, a, "run_b", kt) catch |e| {
         std.debug.print("FAIL run2: {s}\n", .{@errorName(e)});
         return 1;
     };
@@ -450,18 +467,160 @@ pub fn main(init: std.process.Init) !u8 {
     return if (match_a and match_b and ids_equal and logits_equal) 0 else 1;
 }
 
+/// One steady token's host wall time and the id its logits drew.
+const SteadySample = struct { id: u32, wall_ns: u64 };
+
+fn steadyToken(io: std.Io, e: *Engine, feed: u32, rows: []u8) !SteadySample {
+    const t0 = std.Io.Clock.awake.now(io);
+    try e.decode(feed);
+    const id = try e.draw();
+    try e.logitsBytes(rows);
+    return .{ .id = id, .wall_ns = @intCast(t0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds()) };
+}
+
+/// The tally entry's kernel name, resolved against the probe's own shader
+/// images; a module the probe does not embed prints as unknown<len>.
+fn kernelName(a: std.mem.Allocator, spirv_ptr: usize, spirv_len: u32) []const u8 {
+    const bytes = @as([*]const u8, @ptrFromInt(spirv_ptr))[0..spirv_len];
+    inline for (comptime std.meta.declarations(q35s)) |name| {
+        const image = &@field(q35s, name);
+        if (std.mem.eql(u8, std.mem.sliceAsBytes(image), bytes)) return name;
+    }
+    return std.fmt.allocPrint(a, "unknown<{d}>", .{spirv_len}) catch "unknown";
+}
+
+/// The tally sorted heaviest-first, with a per-image rollup folded over the
+/// per-shape lines (one image may serve several shapes).
+const Sorted = struct {
+    fn desc(_: void, x: q35v.vk.dispatch.TallyEntry, y: q35v.vk.dispatch.TallyEntry) bool {
+        return x.total_ns > y.total_ns;
+    }
+};
+
+const Rollup = struct { name: []const u8, calls: u64 = 0, total_ns: u64 = 0 };
+
+fn sortedEntries(a: std.mem.Allocator, kt: *q35v.vk.dispatch.Timing) []q35v.vk.dispatch.TallyEntry {
+    const entries = a.alloc(q35v.vk.dispatch.TallyEntry, kt.tally.n) catch {
+        std.debug.print("KTIME report failed: OutOfMemory\n", .{});
+        return &.{};
+    };
+    @memcpy(entries, kt.tally.entries[0..kt.tally.n]);
+    std.mem.sort(q35v.vk.dispatch.TallyEntry, entries, {}, Sorted.desc);
+    return entries;
+}
+
+fn rollupByImage(a: std.mem.Allocator, entries: []const q35v.vk.dispatch.TallyEntry) []Rollup {
+    var out = a.alloc(Rollup, entries.len) catch return &.{};
+    var n: usize = 0;
+    for (entries) |e| {
+        const name = kernelName(a, e.key.spirv, e.spirv_len);
+        var found = false;
+        for (out[0..n]) |*r| if (std.mem.eql(u8, r.name, name)) {
+            r.calls += e.calls;
+            r.total_ns += e.total_ns;
+            found = true;
+            break;
+        };
+        if (!found) {
+            out[n] = .{ .name = name, .calls = e.calls, .total_ns = e.total_ns };
+            n += 1;
+        }
+    }
+    return out[0..n];
+}
+
+fn ms(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
+
+/// The prefill phase's report: one `KTIME prefill` line per invocation shape
+/// sorted by total, a per-image rollup, then the GPU total, the phase's wall
+/// time and the prompt token count. Diagnostic only — it never changes the
+/// run's result or exit code.
+fn prefillReport(a: std.mem.Allocator, kt: *q35v.vk.dispatch.Timing, wall_ns: u64, prompt_tokens: usize) void {
+    const entries = sortedEntries(a, kt);
+    for (entries) |e| {
+        const name = kernelName(a, e.key.spirv, e.spirv_len);
+        std.debug.print("KTIME prefill {s} calls={d} total_ms={d:.3} share={d:.4}\n", .{ name, e.calls, ms(e.total_ns), kt.tally.share(e.total_ns) });
+    }
+    for (rollupByImage(a, entries)) |r| {
+        std.debug.print("KTIME prefill image {s} calls={d} total_ms={d:.3} share={d:.4}\n", .{ r.name, r.calls, ms(r.total_ns), kt.tally.share(r.total_ns) });
+    }
+    std.debug.print("KTIME prefill total_ms={d:.3} wall_ms={d:.3} prompt_tokens={d}\n", .{ ms(kt.tally.total_ns), ms(wall_ns), prompt_tokens });
+}
+
+/// One `KTIME decode` block per run's steady window: every tally entry
+/// heaviest first (per-token stats), the per-image rollup, then the window's
+/// per-token GPU total and wall time. Diagnostic only.
+fn ktimeReport(a: std.mem.Allocator, kt: *q35v.vk.dispatch.Timing, run: []const u8, samples: []const SteadySample) void {
+    const per_token: u64 = @max(samples.len, 1);
+    var wall_ns: u64 = 0;
+    for (samples) |s| wall_ns += s.wall_ns;
+    const entries = sortedEntries(a, kt);
+    for (entries) |e| {
+        const name = kernelName(a, e.key.spirv, e.spirv_len);
+        const calls_per_token = @as(f64, @floatFromInt(e.calls)) / @as(f64, @floatFromInt(per_token));
+        const mean_us = @as(f64, @floatFromInt(e.total_ns)) / @as(f64, @floatFromInt(@max(e.calls, 1))) / 1000.0;
+        const total_us_per_token = @as(f64, @floatFromInt(e.total_ns)) / 1000.0 / @as(f64, @floatFromInt(per_token));
+        std.debug.print("KTIME {s} {s} push={x:0>8},{x:0>8},{x:0>8},{x:0>8} groups={d},{d},{d} calls_per_token={d:.2} mean_us={d:.2} total_us_per_token={d:.2} share={d:.4}\n", .{
+            run,                          name,
+            e.key.push_words[0],          e.key.push_words[1],
+            e.key.push_words[2],          e.key.push_words[3],
+            e.key.groups[0],              e.key.groups[1],
+            e.key.groups[2],              calls_per_token,
+            mean_us,                      total_us_per_token,
+            kt.tally.share(e.total_ns),
+        });
+    }
+    for (rollupByImage(a, entries)) |r| {
+        std.debug.print("KTIME {s} image {s} calls_per_token={d:.2} total_us_per_token={d:.2} share={d:.4}\n", .{
+            run, r.name,
+            @as(f64, @floatFromInt(r.calls)) / @as(f64, @floatFromInt(per_token)),
+            @as(f64, @floatFromInt(r.total_ns)) / 1000.0 / @as(f64, @floatFromInt(per_token)),
+            kt.tally.share(r.total_ns),
+        });
+    }
+    std.debug.print("KTIME total {s} gpu_ns_per_token={d} wall_ns_per_token={d}\n", .{ run, kt.tally.total_ns / per_token, wall_ns / per_token });
+}
+
 // Greedy: prefill (max_prefill_rows chunks; --sequential-prefill per token = boundary evidence); ids_out.len argreduce draws.
-fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const u32, expected: []const u32, ids_out: []u32, rows_out: []u8, row_len: usize) !void {
+// TF_VK_KTIME=1 instruments two phases per run: the whole prefill (all
+// chunks, one tally) and the steady tokens (the first draw rides prefill's
+// logits, uninstrumented). Each phase's tally restarts; the reports are
+// diagnostic and never change the run's result or exit code.
+fn greedyRun(e: *Engine, teacher_forced: bool, sequential: bool, prompt: []const u32, expected: []const u32, ids_out: []u32, rows_out: []u8, row_len: usize, samples_out: []SteadySample, io: std.Io, a: std.mem.Allocator, run: []const u8, kt: ?*q35v.vk.dispatch.Timing) !void {
+    if (samples_out.len != ids_out.len - 1) return error.Invalid;
+    if (kt) |t| {
+        t.tally = .{};
+        q35v.vk.dispatch.timing = t;
+    }
+    const pf0 = std.Io.Clock.awake.now(io);
     if (sequential) {
         for (prompt) |tok| try e.prefill(&.{tok});
     } else {
         try e.prefill(prompt);
     }
-    for (ids_out, 0..) |*slot, step| {
-        slot.* = try e.draw();
-        try e.logitsBytes(rows_out[step * row_len ..][0..row_len]);
-        if (step + 1 < ids_out.len) try e.decode(if (teacher_forced) expected[step] else slot.*);
+    const pf_wall: u64 = @intCast(pf0.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds());
+    if (kt) |t| {
+        q35v.vk.dispatch.timing = null;
+        prefillReport(a, t, pf_wall, prompt.len);
     }
+    // the warm-up token: prefill's first draw, uninstrumented like the prefill report above
+    ids_out[0] = try e.draw();
+    try e.logitsBytes(rows_out[0..row_len]);
+    if (kt) |t| {
+        t.tally = .{};
+        q35v.vk.dispatch.timing = t;
+    }
+    defer if (kt != null) {
+        q35v.vk.dispatch.timing = null;
+    };
+    for (1..ids_out.len) |step| {
+        const feed: u32 = if (teacher_forced) expected[step - 1] else ids_out[step - 1];
+        samples_out[step - 1] = try steadyToken(io, e, feed, rows_out[step * row_len ..][0..row_len]);
+        ids_out[step] = samples_out[step - 1].id;
+    }
+    if (kt) |t| ktimeReport(a, t, run, samples_out);
 }
 
 const testing = std.testing;

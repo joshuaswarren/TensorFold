@@ -57,7 +57,7 @@ pub const Tally = struct {
     n: u32 = 0,
     total_ns: u64 = 0,
 
-    pub fn add(self: *Tally, key: Key, spirv_len: u32, ns: u64) Error!void {
+    pub fn add(self: *Tally, key: Key, spirv_len: u32, ns: u64) runtime.Error!void {
         for (self.entries[0..self.n]) |*e| if (std.meta.eql(e.key, key)) {
             e.calls += 1;
             e.total_ns += ns;
@@ -137,7 +137,7 @@ pub const Timing = struct {
 
     /// Called from Commands.begin's freshly begun command buffer: the stamp
     /// list restarts, the pool range resets, and stamp 0 anchors the window.
-    pub fn batchBegin(self: *Timing, cmd: c.VkCommandBuffer) Error!void {
+    pub fn batchBegin(self: *Timing, cmd: c.VkCommandBuffer) runtime.Error!void {
         self.n = 0;
         self.dev.api.vkCmdResetQueryPool(cmd, self.pool, 0, timing_capacity);
         try self.write(cmd, 0, .{});
@@ -147,7 +147,7 @@ pub const Timing = struct {
     /// meaningful inside an open command buffer (begin anchors stamp 0,
     /// submit collects exactly this range, so a stamp outside one would be
     /// recorded but never collected).
-    pub fn stamp(self: *Timing, cmd: c.VkCommandBuffer, spirv: []align(4) const u8, push: []const u8, groups: [3]u32) Error!void {
+    pub fn stamp(self: *Timing, cmd: c.VkCommandBuffer, spirv: []align(4) const u8, push: []const u8, groups: [3]u32) runtime.Error!void {
         var words: [4]u32 = .{ 0, 0, 0, 0 };
         for (words[0..@min(4, push.len / 4)], 0..) |*w, i| w.* = std.mem.readInt(u32, push[i * 4 ..][0..4], .little);
         try self.write(cmd, self.n, .{
@@ -159,7 +159,7 @@ pub const Timing = struct {
         });
     }
 
-    fn write(self: *Timing, cmd: c.VkCommandBuffer, index: u32, entry: Stamp) Error!void {
+    fn write(self: *Timing, cmd: c.VkCommandBuffer, index: u32, entry: Stamp) runtime.Error!void {
         if (index >= timing_capacity) {
             std.log.err("vulkan: timing stamp {d} past capacity {d}; refusing", .{ index, timing_capacity });
             return error.TimingOverflow;
@@ -172,7 +172,7 @@ pub const Timing = struct {
 
     /// After the submit's fence: fetch the stamps, convert the deltas to ns
     /// and fold them into the tally. Delta i names the dispatch of entry i.
-    pub fn collect(self: *Timing) Error!void {
+    pub fn collect(self: *Timing) runtime.Error!void {
         if (self.n == 0) return;
         try check(self.dev.api.vkGetQueryPoolResults(
             self.dev.handle,
