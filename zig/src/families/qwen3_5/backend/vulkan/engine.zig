@@ -11,7 +11,7 @@ const View = vk.tensor.View;
 
 pub const max_prefill_rows = fwd.max_prefill_rows;
 
-// Chunk cut = min(done+64,total), pure, host-tested; totals 64/65/127/128/129 cut at 64 / 64,65 / 64,127 / 64,128 / 64,128,129
+// Chunk cut = min(done+64,total), pure; the host tests cover totals 64, 65, 127, 128 and 129.
 pub fn chunkEnd(done: usize, total: usize) usize {
     return @min(done +| max_prefill_rows, total);
 }
