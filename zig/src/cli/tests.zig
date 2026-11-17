@@ -4,5 +4,6 @@ test {
     _ = @import("models.zig");
     _ = @import("info.zig");
     _ = @import("pull.zig");
+    _ = @import("pull_tests.zig");
     _ = @import("cli.zig");
 }

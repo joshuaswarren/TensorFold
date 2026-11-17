@@ -154,6 +154,9 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     cli.addImport("lanes", mods.lanes);
     cli.addImport("nemotron", mods.nemotron);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
+    // The checkpoint CLI's host tests (models, info, pull against a fake hub): host-only, so they run here too.
+    const checkpoint_cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/tests.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "native_engines", .module = b.createModule(.{ .root_source_file = b.path("zig/src/cli/test_registry.zig"), .target = host, .optimize = .debug }) }} });
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = checkpoint_cli })).step);
 }
 
 /// nvcc -fatbin with torch's flags, the kernel's own and one -gencode per SASS target, as the Python build passes them.
