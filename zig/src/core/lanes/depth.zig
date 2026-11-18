@@ -103,12 +103,30 @@ pub const Rule = struct {
         try table.put(r.gpa, drafts, if (before) |b| b + r.k.cost_rate * (ms - b) else ms);
     }
 
+    /// The head step's ms, capped at the timed windows' least per-row slope (a single width gives no cap).
+    fn headStep(r: *const Rule) f64 {
+        var cap: ?f64 = null;
+        var prev_w: i64 = 0;
+        var prev_ms: f64 = 0.0;
+        for (r.family_costs.slots, 0..) |slot, w| {
+            const ms = slot orelse continue;
+            const width: i64 = @intCast(w);
+            if (prev_w > 0) {
+                const slope = (ms - prev_ms) / @as(f64, @floatFromInt(width - prev_w));
+                if (slope > 0.0) cap = if (cap) |c| @min(c, slope) else slope;
+            }
+            prev_w = width;
+            prev_ms = ms;
+        }
+        return @min(r.mtp_step_ms, cap orelse r.mtp_step_ms);
+    }
+
     /// Measured round time when there is one, else the load-time forward cost plus head steps.
     pub fn roundCost(r: *Rule, drafts: i64, who: ?Who) !?f64 {
         const table = try r.costs(who);
         if (table.get(drafts)) |v| return v;
         const forward = r.family_costs.get(drafts + 1) orelse return null;
-        var modeled = forward + r.mtp_step_ms * @as(f64, @floatFromInt(drafts));
+        var modeled = forward + r.headStep() * @as(f64, @floatFromInt(drafts));
         if (r.plain_guard) {
             // untimed: its model plus the least time a row of a timed round took beyond its model
             var least: ?f64 = null;
@@ -263,6 +281,20 @@ test "depth picks the most tokens a ms and probes deeper" {
     for (1..5) |w| try fc.put(gpa, @intCast(w), 5.0 + @as(f64, @floatFromInt(w)));
     const shared: Table = .{};
     var rule: Rule = .{ .gpa = gpa, .prior = &.{ 0.9, 0.9, 0.9 }, .most_drafts = 3, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 0.5, .plain_guard = false, .node_probabilities = false, .batch_rows = 8 };
+    defer rule.deinit();
+    var st: ?State = null;
+    defer if (st) |*s| s.deinit(gpa);
+    const who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false };
+    try std.testing.expectEqual(@as(i64, 3), try rule.depth(who));
+}
+
+test "an inflated load-time head-step measure cannot starve the depth rule" {
+    const gpa = std.testing.allocator;
+    var fc: Table = .{};
+    defer fc.deinit(gpa);
+    for (1..5) |w| try fc.put(gpa, @intCast(w), 5.0 + @as(f64, @floatFromInt(w)));
+    const shared: Table = .{};
+    var rule: Rule = .{ .gpa = gpa, .prior = &.{ 0.9, 0.9, 0.9 }, .most_drafts = 3, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 25.0, .plain_guard = false, .node_probabilities = false, .batch_rows = 8 };
     defer rule.deinit();
     var st: ?State = null;
     defer if (st) |*s| s.deinit(gpa);
