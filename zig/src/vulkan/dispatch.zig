@@ -16,6 +16,14 @@ pub const max_bindings = 10;
 pub const batch_max: u32 = 256;
 const batch_flush: u32 = batch_max / 2;
 
+/// TF_Q35_VK_PROFILE=1 sets this to 1: every dispatch then submits and fences, so per-op wall spans are fence-backed.
+/// Off (null) leaves the batcher exactly as before; the flag changes only submission batching, never the recorded work.
+pub var batch_flush_override: ?u32 = null;
+
+fn flushAt() u32 {
+    return batch_flush_override orelse batch_flush;
+}
+
 /// The shader's set 0: storage buffers 0..bindings-1, its push bytes, and a mask of the bindings it writes.
 pub const Layout = struct { bindings: u32, push_bytes: u32, writes: u32 };
 
@@ -181,7 +189,7 @@ pub const Pipeline = struct {
     pub fn run(p: *const Pipeline, cmds: *commands.Commands, push: []const u8, groups: [3]u32, timeout_ns: u64) Error!void {
         try p.record(try cmds.begin(), push, groups);
         cmds.pending += 1;
-        if (cmds.pending >= batch_flush) try cmds.submit(timeout_ns);
+        if (cmds.pending >= flushAt()) try cmds.submit(timeout_ns);
     }
 };
 

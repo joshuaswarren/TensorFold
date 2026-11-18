@@ -18,7 +18,69 @@ pub const wide_layers: usize = state.wide_layers;
 pub fn actKind(layer: usize) vk.tensor.Kind {
     return if (layer < wide_layers) .f32 else .bf16;
 }
-/// The GDN prefill scan's chunk cap (chunks of 1 when a prefill fits one).
+
+/// Op classes the fence-timed profiler totals; names mirror the Metal-side gpu_profile enum where the ops map.
+pub const ProfClass = enum { dense, norm, embedding, copy, activation, gdn_prepare, gdn_scan, gdn_gate, attention_prepare, attention };
+const prof_class_count = @typeInfo(ProfClass).@"enum".field_names.len;
+
+/// Monotonic nanoseconds, the rows_io idiom: span walls are differences, never compared across processes.
+fn nowNs() i128 {
+    var t: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t);
+    return @as(i128, t.sec) * std.time.ns_per_s + t.nsec;
+}
+
+/// Fence-timed per-op spans behind TF_Q35_VK_PROFILE=1: with the batcher flushing per dispatch, the wall
+/// time around one op is GPU-complete (the op's own submit fence), so spans read as per-class shares.
+/// Per-dispatch flushing changes the absolute times; the unprofiled leg gives the real total.
+pub const Prof = struct {
+    on: bool = false,
+    open_ns: i128 = 0,
+    pending: ProfClass = .dense,
+    calls: [prof_class_count]u64 = @splat(0),
+    wall_ns: [prof_class_count]u64 = @splat(0),
+    rounds: u64 = 0,
+
+    pub fn pre(p: *Prof, class: ProfClass) void {
+        if (!p.on) return;
+        p.pending = class;
+        p.open_ns = nowNs();
+    }
+
+    pub fn lap(p: *Prof) void {
+        if (!p.on or p.open_ns == 0) return;
+        const i = @backingInt(p.pending);
+        p.calls[i] += 1;
+        p.wall_ns[i] += @intCast(nowNs() - p.open_ns);
+        p.open_ns = 0;
+    }
+
+    pub fn round(p: *Prof) void {
+        if (!p.on) return;
+        p.rounds += 1;
+    }
+
+    /// The totals since the trace began, one log line per class with calls.
+    pub fn report(p: *const Prof) void {
+        if (!p.on or p.rounds == 0) return;
+        var total: u64 = 0;
+        for (p.wall_ns) |ns| total += ns;
+        std.log.info("vk profile: {d} rounds, {d:.1} ms (per-dispatch flush; shares, not absolute)", .{ p.rounds, @as(f64, @floatFromInt(total)) / 1e6 });
+        for (std.enums.values(ProfClass), 0..) |kind, i| {
+            if (p.calls[i] == 0) continue;
+            std.log.info("vk profile: {s:<18} {d:>6} calls {d:>9.2} ms {d:>8.3} ms/round", .{ @tagName(kind), p.calls[i], @as(f64, @floatFromInt(p.wall_ns[i])) / 1e6, @as(f64, @floatFromInt(p.wall_ns[i])) / 1e6 / @as(f64, @floatFromInt(p.rounds)) });
+        }
+    }
+};
+
+/// The TF_Q35_VK_PROFILE flag: "1" turns fence-timed per-op profiling on and makes the batcher flush per dispatch.
+pub fn profileOn() bool {
+    const v = std.c.getenv("TF_Q35_VK_PROFILE") orelse return false;
+    const s = std.mem.span(v);
+    return std.mem.eql(u8, s, "1");
+}
+
+// The GDN prefill scan's chunk cap (chunks of 1 when a prefill fits one).
 pub const max_gdn_chunk: u64 = 32;
 
 comptime {
@@ -37,27 +99,43 @@ pub const Acc = struct {
 };
 
 // `Core` borrows commands, staging, operators, scratch and fence timeout; the owner owns the arena and every view.
+// `prof` is null unless TF_Q35_VK_PROFILE=1; the engine owns the Prof so *const Core sites can still write through it.
 pub const Core = struct {
     cmds: *vk.Commands,
     staging: vk.Buffer,
     acc: Acc,
     scratch: *Arena,
     timeout_ns: u64,
+    prof: ?*Prof = null,
+
+    fn pre(c: *const Core, class: ProfClass) void {
+        if (c.prof) |p| p.pre(class);
+    }
+
+    fn lap(c: *const Core) void {
+        if (c.prof) |p| p.lap();
+    }
 
     /// One affine projection through the admitted Q4 closure; weights repacked at load run the tiled image.
     fn project(c: *const Core, out: View, x: View, q: weights.Quant) !void {
+        c.pre(.dense);
+        defer c.lap();
         if (q.tiled) return vk.orExit(vk.ops_q4.projectTiled(c.acc.ops, c.cmds, out, x, q.w, q.scales, q.biases, q.k, c.timeout_ns));
         try vk.orExit(vk.ops_q4.project(c.acc.ops, c.cmds, out, x, q.w, q.scales, q.biases, q.k, c.scratch, c.timeout_ns));
     }
 
     // Fused norm: bf16 residual add (`h = bf16(H + R)`) out of place into `sum`, then raw-gain RMSNorm into `out`.
     pub fn addNorm(c: *const Core, out: View, sum: View, h: View, r: View, gain: View, rows: usize) !void {
+        c.pre(.norm);
+        defer c.lap();
         try vk.orExit(c.acc.norm.add(c.cmds, sum, h, r, c.timeout_ns));
         try vk.orExit(c.acc.norm.rmsNorm(c.cmds, out, sum, gain, rows, pinned.hidden, pinned.eps, c.timeout_ns));
     }
 
     /// The layer-0 norm: no residual, the gain over the raw embedding.
     pub fn plainNorm(c: *const Core, out: View, h: View, gain: View, rows: usize) !void {
+        c.pre(.norm);
+        defer c.lap();
         try vk.orExit(c.acc.norm.rmsNorm(c.cmds, out, h, gain, rows, pinned.hidden, pinned.eps, c.timeout_ns));
     }
 
@@ -74,6 +152,8 @@ pub const Core = struct {
             .in_strides = .{ 1, plan.in_head_stride, 0, 0 },
             .out_strides = .{ 1, plan.dim, 0, 0 },
         };
+        c.pre(.attention_prepare);
+        defer c.lap();
         try vk.orExit(pipe.run(c.cmds, std.mem.asBytes(&p), vk.ops.dispatchGroups(plan.count, pipe.local[0]), c.timeout_ns));
     }
 
@@ -88,21 +168,31 @@ pub const Core = struct {
         const q = try c.scratch.alloc(act, rows * pinned.query_heads * pinned.head_dim);
         try c.extractQueries(q, qraw, rows);
         const qn = try c.scratch.alloc(act, q.elements);
+        c.pre(.norm);
         try vk.orExit(c.acc.norm.rmsNorm(c.cmds, qn, q, layer.q_norm, rows * pinned.query_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
+        c.lap();
         const k = try c.scratch.alloc(act, rows * pinned.kv_heads * pinned.head_dim);
         try c.project(k, x, layer.k);
         const kn = try c.scratch.alloc(act, k.elements);
+        c.pre(.norm);
         try vk.orExit(c.acc.norm.rmsNorm(c.cmds, kn, k, layer.k_norm, rows * pinned.kv_heads, pinned.head_dim, pinned.eps, c.timeout_ns));
+        c.lap();
         const v = try c.scratch.alloc(act, k.elements);
         try c.project(v, x, layer.v);
         const queries = try c.scratch.alloc(act, q.elements);
+        c.pre(.attention_prepare);
         try vk.orExit(c.acc.attn.setBasePosition(c.cmds, c.staging, @intCast(base), c.timeout_ns));
         try vk.orExit(c.acc.attn.ropeQueries(c.cmds, queries, qn, rows, c.timeout_ns));
         try vk.orExit(c.acc.attn.cacheKV(c.cmds, s.keysFor(slot), s.valuesFor(slot), kn, v, rows, base, s.capacity, c.timeout_ns));
+        c.lap();
         const y = try c.scratch.alloc(act, q.elements);
+        c.pre(.attention);
         try vk.orExit(c.acc.attn.attend(c.cmds, y, queries, s.keysFor(slot), s.valuesFor(slot), base, rows, s.capacity, c.timeout_ns));
+        c.lap();
         const mix = try c.scratch.alloc(act, rows * hidden);
+        c.pre(.attention_prepare);
         try vk.orExit(c.acc.attn.gateOutput(c.cmds, mix, y, qraw, rows, c.timeout_ns));
+        c.lap();
         try c.project(r_out, mix, layer.o);
         c.scratch.reset(mark) catch {};
     }
@@ -126,11 +216,17 @@ pub const Core = struct {
         const beta = try c.scratch.alloc(act, rows * pinned.linear_heads);
         const conv_out = try c.scratch.alloc(act, rows * pinned.conv_dim);
         const conv_in = try c.scratch.alloc(act, (rows + state.conv_rows) * pinned.conv_dim);
+        c.pre(.gdn_prepare);
         try vk.orExit(c.acc.gdn.convPrefill(c.cmds, soa, g, beta, conv_out, conv_in, s.convInput(slot), qkv, layer.conv, a, b, layer.a_log, layer.dt_bias, s.convOutput(slot), rows, c.timeout_ns));
+        c.lap();
         const y = try c.scratch.alloc(act, rows * dim);
+        c.pre(.gdn_scan);
         try vk.orExit(c.acc.gdn.prefillRecur(c.cmds, soa, g, beta, s.gdnInput(slot), y, s.gdnOutput(slot), null, rows, @min(rows, max_gdn_chunk), c.timeout_ns));
+        c.lap();
         const mix = try c.scratch.alloc(act, rows * dim);
+        c.pre(.gdn_gate);
         try vk.orExit(c.acc.gdn.gatedNorm(c.cmds, mix, y, z, layer.gnorm, rows, pinned.eps, c.timeout_ns));
+        c.lap();
         try c.project(r_out, mix, layer.out);
         s.flip(slot);
         c.scratch.reset(mark) catch {};
@@ -146,17 +242,21 @@ pub const Core = struct {
         const up = try c.scratch.alloc(act, rows * pinned.intermediate);
         try c.project(up, x, m.up);
         const activated = try c.scratch.alloc(act, rows * pinned.intermediate);
+        c.pre(.activation);
         try vk.orExit(c.acc.norm.swiglu(c.cmds, activated, gate, up, c.timeout_ns));
+        c.lap();
         try c.project(r_out, activated, m.down);
         c.scratch.reset(mark) catch {};
     }
 
     // The last row gets residual add, raw-gain norm, and tied embedding or separate `lm_head` for greedy draw.
     pub fn finish(c: *const Core, sum: View, h: View, r: View, x: View, final_norm: View, head: weights.Quant, logits: View, rows: usize) !void {
+        c.pre(.norm);
         try vk.orExit(c.acc.norm.add(c.cmds, sum, h, r, c.timeout_ns));
         const last = (rows - 1) * pinned.hidden;
         const x_last = try x.slice(last, pinned.hidden);
         try vk.orExit(c.acc.norm.rmsNorm(c.cmds, x_last, try sum.slice(last, pinned.hidden), final_norm, 1, pinned.hidden, pinned.eps, c.timeout_ns));
+        c.lap();
         const mark = c.scratch.mark();
         defer c.scratch.reset(mark) catch {};
         try c.project(logits, x_last, head);

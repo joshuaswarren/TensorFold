@@ -79,6 +79,8 @@ pub const Engine = struct {
     logits: View,
     base_mark: u64,
     poisoned: bool,
+    /// Fence-timed per-op profiler; on and attached only when TF_Q35_VK_PROFILE=1, which also makes the batcher flush per dispatch.
+    prof: fwd.Prof = .{},
 
     // Pinned-model admission runs inside the weights load before GPU work; SDPA arm limit is 7168; probe uses 256.
     pub fn init(
@@ -138,11 +140,17 @@ pub const Engine = struct {
         e.model = try vk.orExit(weights.Model.load(gpa, e.dev, e.cmds, io, model_dir, e.staging, timeout_ns));
         errdefer e.model.deinit();
         e.state = try vk.orExit(state.State.init(gpa, e.dev, e.cmds, cap, e.staging, timeout_ns));
+        // TF_Q35_VK_PROFILE=1: fence-timed per-op spans plus per-dispatch batch flushing (shares, not absolute times).
+        if (fwd.profileOn()) {
+            e.prof.on = true;
+            vk.dispatch.batch_flush_override = 1;
+        }
         return e;
     }
 
     // Reverse teardown is legal only with no pending submission; `orExit` ensures Timeout/InFlight never return here.
     pub fn deinit(e: *Engine) void {
+        e.prof.report();
         e.state.deinit();
         e.model.deinit();
         e.arena.deinit();
@@ -195,6 +203,7 @@ pub const Engine = struct {
         try runLayers(e, tokens.len);
         try vk.orExit(e.state.append(tokens.len));
         e.poisoned = false;
+        e.prof.round();
     }
 
     // Decode embeds the fed token, runs all 24 layers and final norm/head; resulting logits cover the next token.
@@ -265,6 +274,7 @@ pub const Engine = struct {
             .acc = .{ .ops = &e.ops, .norm = &e.norm, .attn = &e.attn, .gdn = &e.gdn },
             .scratch = &e.arena,
             .timeout_ns = e.timeout_ns,
+            .prof = &e.prof,
         };
     }
 
