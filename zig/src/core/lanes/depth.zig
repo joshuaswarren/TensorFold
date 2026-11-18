@@ -301,3 +301,17 @@ test "an inflated load-time head-step measure cannot starve the depth rule" {
     const who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false };
     try std.testing.expectEqual(@as(i64, 3), try rule.depth(who));
 }
+
+test "an inflated load-time head-step measure cannot hand plain_guard the win" {
+    const gpa = std.testing.allocator;
+    var fc: Table = .{};
+    defer fc.deinit(gpa);
+    for (1..5) |w| try fc.put(gpa, @intCast(w), 5.0 + @as(f64, @floatFromInt(w)));
+    const shared: Table = .{};
+    var rule: Rule = .{ .gpa = gpa, .prior = &.{ 0.9, 0.9, 0.9 }, .most_drafts = 3, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 25.0, .plain_guard = true, .node_probabilities = false, .batch_rows = 8 };
+    defer rule.deinit();
+    var st: ?State = null;
+    defer if (st) |*s| s.deinit(gpa);
+    const who: Who = .{ .state = &st, .draft_room = 100, .finished = false, .forced = false };
+    try std.testing.expectEqual(@as(i64, 3), try rule.depth(who));
+}
