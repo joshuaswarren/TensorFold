@@ -406,6 +406,20 @@ pub const Generation = struct {
         const seed = if (g.seed) |v| std.fmt.bufPrint(&seed_text, " seed={d}", .{v}) catch unreachable else "";
         const rate = if (decode_log_s > 0) @as(f64, @floatFromInt(decode_tokens)) / decode_log_s else 0;
         log.line("done {s} prompt={d} cached={d} thinking={s} effort={s} tokens={d} sha={s} finish={s}{s} rounds={d} accepted={d}/{d} ttft={d:.3} decode={d:.3} elapsed={d:.3} queued={d:.3} tok/s={d:.1}{s}", .{ g.reply_id, prompt_len, reply.cached_tokens, if (thinking) "True" else "False", if (thinking) effort orelse "none" else "none", g.collected.items.len, sha, reason, cycle, s.rounds, s.accepted, s.drafted, ttft_s, decode_log_s, @max(0, seconds(done_ns - received)), s.queued_seconds, rate, seed });
+        if (g.srv.config.request_log) |path| @import("request_log.zig").reply(a, path, .{
+            .id = g.reply_id,
+            .content = content,
+            .reasoning = reasoning,
+            .finish = reason,
+            .prompt_tokens = reply.prompt_tokens,
+            .cached_tokens = reply.cached_tokens,
+            .completion_tokens = reply.completion_tokens,
+            .reasoning_tokens = reply.reasoning_tokens,
+            .queued_s = s.queued_seconds,
+            .ttft_s = ttft_s,
+            .elapsed_s = @max(0, seconds(done_ns - received)),
+            .tok_s = rate,
+        });
         return reply;
     }
 };

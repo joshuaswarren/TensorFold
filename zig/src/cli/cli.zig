@@ -6,6 +6,7 @@ const pull = @import("pull.zig");
 const plan = @import("plan.zig");
 const pull_exlr8 = @import("pull_exlr8.zig");
 const lora_merge = @import("core").lora_merge;
+const log = @import("log.zig");
 
 const usage =
     \\usage: tensorfold models [--json]
@@ -22,7 +23,7 @@ const usage =
 pub fn wants(args: []const []const u8) bool {
     if (args.len == 0) return false;
     const cmd = args[0];
-    return std.mem.eql(u8, cmd, "models") or std.mem.eql(u8, cmd, "info") or std.mem.eql(u8, cmd, "pull") or std.mem.eql(u8, cmd, "merge") or std.mem.eql(u8, cmd, "plan");
+    return std.mem.eql(u8, cmd, "models") or std.mem.eql(u8, cmd, "info") or std.mem.eql(u8, cmd, "pull") or std.mem.eql(u8, cmd, "merge") or std.mem.eql(u8, cmd, "plan") or std.mem.eql(u8, cmd, "log");
 }
 
 /// Runs a checkpoint subcommand; `argv` is argv[1..] as in cluster.cli.main.
@@ -68,6 +69,7 @@ pub fn main(init: std.process.Init, argv: []const [:0]const u8) !u8 {
         }
         return plan.run(a, init.io, &out.interface, env, parsed.model, .{ .mem_gb = parsed.mem_gb, .ram = parsed.ram });
     }
+    if (std.mem.eql(u8, args[0], "log")) return log.run(a, init.io, &out.interface, &err.interface, env, args[1..]);
     if (std.mem.eql(u8, args[0], "merge")) {
         const m = lora_merge.parseArgs(args[1..]) orelse {
             try err.interface.writeAll(usage);
@@ -87,5 +89,6 @@ test "wants only the checkpoint subcommands" {
     try std.testing.expect(wants(&.{ "info", "Org/Flash" }));
     try std.testing.expect(wants(&.{ "merge", "model", "adapter", "out" }));
     try std.testing.expect(wants(&.{ "merge", "dense", "adapter", "out", "--quantize", "shipped" }));
+    try std.testing.expect(wants(&.{ "log", "--follow" }));
     try std.testing.expect(!wants(&.{"run"}) and !wants(&.{}) and !wants(&.{"serve"}));
 }

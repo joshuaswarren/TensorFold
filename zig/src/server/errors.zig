@@ -38,6 +38,8 @@ pub const Cx = struct {
     template_fields: @import("json").Value = .null,
     /// Set by a route that has already planned the same body (its first plan writes the request log).
     skip_request_log: bool = false,
+    /// The id the reply to this request will get: the request log's line and the reply record share it.
+    request_id: ?[]const u8 = null,
 
     pub fn fail(cx: *Cx, kind: Kind, comptime fmt: []const u8, args: anytype) Refused {
         cx.kind = kind;

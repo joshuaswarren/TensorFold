@@ -23,7 +23,7 @@ pub const PrepareResult = union(enum) {
 /// ``plan`` then ``chat.prepare``: images, template fields and the context window, checked as a real turn checks them.
 pub fn prepare(srv: *Server, a: Allocator, gone: openai.Gone, raw: Value, format: ?[]const u8, client_thinking: bool) PrepareResult {
     const id = ids.make(a, "chatcmpl-", 32) catch return outOfMemory(a);
-    var cx: Cx = .{ .a = a };
+    var cx: Cx = .{ .a = a, .request_id = id };
     var p = openai.plan(srv, &cx, true, raw, format, client_thinking) catch |e| {
         if (e == error.OutOfMemory) cx.message = "out of memory";
         return refusal(a, id, &cx, cx.status());
