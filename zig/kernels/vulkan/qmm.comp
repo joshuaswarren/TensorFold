@@ -45,6 +45,10 @@ layout(set = 0, binding = 0, std430) readonly buffer InputX {
 layout(set = 0, binding = 1, std430) readonly buffer InputW {
   uint values[];
 } input_w;
+// Word view of the same weight binding for 128-bit loads on aligned rows.
+layout(set = 0, binding = 1, std430) readonly buffer InputW4 {
+  uvec4 values[];
+} input_w4;
 #ifdef FP_MODE
 // Scale bytes addressed through the word view; no bias term.
 layout(set = 0, binding = 2, std430) readonly buffer ScaleBias {
@@ -299,41 +303,61 @@ void main() {
         float scale = LOAD_VALUE(scales.values[param_base + group]);
         float bias = LOAD_VALUE(biases.values[bias_base + group]);
         ++group;
-        for (uint pack = 0u; pack < packs_per_group; ++pack) {
-          uint k_base = k + pack * pack_factor;
-          if (is_byte_bits == 1u) {
-            uint byte_addr = w_base * 4u +
-                ((k / group_size) * packs_per_group + pack) *
-                    bytes_per_pack;
-            uint c0 = byte_at(
-                input_w.values[byte_addr >> 2u], byte_addr & 3u);
-            uint c1 = byte_at(
-                input_w.values[(byte_addr + 1u) >> 2u],
-                (byte_addr + 1u) & 3u);
-            uint c2 = byte_at(
-                input_w.values[(byte_addr + 2u) >> 2u],
-                (byte_addr + 2u) & 3u);
-            for (uint lane = 0u; lane < pack_factor; ++lane) {
-              uint q = (bits == 3u)
-                  ? q3_at(lane, c0, c1, c2)
-                  : (bits == 5u)
-                  ? q5_at(lane, c0, c1, c2, byte_at(
-                        input_w.values[(byte_addr + 3u) >> 2u],
-                        (byte_addr + 3u) & 3u), byte_at(
-                        input_w.values[(byte_addr + 4u) >> 2u],
-                        (byte_addr + 4u) & 3u))
-                  : q6_at(lane, c0, c1, c2);
-              accumulator +=
-                  LOAD_VALUE(input_x.values[x_base + k_base + lane]) *
-                  (scale * float(q) + bias);
+        uint w_row = w_base + (k / pack_factor);
+        if (is_byte_bits == 0u && (w_row & 3u) == 0u &&
+            (packs_per_group & 3u) == 0u) {
+          // Aligned rows take 128-bit loads: one uvec4 per four packs, same
+          // words and the same element order as the scalar loop.
+          for (uint p4 = 0u; p4 < packs_per_group; p4 += 4u) {
+            uvec4 w4 = input_w4.values[(w_row >> 2u) + (p4 >> 2u)];
+            for (uint pi = 0u; pi < 4u; ++pi) {
+              uint k_base = k + (p4 + pi) * pack_factor;
+              uint word = w4[pi];
+              for (uint lane = 0u; lane < pack_factor; ++lane) {
+                uint q = (word >> (lane * bits)) & value_mask;
+                accumulator +=
+                    LOAD_VALUE(input_x.values[x_base + k_base + lane]) *
+                    (scale * float(q) + bias);
+              }
             }
-          } else {
-            uint word = input_w.values[w_base + (k / pack_factor) + pack];
-            for (uint lane = 0u; lane < pack_factor; ++lane) {
-              uint q = (word >> (lane * bits)) & value_mask;
-              accumulator +=
-                  LOAD_VALUE(input_x.values[x_base + k_base + lane]) *
-                  (scale * float(q) + bias);
+          }
+        } else {
+          for (uint pack = 0u; pack < packs_per_group; ++pack) {
+            uint k_base = k + pack * pack_factor;
+            if (is_byte_bits == 1u) {
+              uint byte_addr = w_base * 4u +
+                  ((k / group_size) * packs_per_group + pack) *
+                      bytes_per_pack;
+              uint c0 = byte_at(
+                  input_w.values[byte_addr >> 2u], byte_addr & 3u);
+              uint c1 = byte_at(
+                  input_w.values[(byte_addr + 1u) >> 2u],
+                  (byte_addr + 1u) & 3u);
+              uint c2 = byte_at(
+                  input_w.values[(byte_addr + 2u) >> 2u],
+                  (byte_addr + 2u) & 3u);
+              for (uint lane = 0u; lane < pack_factor; ++lane) {
+                uint q = (bits == 3u)
+                    ? q3_at(lane, c0, c1, c2)
+                    : (bits == 5u)
+                    ? q5_at(lane, c0, c1, c2, byte_at(
+                          input_w.values[(byte_addr + 3u) >> 2u],
+                          (byte_addr + 3u) & 3u), byte_at(
+                          input_w.values[(byte_addr + 4u) >> 2u],
+                          (byte_addr + 4u) & 3u))
+                    : q6_at(lane, c0, c1, c2);
+                accumulator +=
+                    LOAD_VALUE(input_x.values[x_base + k_base + lane]) *
+                    (scale * float(q) + bias);
+              }
+            } else {
+              uint word = input_w.values[w_row + pack];
+              for (uint lane = 0u; lane < pack_factor; ++lane) {
+                uint q = (word >> (lane * bits)) & value_mask;
+                accumulator +=
+                    LOAD_VALUE(input_x.values[x_base + k_base + lane]) *
+                    (scale * float(q) + bias);
+              }
             }
           }
         }
