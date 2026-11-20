@@ -39,6 +39,16 @@ uint16_t bf16_store(float value) {
 
 layout(local_size_x = 256) in;
 
+// Single-row dispatches (decode: batch and matrix_m 1) re-read the same x row
+// from global memory once per output element. Stage it once a workgroup; the
+// 16 KB bound keeps the pipeline inside the Vulkan shared-memory floor.
+#if defined(USE_FP16) || defined(USE_BF16)
+#define X_STAGE_CAP 8192u
+#else
+#define X_STAGE_CAP 4096u
+#endif
+shared STORAGE_TYPE x_stage[X_STAGE_CAP];
+
 layout(set = 0, binding = 0, std430) readonly buffer InputX {
   STORAGE_TYPE values[];
 } input_x;
@@ -176,6 +186,17 @@ void main() {
 #endif
   uint stride = gl_NumWorkGroups.x * 256u;
 
+  // One x row shared by the whole grid: fill shared memory once, then every
+  // element read below is a workgroup read of a bit-exact copy. Wider x (batch
+  // or m over 1, K over the cap) keeps the straight-line global loads.
+  bool stage_x = batch <= 1u && params.matrix_m == 1u &&
+      params.matrix_k <= X_STAGE_CAP;
+  if (stage_x) {
+    for (uint t = gl_LocalInvocationID.x; t < params.matrix_k; t += 256u)
+      x_stage[t] = input_x.values[params.lhs_offset + t];
+    barrier();
+  }
+
   for (uint index = gl_GlobalInvocationID.x; index < total;
        index += stride) {
     uint b = index / matrix;
@@ -210,7 +231,7 @@ void main() {
             : ((nibble == 0u) ? (packed_byte & 0xFu)
                               : (packed_byte >> 4u));
         float value = (bits == 8u) ? fp8_decode(code) : fp4_decode(code);
-        accumulator += LOAD_VALUE(input_x.values[x_base + k]) *
+        accumulator += LOAD_VALUE(stage_x ? x_stage[k] : input_x.values[x_base + k]) *
             (scale * value);
       }
     } else {
@@ -233,7 +254,7 @@ void main() {
             : (((k & 1u) == 0u) ? (packed_byte & 0xFu)
                                 : (packed_byte >> 4u));
         float value = (bits == 8u) ? fp8_decode(code) : fp4_decode(code);
-        accumulator += LOAD_VALUE(input_x.values[x_base + k]) *
+        accumulator += LOAD_VALUE(stage_x ? x_stage[k] : input_x.values[x_base + k]) *
             (scale * value);
       }
     }
@@ -284,7 +305,7 @@ void main() {
               b * w_batch_words + k * n_words_per_row + col_word_off];
           q = (word >> lane_shift) & value_mask;
         }
-        accumulator += LOAD_VALUE(input_x.values[x_base + k]) *
+        accumulator += LOAD_VALUE(stage_x ? x_stage[k] : input_x.values[x_base + k]) *
             (scale * float(q) + bias);
       }
     } else {
@@ -324,7 +345,8 @@ void main() {
                         (byte_addr + 4u) & 3u))
                   : q6_at(lane, c0, c1, c2);
               accumulator +=
-                  LOAD_VALUE(input_x.values[x_base + k_base + lane]) *
+                  LOAD_VALUE(stage_x ? x_stage[k_base + lane] :
+                      input_x.values[x_base + k_base + lane]) *
                   (scale * float(q) + bias);
             }
           } else {
@@ -332,7 +354,8 @@ void main() {
             for (uint lane = 0u; lane < pack_factor; ++lane) {
               uint q = (word >> (lane * bits)) & value_mask;
               accumulator +=
-                  LOAD_VALUE(input_x.values[x_base + k_base + lane]) *
+                  LOAD_VALUE(stage_x ? x_stage[k_base + lane] :
+                      input_x.values[x_base + k_base + lane]) *
                   (scale * float(q) + bias);
             }
           }
