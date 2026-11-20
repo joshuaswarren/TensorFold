@@ -73,6 +73,16 @@ fn q4Push(m: u64, n: u64, k: u64) Error!params.Params {
 /// Which qmm image a dispatch runs: `scalar` is qmm.comp, `vec4` is qmm_q4_vec4.comp (same arithmetic, 16-byte loads).
 pub const Qmm = enum { scalar, vec4 };
 
+/// Per-image dispatch counts: which qmm SPIR-V image the model path actually ran.
+pub var qmm_dispatches = struct { scalar: u64 = 0, vec4: u64 = 0, f32: u64 = 0, tile: u64 = 0, tile_f32: u64 = 0 }{};
+
+/// One log line naming every qmm image with a nonzero dispatch count.
+pub fn reportQmmImages() void {
+    const d = qmm_dispatches;
+    if (d.scalar + d.vec4 + d.f32 + d.tile + d.tile_f32 == 0) return;
+    std.log.info("qmm images: tile={d} tile_f32={d} vec4={d} scalar={d} f32={d}", .{ d.tile, d.tile_f32, d.vec4, d.scalar, d.f32 });
+}
+
 // vec4 loads uvec4 from x and w: both windows must start 16-byte aligned (k % 64 keeps strides and ranges aligned).
 pub fn qmmVariant(x: View, w: View) Qmm {
     return if (x.byte_offset % 16 == 0 and w.byte_offset % 16 == 0) .vec4 else .scalar;
@@ -104,6 +114,7 @@ pub fn projectTiled(o: *Ops, cmds: *Commands, out: View, x: View, w: View, scale
     if (x.byteLen() > range or out.byteLen() > range or w.byteLen() > range) return error.TooLarge;
     if (qmmVariant(x, w) != .vec4) return error.Misaligned;
     const pipe = if (out.kind == .f32) &o.qmm_q4_tile_f32 else &o.qmm_q4_tile;
+    if (pipe == &o.qmm_q4_tile_f32) qmm_dispatches.tile_f32 += 1 else qmm_dispatches.tile += 1;
     try pipe.bind(&.{ x.bind(), w.bind(), scales.bind(), biases.bind(), out.bind() });
     const p = try q4Push(g.m, g.n, k);
     try pipe.run(cmds, std.mem.asBytes(&p), ops_mod.dispatchGroups(p.count, pipe.local[0]), timeout_ns);
@@ -119,6 +130,7 @@ pub fn projectAs(o: *Ops, force: ?Qmm, cmds: *Commands, out: View, x: View, w: V
     const act_f32 = out.kind == .f32;
     if (rows == 0) {
         const pipe = try qmmPipeline(o, force, act_f32, x, w);
+        if (pipe == &o.qmm_f32) qmm_dispatches.f32 += 1 else if (pipe == &o.qmm_q4_vec4) qmm_dispatches.vec4 += 1 else qmm_dispatches.scalar += 1;
         try pipe.bind(&.{ x.bind(), w.bind(), scales.bind(), biases.bind(), out.bind() });
         const p = try q4Push(g.m, g.n, k);
         try pipe.run(cmds, std.mem.asBytes(&p), ops_mod.dispatchGroups(p.count, pipe.local[0]), timeout_ns);
@@ -139,6 +151,7 @@ pub fn projectAs(o: *Ops, force: ?Qmm, cmds: *Commands, out: View, x: View, w: V
         const b_chunk = try biases.slice(first * row_groups, chunk * row_groups);
         const block_chunk = try block.slice(0, g.m * chunk);
         const pipe = try qmmPipeline(o, force, act_f32, x, w_chunk);
+        if (pipe == &o.qmm_f32) qmm_dispatches.f32 += 1 else if (pipe == &o.qmm_q4_vec4) qmm_dispatches.vec4 += 1 else qmm_dispatches.scalar += 1;
         try pipe.bind(&.{ x.bind(), w_chunk.bind(), s_chunk.bind(), b_chunk.bind(), block_chunk.bind() });
         const p = try q4Push(g.m, chunk, k);
         try pipe.run(cmds, std.mem.asBytes(&p), ops_mod.dispatchGroups(p.count, pipe.local[0]), timeout_ns);

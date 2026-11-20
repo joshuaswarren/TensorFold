@@ -15,6 +15,18 @@ layout(set = 0, binding = 0, std430) readonly buffer InputX {
   uvec4 values[];
 } input_x;
 #endif
+
+// Single-row dispatches (decode: matrix_m 1) re-read the same x row from
+// global memory once per output column. Stage it once a workgroup; the
+// 16 KB bound keeps the pipeline inside the Vulkan shared-memory floor.
+#ifdef ACT_F32
+shared vec4 x_stage[1024];  // f32 rows: covers matrix_k <= 4096
+#define X_STAGE_K 4096u
+#else
+shared uvec4 x_stage[1024];  // bf16-packed rows: covers matrix_k <= 8192
+#define X_STAGE_K 8192u
+#endif
+
 layout(set = 0, binding = 1, std430) readonly buffer InputW {
   uvec4 values[];
 } input_w;
@@ -74,6 +86,22 @@ void main() {
   uint groups_per_row = params.matrix_k / 64u;
   uint total = params.matrix_m * params.matrix_n;
   uint stride = gl_NumWorkGroups.x * 256u;
+
+  // One x row shared by the whole grid: fill shared memory once, then every
+  // element read below is a workgroup read of a bit-exact copy. Wider x
+  // (matrix_m over 1 or K over the cap) keeps the global loads.
+  bool stage_x = params.matrix_m == 1u && params.matrix_k <= X_STAGE_K;
+  if (stage_x) {
+#ifdef ACT_F32
+    for (uint t = gl_LocalInvocationID.x; t < params.matrix_k / 4u;
+         t += 256u) x_stage[t] = input_x.values[t];
+#else
+    for (uint t = gl_LocalInvocationID.x; t < params.matrix_k / 8u;
+         t += 256u) x_stage[t] = input_x.values[t];
+#endif
+    barrier();
+  }
+
   for (uint index = gl_GlobalInvocationID.x; index < total; index += stride) {
     uint row = index / params.matrix_n;
     uint column = index - row * params.matrix_n;
@@ -92,14 +120,17 @@ void main() {
           uint word = w4[t];
           uint x_at = x_vec + group * 8u + half_group * 4u + t;
 #ifdef ACT_F32
-          vec4 x_lo = input_x.values[x_at * 2u];
-          vec4 x_hi = input_x.values[x_at * 2u + 1u];
+          vec4 x_lo = stage_x ? x_stage[x_at * 2u]
+                              : input_x.values[x_at * 2u];
+          vec4 x_hi = stage_x ? x_stage[x_at * 2u + 1u]
+                              : input_x.values[x_at * 2u + 1u];
           for (uint e = 0u; e < 8u; ++e) {
             float xv = e < 4u ? x_lo[e] : x_hi[e - 4u];
             accumulator += xv * (scale * float((word >> (e * 4u)) & 0xfu) + bias);
           }
 #else
-          uvec4 x8 = input_x.values[x_at];
+          uvec4 x8 = stage_x ? x_stage[x_at]
+                             : input_x.values[x_at];
           for (uint pair = 0u; pair < 4u; ++pair) {
             uint x_pair = x8[pair];
             accumulator += uintBitsToFloat(x_pair << 16u) *

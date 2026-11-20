@@ -151,6 +151,7 @@ pub const Engine = struct {
     // Reverse teardown is legal only with no pending submission; `orExit` ensures Timeout/InFlight never return here.
     pub fn deinit(e: *Engine) void {
         e.prof.report();
+        vk.ops_q4.reportQmmImages();
         e.state.deinit();
         e.model.deinit();
         e.arena.deinit();
