@@ -60,3 +60,18 @@ test "empty and exact-cap buffers pass through" {
     try cw.writeChunked(&sink, &exact);
     try testing.expect(std.mem.eql(u8, sink.buf.items, &exact));
 }
+
+test "writeFileChunked round-trips through the real file path" {
+    var single: std.Io.Threaded = .init_single_threaded;
+    defer single.deinit();
+    const io = single.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = "bounded file output";
+    try cw.writeFileChunked(io, tmp.dir, "cw-roundtrip.bin", data);
+
+    const result = try tmp.dir.readFileAlloc(io, "cw-roundtrip.bin", testing.allocator, .limited(data.len + 1));
+    defer testing.allocator.free(result);
+    try testing.expectEqualSlices(u8, data, result);
+}
