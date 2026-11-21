@@ -3,6 +3,7 @@ const std = @import("std");
 
 pub const startup_receipt = @import("profile").startup_receipt;
 pub const benchmark_group = @import("core/benchmark_group.zig");
+pub const chunked_write = @import("core/chunked_write.zig");
 pub const safetensors = @import("core/safetensors.zig");
 pub const gguf = @import("core/gguf.zig");
 pub const Checkpoint = checkpoint_host.Checkpoint;
