@@ -3,11 +3,13 @@ const std = @import("std");
 const sys = @import("sys.zig");
 
 pub const Error = error{InvalidEnvironment};
-pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, gemma4, drama3, glm, flashnext };
+pub const Scope = enum { common, cuda, metal, xpu, vulkan, slide, hooks, dsv41, gemma4, drama3, glm, flashnext };
 pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path };
 pub const Rule = struct {
     name: [:0]const u8,
     scope: Scope,
+    /// A second engine scope the setting is checked under, for one name two backends read.
+    also: ?Scope = null,
     kind: Kind,
     forms: []const u8,
     trim: []const u8 = "",
@@ -59,6 +61,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_Q27_COPY_ROWS", .scope = .metal, .kind = .u32, .forms = "a whole number from 0 to 4294967295 (0 disables copied rows)" },
     .{ .name = "TF_Q27_DRAFT_SLOTS", .scope = .metal, .kind = .u32, .forms = "a whole number from 0 to 4294967295 (clamped to the current stream bounds)" },
     .{ .name = "TF_HEAD_GEOMETRY", .scope = .metal, .kind = .size, .forms = "a whole nonnegative native-size geometry count" },
+    .{ .name = "TF_QWEN35_CHUNK", .scope = .metal, .also = .vulkan, .kind = .size, .min = 1, .forms = "whole prompt rows a prefill pass (Metal: 1 to the served context window, default 128; Vulkan: 1 to 64, default 64)" },
     .{ .name = "TF_PROMPT_ROWS", .scope = .metal, .kind = .prompt, .forms = "a multiple of 16 from 128 to 2048 for native serving" },
     .{ .name = "TF_ANE_COLUMNS", .scope = .metal, .kind = .u32, .forms = "a whole column count from 0 to 4294967295 (0 disables the share)" },
     .{ .name = "TF_FLASHNEXT_SCALE_INDEX", .scope = .metal, .kind = .flag, .forms = "0 or 1 (1: Flash Next's 4-bit expert kernels read scales and biases through a 16-bit index)" },
@@ -334,7 +337,7 @@ pub fn path(name: [:0]const u8, raw: ?[]const u8) Error!?[]const u8 {
 
 /// One scope's rules in table order, without allocating: the first malformed value is logged and refused.
 pub fn checkScope(scope: Scope, environment: anytype) Error!void {
-    for (rules) |r| if (r.scope == scope and !masked(r, environment)) {
+    for (rules) |r| if ((r.scope == scope or r.also == scope) and !masked(r, environment)) {
         _ = try checked(r.name, environment.get(r.name));
     };
 }
@@ -353,6 +356,7 @@ pub const Flags = struct {
     cuda: bool = false,
     metal: bool = false,
     xpu: bool = false,
+    vulkan: bool = false,
     slide: bool = false,
     hooks: bool = false,
     dsv41: bool = false,
@@ -370,6 +374,7 @@ pub const Flags = struct {
             .cuda => f.cuda,
             .metal => f.metal,
             .xpu => f.xpu,
+            .vulkan => f.vulkan,
             .slide => f.slide,
             .hooks => f.hooks,
             .dsv41 => f.dsv41,
@@ -384,7 +389,7 @@ pub const Flags = struct {
 /// The environment is injectable so the actual startup validator runs against host fixtures without a GPU.
 pub fn refusal(a: std.mem.Allocator, environment: anytype, flags: Flags) !?[]const u8 {
     for (rules) |r| {
-        if (!flags.includes(r.scope) or masked(r, environment)) continue;
+        if ((!flags.includes(r.scope) and (r.also == null or !flags.includes(r.also.?))) or masked(r, environment)) continue;
         if (std.mem.eql(u8, r.name, "TF_CUDA_DEVICE") and flags.device != null) continue;
         if (std.mem.eql(u8, r.name, "TF_CUDA_SEGMENTS") and flags.segments != null) continue;
         if (std.mem.eql(u8, r.name, "TF_CUDA_CARVEOUT") and flags.carveout) continue;

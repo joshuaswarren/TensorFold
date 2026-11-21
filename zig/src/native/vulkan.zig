@@ -9,6 +9,51 @@ const Allocator = std.mem.Allocator;
 /// Every fence wait inside the engine is bound by this; the probes serve with the same bound.
 const timeout_ns: u64 = 10 * std.time.ns_per_s;
 
+/// TF_QWEN35_CHUNK: whole prompt rows a prefill pass, 1 to the Vulkan kernel's 64; unset keeps the shipped 64.
+fn chunkRows(problem: *[]const u8) !u32 {
+    const settings = @import("sys").environment;
+    comptime settings.registered("TF_QWEN35_CHUNK");
+    const why = "TF_QWEN35_CHUNK: whole prompt rows a prefill pass, 1 to 64 on Vulkan; unset for the shipped 64";
+    const chunk = settings.read(usize, "TF_QWEN35_CHUNK", fam.backend.max_prompt_rows) catch |err| {
+        if (err == error.InvalidEnvironment) {
+            problem.* = why;
+            return error.InvalidChunk;
+        }
+        return err;
+    };
+    if (chunk == 0 or chunk > fam.backend.max_prompt_rows) {
+        problem.* = why;
+        return error.InvalidChunk;
+    }
+    return @intCast(chunk);
+}
+
+test "TF_QWEN35_CHUNK is parsed through platform/environment.zig" {
+    const settings = @import("sys").environment;
+    try std.testing.expectEqual(@as(?u64, null), try settings.parse("TF_QWEN35_CHUNK", null));
+    try std.testing.expectEqual(@as(?u64, 32), try settings.parse("TF_QWEN35_CHUNK", "32"));
+    try std.testing.expectError(error.InvalidEnvironment, settings.parse("TF_QWEN35_CHUNK", "0"));
+    try std.testing.expectError(error.InvalidEnvironment, settings.parse("TF_QWEN35_CHUNK", "4k"));
+}
+
+// The startup refusal runs the setenv dance like the Metal engine's test does.
+test "qwen35 startup: TF_QWEN35_CHUNK refuses before the checkpoint loader runs" {
+    const env = @import("sys").env;
+    const saved = std.c.getenv("TF_QWEN35_CHUNK");
+    defer if (saved) |v| {
+        _ = env.setenv("TF_QWEN35_CHUNK", std.mem.span(v), 1);
+    } else {
+        _ = env.unsetenv("TF_QWEN35_CHUNK");
+    };
+    var problem: []const u8 = "";
+    try std.testing.expectEqual(@as(u32, fam.backend.max_prompt_rows), try chunkRows(&problem)); // unset keeps the shipped 64
+    try std.testing.expectEqual(@as(c_int, 0), env.setenv("TF_QWEN35_CHUNK", "4k", 1));
+    try std.testing.expectError(error.InvalidChunk, chunkRows(&problem));
+    try std.testing.expectEqualStrings("TF_QWEN35_CHUNK: whole prompt rows a prefill pass, 1 to 64 on Vulkan; unset for the shipped 64", problem);
+    try std.testing.expectEqual(@as(c_int, 0), env.setenv("TF_QWEN35_CHUNK", "65", 1));
+    try std.testing.expectError(error.InvalidChunk, chunkRows(&problem));
+}
+
 pub const backends: []const []const u8 = &.{"vulkan"};
 pub const serves: []const []const u8 = &.{"--backend=vulkan"};
 pub const families: []const api.Family = &.{
@@ -174,6 +219,12 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = why;
         return null;
     }
+    // the registry refusal and the chunk read happen before Engine.init: a bad TF_QWEN35_CHUNK never loads weights
+    if (try @import("sys").environment.refusal(a, @import("sys").environment.Process{}, .{ .vulkan = true })) |why| {
+        problem.* = why;
+        return null;
+    }
+    const chunk = chunkRows(problem) catch return null;
     if (o.lanes > 1 and o.lanes_fixed) {
         problem.* = try std.fmt.allocPrint(a, "--parallel {d}: the Vulkan engine serves one stream; serve with --parallel 1", .{o.lanes});
         return null;
@@ -214,7 +265,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     h.host = api.LaneHost.init(gpa, io, &h.core, .{
         .lanes = 1,
         .context_window = @intCast(engine.capacity()),
-        .prefill_step = fam.backend.max_prompt_rows,
+        .prefill_step = chunk,
         .greedy_only = true,
     });
     try h.host.start();

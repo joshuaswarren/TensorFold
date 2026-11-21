@@ -4,6 +4,8 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Qwen3.5 on Vulkan: `TF_QWEN35_CHUNK` now works on the native Vulkan engine like it does on Metal. It sets how many prompt rows one prefill pass takes, from 1 to the Vulkan kernel's 64; unset keeps the shipped 64. A malformed value refuses at startup before any weight byte is read.
+
 - Pull: a hub file path refused for a reserved name or a path escape now names the path and the reason, and the pull exits 1 (#3097).
 
 - Server: a fact graph save whose final rename fails no longer leaves its temporary file behind (#3096).

@@ -69,6 +69,10 @@ pub fn steps(
         },
     }) });
     all.dependOn(&b.addRunArtifact(native_tests).step);
+    b.step("test-qwen35-chunk-startup-vulkan-host", "Qwen3.5 Vulkan startup refuses bad TF_QWEN35_CHUNK before the checkpoint loader runs").dependOn(&b.addRunArtifact(b.addTest(.{
+        .root_module = native_tests.root_module,
+        .filters = &.{"qwen35 startup: TF_QWEN35_CHUNK refuses before the checkpoint loader runs"},
+    })).step);
     // A file-local root discovers tests; a separate imported module does not.
     const family_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/families/qwen3_5/vulkan_test.zig"),

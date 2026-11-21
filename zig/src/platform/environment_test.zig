@@ -3,7 +3,7 @@ const std = @import("std");
 const e = @import("environment.zig");
 const t = std.testing;
 const a = t.allocator;
-const all: e.Flags = .{ .cuda = true, .metal = true, .xpu = true, .slide = true, .hooks = true, .dsv41 = true, .gemma4 = true, .drama3 = true, .glm = true, .flashnext = true };
+const all: e.Flags = .{ .cuda = true, .metal = true, .xpu = true, .vulkan = true, .slide = true, .hooks = true, .dsv41 = true, .gemma4 = true, .drama3 = true, .glm = true, .flashnext = true };
 const Env = struct {
     name: []const u8,
     raw: ?[]const u8,
@@ -109,6 +109,9 @@ const valid = [_]Case{
     .{ .name = "TF_DSV41_ENGRAM_DIR", .raw = "engram-rows", .n = 0 },
     .{ .name = "TF_DSV41_ENGRAM_VERIFY", .raw = "full", .n = 1 },
     .{ .name = "TF_DSV41_ENGRAM_CACHE", .raw = "0", .n = 0 },
+    .{ .name = "TF_QWEN35_CHUNK", .raw = "64", .n = 64 },
+    .{ .name = "TF_QWEN35_CHUNK", .raw = "128", .n = 128 },
+    .{ .name = "TF_QWEN35_CHUNK", .raw = "512", .n = 512 },
 };
 
 test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {
