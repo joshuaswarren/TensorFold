@@ -5,6 +5,7 @@ const check = @import("check.zig");
 const g = @import("core").contract.gates;
 
 const Prompt = @import("contract_qmmf_prompt.zig").Registrations;
+const PromptMx = @import("contract_qmmf_prompt_mx.zig").Registrations;
 const SharedDown = @import("contract_qmmf_shared.zig").Registrations;
 const Grouped = @import("contract_gb10_many.zig").Registrations;
 
@@ -23,6 +24,7 @@ pub const Sets = struct {
     exl3: *@import("contract_exl3.zig").Set,
     shared_down: *SharedDown,
     prompt: *Prompt,
+    prompt_mx: *PromptMx,
     muse: *@import("contract_muse.zig").Group,
     a: std.mem.Allocator,
     joint_schema: *@import("contract_joint_schema.zig").Set,
@@ -71,6 +73,10 @@ pub const Sets = struct {
         prompt.* = Prompt.init(gpu, s, prompt_lane);
         errdefer prompt.deinit();
         try prompt.append(cap, a, list);
+        const prompt_mx = try gpu.gpa.create(PromptMx);
+        prompt_mx.* = PromptMx.init(gpu, s, prompt_lane); // the prompt lane's module carries both prompt tiles
+        errdefer prompt_mx.deinit();
+        try prompt_mx.append(cap, a, list);
         const muse = try @import("contract_muse.zig").Group.create(a, gpu, s, list);
         errdefer muse.destroy(a);
         const joint_schema = try @import("contract_joint_schema.zig").Set.init(gpu, s, a, list);
@@ -94,6 +100,7 @@ pub const Sets = struct {
             .exl3 = exl3,
             .shared_down = shared_down,
             .prompt = prompt,
+            .prompt_mx = prompt_mx,
             .joint_schema = joint_schema,
             .idol = idol,
             .muse = muse,
@@ -109,6 +116,8 @@ pub const Sets = struct {
         sets.idol.deinit();
         sets.joint_schema.deinit();
         sets.muse.destroy(sets.a);
+        sets.prompt_mx.deinit();
+        sets.gpa.destroy(sets.prompt_mx);
         sets.prompt.deinit();
         sets.gpa.destroy(sets.prompt);
         sets.shared_down.deinit();

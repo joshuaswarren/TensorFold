@@ -157,24 +157,39 @@ fn loadTiles(mod: Module, comptime mode: Mode, comptime wide: bool) ![7]Function
 pub const prompt_shared: u32 = 3 * (128 + 128) * group * 2 + 128;
 pub const prompt_rows: usize = 512;
 pub const prompt_k32_shared: u32 = 3 * (128 + 128) * 32 * 2;
+/// MXFP8 prompt tile: 128 rows on the same packed 64-column tiles, eight warps and four stages (Tile<MXFP8, 128, 64, 2, 4, 4>).
+pub const prompt_mx_shared: u32 = 4 * ((128 * group * 2 + bn * group + bn * 2 + 127) / 128 * 128);
 
 pub fn promptK32Symbol(comptime out: Out) [:0]const u8 {
     return std.fmt.comptimePrint("_ZN7tf_qmmf22qmmf_prompt_k32_kernelILb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{@intFromBool(out == .f32)});
 }
 
-/// The prompt tile's blocks: its K slices meet inside a block, so one block per 128 x 128 output tile.
-pub fn promptBlocks(m: usize, n: usize) usize {
-    return (m + 127) / 128 * ((n + 127) / 128);
+/// A prompt tile's blocks: its K slices meet inside a block, so one block per 128-row, `cols`-column output tile.
+pub fn promptBlocks(m: usize, n: usize, cols: usize) usize {
+    return (m + 127) / 128 * ((n + cols - 1) / cols);
+}
+
+/// Columns a mode's prompt tile covers a block: the BF16 tile's 128, else the packed column tiles' 64.
+pub fn promptCols(mode: Mode) usize {
+    return if (mode == .bf16) 128 else bn;
 }
 
 pub fn promptSymbol(comptime out: Out, comptime fused: bool) [:0]const u8 {
     return std.fmt.comptimePrint("_ZN7tf_qmmf11qmmf_kernelILi4ELi128ELi128ELi2ELi4ELi3ELb{d}ELb0ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ @intFromBool(out == .f32), @intFromBool(fused) });
 }
 
-/// Only large BF16 grids use the prompt tile; the packed allocation contains complete 128-column tiles.
+/// The MXFP8 prompt tile's name: 128 rows a block over the packed 64-column tiles, two warps of rows.
+pub fn promptMxSymbol(comptime out: Out, comptime fused: bool) [:0]const u8 {
+    return std.fmt.comptimePrint("_ZN7tf_qmmf11qmmf_kernelILi2ELi128ELi64ELi2ELi4ELi4ELb{d}ELb0ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ @intFromBool(out == .f32), @intFromBool(fused) });
+}
+
+/// Only large grids use a prompt tile; the packed allocation contains complete column tiles.
 pub fn promptEligible(m: usize, w: Weight) bool {
-    return m >= prompt_rows and w.mode == .bf16 and w.n >= 128 and
+    if (m < prompt_rows) return false;
+    if (w.mode == .bf16) return w.n >= 128 and
         (w.k >= 512 or (w.n == 10240 and w.k == 320)) and w.npad % 128 == 0;
+    return w.mode == .mxfp8 and w.n >= bn and
+        (w.k >= 512 or (w.n == 10240 and w.k == 320)) and w.npad % bn == 0;
 }
 
 pub const Lane = struct {
@@ -189,6 +204,7 @@ pub const Lane = struct {
     fuse_split_n: usize = 0,
     fuse_s: [2][2][2]Function = undefined, // by halfModeIndex, Out, row tile 16 then 32: the fused form at decode rows
     prompt: ?[2][2]Function = null, // Out, then plain / fused; loadPrompt() fills it on sm_12x
+    prompt_mx: ?[2][2]Function = null, // the MXFP8 128-row prompt tile, same Out / fused layout
     prompt_k32: ?[2]Function = null, // Out; unsplit BF16 prompt calls, loadPrompt() fills it on sm_12x
     prompt_sms: usize = 0, // the device's SMs: the tile runs when its blocks fill more than half of them
     clusters: bool, // sm_90 on: slices meet in a cluster's shared memory
@@ -244,12 +260,19 @@ pub const Lane = struct {
             try f.allowDynamicShared(prompt_k32_shared);
             k32[oi] = f;
         }
+        var mx: [2][2]Function = undefined;
+        inline for (.{ Out.bf16, Out.f32 }, 0..) |out, oi| inline for (.{ false, true }, 0..) |fused, fi| {
+            const f = try l.mod.function(promptMxSymbol(out, fused));
+            try f.allowDynamicShared(prompt_mx_shared);
+            mx[oi][fi] = f;
+        };
         var dev: abi.Device = 0;
         try d.check(d.api.cuCtxGetDevice(&dev), "cuCtxGetDevice");
         var sms: c_int = 0;
         try d.check(d.api.cuDeviceGetAttribute(&sms, .multiprocessor_count, dev), "cuDeviceGetAttribute");
         l.prompt = prompt;
         l.prompt_k32 = k32;
+        l.prompt_mx = mx;
         l.prompt_sms = @intCast(@max(sms, 1));
     }
 
@@ -278,8 +301,9 @@ pub const Lane = struct {
     /// The actual prompt selection: loaded tiles, the pinned slice plan, and blocks over half the SMs.
     pub fn usesPrompt(l: Lane, m: usize, w: Weight) bool {
         const p = planFor(m, w, l.clusters);
-        return promptEligible(m, w) and !p.cluster and !p.reduce and l.prompt != null and
-            2 * promptBlocks(m, w.n) > l.prompt_sms;
+        return promptEligible(m, w) and !p.cluster and !p.reduce and
+            (if (w.mode == .bf16) l.prompt != null else l.prompt_mx != null) and
+            2 * promptBlocks(m, w.n, promptCols(w.mode)) > l.prompt_sms;
     }
 
     /// matmul() writing y as `out` says: bf16, or fp32.
@@ -289,15 +313,15 @@ pub const Lane = struct {
         const set = (if (out == .f32) l.f32_fns else l.fns)[modeIndex(w.mode)];
         const ti: usize = if (p.bm == 16) 0 else if (p.bm == 32) 1 else 2;
         const prompt = l.usesPrompt(m, w);
-        const k32 = prompt and p.sk == 1 and l.prompt_k32 != null;
+        const k32 = prompt and p.sk == 1 and w.mode == .bf16 and l.prompt_k32 != null;
         const bm: usize = if (prompt) 128 else p.bm;
         const rows_t = (m + bm - 1) / bm;
         const hm = halfModeIndex(w.mode);
         // fuse_split_n: a cluster call this wide on the fused form (row tile 64: the fused instance), one block a tile
         const fs = l.fuse_split_n != 0 and p.cluster and w.n >= l.fuse_split_n and hm != null;
         const half = hm != null and p.bm == 16 and !p.fused and !fs and rows_t * ((w.n + bn - 1) / bn) * p.sk < l.half_below;
-        const f = if (k32) l.prompt_k32.?[@backingInt(out)] else if (prompt) l.prompt.?[@backingInt(out)][@intFromBool(p.fused)] else if (half) l.half[hm.?][@backingInt(out)][@intFromBool(p.cluster)] else if (fs) (if (p.bm == 64) set[6] else l.fuse_s[hm.?][@backingInt(out)][@intFromBool(p.bm == 32)]) else if (p.fused) set[6] else set[ti * 2 + @intFromBool(p.cluster)];
-        const cols: usize = if (prompt) 128 else if (half) 32 else bn;
+        const f = if (k32) l.prompt_k32.?[@backingInt(out)] else if (prompt) (if (w.mode == .bf16) l.prompt.? else l.prompt_mx.?)[@backingInt(out)][@intFromBool(p.fused)] else if (half) l.half[hm.?][@backingInt(out)][@intFromBool(p.cluster)] else if (fs) (if (p.bm == 64) set[6] else l.fuse_s[hm.?][@backingInt(out)][@intFromBool(p.bm == 32)]) else if (p.fused) set[6] else set[ti * 2 + @intFromBool(p.cluster)];
+        const cols: usize = if (prompt) promptCols(w.mode) else if (half) 32 else bn;
         const band = @max(1, @min(rows_t, (12 << 20) / (bm * w.k * 2)));
         var args: launch_.Args = .{};
         args.add(x);
@@ -316,7 +340,7 @@ pub const Lane = struct {
         try launch_.launch(f, .{
             .grid = .{ .x = @intCast(rows_t * ((w.n + cols - 1) / cols)), .y = 1, .z = if (p.fused or fs) 1 else p.sk },
             .block = .{ .x = if (prompt) 256 else threads, .y = 1, .z = 1 },
-            .shared = if (k32) prompt_k32_shared else if (prompt) prompt_shared else if (half) halfShared(w.mode) else sharedBytes(w.mode, p.bm),
+            .shared = if (k32) prompt_k32_shared else if (prompt) (if (w.mode == .bf16) prompt_shared else prompt_mx_shared) else if (half) halfShared(w.mode) else sharedBytes(w.mode, p.bm),
             .cluster = if (p.cluster and !fs) .{ .x = 1, .y = 1, .z = p.sk } else null,
             .pdl = l.pdl and !prompt, // the prompt entries do not wait
         }, s, &args);
