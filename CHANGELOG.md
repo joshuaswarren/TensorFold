@@ -2049,9 +2049,6 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## 1.2.2
 
-- The Nemotron XPU loader and the XPU safetensors reader read shard headers through core, so a malformed or oversized header is refused before anything is read (#1919). Thanks to @jschmied.
-
-
 - CUDA lanes: Gemma 4, MiniMax M3, Kolibri-1, Spark 2.5 and Dory can verify root and context copies as Nemotron does, opt-in: set `TF_GEMMA4_COPIES`, `TF_MINIMAX_COPIES`, `TF_KOLIBRI_COPIES`, `TF_SPARK_COPIES` or `TF_DORY_COPIES` to 1. Replies equal `"draft": false`, and unset is the old policy (#2022, part of #1910).
 
 - The dense Qwen3.5 Metal loader takes its shape from the checkpoint's config rather than the 27B's fixed geometry, checked against the 27B, 9B and 2B with identical tokens (#1817).
@@ -2079,8 +2076,6 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 - Docs: the cache benchmark receipts say which tool-call content they count (#1999). Thanks to @garvrao80.
 
 - `zig build test-info-config` runs info's issue-934 test again: it was built from the CUDA CLI root, which never reached it (#2006). Thanks to @jishnuvenugopal.
-
-- The Vulkan engine records its dispatches into one command buffer and submits when 128 are waiting, or when the next upload, download or fill needs the queue, instead of one submission and fence wait per dispatch. Each pipeline holds a ring of 256 descriptor sets. No kernel changes, so the logits are byte-identical. On a 13-inch M1 with Qwen3.5-2B 4-bit and tiled projections, a run took 68% less time on a 24-token prompt, 49% less on a 256-token document and 30% less on a 1,024-token document. Receipts: [docs/receipts/vulkan-submit-batch-m1](docs/receipts/vulkan-submit-batch-m1/README.md).
 
 - The Nemotron XPU loader and the XPU safetensors reader read shard headers through core, so a malformed or oversized header is refused before anything is read (#1919). Thanks to @jschmied.
 
