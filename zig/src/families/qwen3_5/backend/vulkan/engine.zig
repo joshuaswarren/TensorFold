@@ -97,6 +97,7 @@ pub const Engine = struct {
         e.gpa = gpa;
         e.timeout_ns = timeout_ns;
         e.poisoned = false;
+        e.prof = .{};
 
         e.rt = try gpa.create(vk.Runtime);
         errdefer gpa.destroy(e.rt);

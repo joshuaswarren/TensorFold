@@ -1,0 +1,18 @@
+{
+ "case": "document-1024",
+ "chip": "Apple M1 Max (jwm1)",
+ "kernel_release": "7.3.0-2-20261110.1-lab-ARCH",
+ "mesa": "Honeykrisp, Omarchy Mesa build",
+ "checkpoint": "Qwen3.5-2B-MLX-4bit, revision 93760be4",
+ "settings": "TF_Q35_VK_PROFILE=1, free-running greedy, 64 steps, --context 7168, --vendor 0x10005, gpu-turn ticket, fresh process per run",
+ "base_commit": "b437529f86",
+ "elf_sha256": "c5cdc20ec54e5ee2bea66fefe6e239e06fad2617f0664d8e6c01f4e8b053e022",
+ "generated_ids_hash": "a472a62c7e221de2b9ec38e07b72011f29abc6f23adc393cf0f7b7cae2259c37",
+ "logits_bf16_sha256": "82c353787e896b52c8def7f4cebbc087d42f71c4837505db8100df67b2235356",
+ "identical_greedy_tokens_two_runs": true,
+ "pinned_commit_teardown_panic": "u64 sum over uninitialized Prof.wall_ns (0xaa fill); fixed by e.prof = .{}",
+ "processes": [
+  {"label": "pr1", "rc": 0, "elapsed_ms": 46199, "profiled_rounds": 64},
+  {"label": "pr2", "rc": 0, "elapsed_ms": 46956, "profiled_rounds": 64}
+ ]
+}
