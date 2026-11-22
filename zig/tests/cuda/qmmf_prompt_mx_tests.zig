@@ -23,3 +23,24 @@ pub const projections = [_]Projection{
     .{ .name = "final HC down", .n = 320, .k = 10240, .out = .f32 },
     .{ .name = "MTP hidden", .n = 2560, .k = 2560, .out = .f32 },
 };
+
+test "qmmf MXFP8 prompt scratch bounds every projection and the eligibility edges" {
+    try std.testing.expectEqual(@as(u32, 82432), q.prompt_mx_shared);
+    try std.testing.expectEqual(q.sharedBytes(.mxfp8, 128), q.prompt_mx_shared);
+    try std.testing.expectEqual(@as(usize, 64), q.promptCols(.mxfp8));
+    try std.testing.expectEqual(@as(usize, 128), q.promptCols(.bf16));
+    try std.testing.expectEqual(@as(usize, 4 * 258), q.promptBlocks(512, 16480, q.promptCols(.mxfp8)));
+
+    for (projections) |p| {
+        const w = try q.pinned(cuda.mxfp8.weight(0, 0, p.n, p.k), q.splitK(p.n, p.k));
+        try std.testing.expect(q.promptEligible(q.prompt_rows, w));
+        try std.testing.expect(!q.promptEligible(q.prompt_rows - 1, w));
+    }
+
+    const hc_up = try q.pinned(cuda.mxfp8.weight(0, 0, 10240, 320), 1);
+    try std.testing.expect(q.promptEligible(512, hc_up));
+    const small_k = try q.pinned(cuda.mxfp8.weight(0, 0, 640, 320), 1);
+    try std.testing.expect(!q.promptEligible(512, small_k));
+    const narrow = try q.pinned(cuda.mxfp8.weight(0, 0, 48, 512), 1);
+    try std.testing.expect(!q.promptEligible(512, narrow));
+}

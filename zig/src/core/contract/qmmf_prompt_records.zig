@@ -37,19 +37,7 @@ fn k32(comptime wide: bool) registry.CudaRecord {
     }, .usage = usage(120), .later_pending = true };
 }
 
-fn mxfp8(comptime wide: bool, comptime fused: bool) registry.CudaRecord {
-    return .{ .launch = .{
-        .name = "qmmf MXFP8 prompt 128x64 " ++ (if (wide) "fp32" else "bf16") ++ (if (fused) " fused slices" else " unsplit"),
-        .symbol = std.fmt.comptimePrint("_ZN7tf_qmmf11qmmf_kernelILi2ELi128ELi64ELi2ELi4ELi4ELb{d}ELb0ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ @intFromBool(wide), @intFromBool(fused) }),
-        .image = "qmmf",
-        .threads = 256,
-        .dynamic = 82944,
-        .opt_in = true,
-        .min_sm = 120,
-    }, .usage = usage(if (fused) 255 else 168), .later_pending = true };
-}
-
-pub const records = [_]registry.CudaRecord{ record(false, false), record(false, true), record(true, false), record(true, true), k32(false), k32(true), mxfp8(false, false), mxfp8(false, true), mxfp8(true, false), mxfp8(true, true) };
+pub const records = [_]registry.CudaRecord{ record(false, false), record(false, true), record(true, false), record(true, true), k32(false), k32(true) };
 
 test "qmmf prompt launch records hold nvcc 13.0's usage on sm_12x, later releases pending" {
     try std.testing.expectEqual(@as(usize, 0), try registry.checkCuda(std.testing.allocator, records[0..4], true));

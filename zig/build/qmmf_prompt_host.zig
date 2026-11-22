@@ -31,4 +31,24 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, core: *std.Build.Module, st
     }), .filters = &.{"qmmf prompt contract"} }));
     b.step("test-qmmf-prompt-contract-host", "BF16 K64 and K32 prompt instances, controls and limits without a GPU").dependOn(&qmmf_prompt_contract.step);
     step.dependOn(&qmmf_prompt_contract.step);
+    const mx_scratch = b.step("test-qmmf-prompt-mx-scratch-host", "MXFP8 prompt scratch bounds in Debug and ReleaseFast without a GPU");
+    for ([_]std.builtin.OptimizeMode{ .debug, .fast }) |optimize| {
+        const tests = b.createModule(.{
+            .root_source_file = b.path("zig/tests/cuda/qmmf_prompt_mx_tests.zig"),
+            .target = host,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "cuda", .module = runtime(b, host, optimize, &.{}) }},
+        });
+        mx_scratch.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = tests })).step);
+    }
+    step.dependOn(mx_scratch);
+    const qmmf_prompt_mx_contract = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/contract_qmmf_prompt_mx.zig"),
+        .target = host,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core } },
+    }), .filters = &.{"qmmf MXFP8 prompt contract"} }));
+    b.step("test-qmmf-prompt-mx-contract-host", "MXFP8 128x64 prompt instances, controls and limits without a GPU").dependOn(&qmmf_prompt_mx_contract.step);
+    step.dependOn(&qmmf_prompt_mx_contract.step);
 }

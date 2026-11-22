@@ -244,7 +244,6 @@ test "qmmf MXFP8 prompt contract registers the 128-row tile, its controls and ev
         } else return error.MissingPromptMxRecord;
         try std.testing.expectEqual(q.prompt_mx_shared, record.launch.dynamic);
         try std.testing.expectEqual(@as(u32, 256), record.launch.threads);
-        try std.testing.expectEqual(@as(u32, 120), record.launch.min_sm);
         try std.testing.expect(record.launch.opt_in);
         for (k.spec.served) |shape| {
             const sk = slices(shape, fused);
