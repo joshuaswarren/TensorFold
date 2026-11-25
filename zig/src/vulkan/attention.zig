@@ -171,6 +171,7 @@ pub const Attention = struct {
     pub fn attend(a: *Attention, cmds: *Commands, y: View, queries: View, cache_keys: View, cache_values: View, prefix: u64, rows: u64, capacity: u64, timeout_ns: u64) Error!void {
         const plan = try attendPlan(prefix, rows, capacity, queries.elements, y.elements, cache_keys.elements, cache_values.elements);
         if (y.kind != queries.kind or (queries.kind != .bf16 and queries.kind != .f32)) return error.Invalid;
+        if (cache_keys.kind != .bf16 or cache_values.kind != .bf16) return error.Invalid;
         if (y.overlaps(queries) or y.overlaps(cache_keys) or y.overlaps(cache_values)) return error.Aliased;
         const pipe = if (queries.kind == .f32) &a.sdpa_f32q else &a.sdpa_bf16;
         try pipe.bind(&.{ queries.bind(), cache_keys.bind(), cache_values.bind(), y.bind() });
@@ -193,7 +194,7 @@ pub const Attention = struct {
     pub fn gateOutput(a: *Attention, cmds: *Commands, out: View, ctx: View, qraw: View, rows: u64, timeout_ns: u64) Error!void {
         const plan = try gatePlan(out.elements, ctx.elements, qraw.elements, rows);
         const wide = out.kind == .f32;
-        if (ctx.kind != out.kind or qraw.kind != out.kind) return error.Invalid;
+        if ((out.kind != .bf16 and out.kind != .f32) or ctx.kind != out.kind or qraw.kind != out.kind) return error.Invalid;
         if (out.overlaps(ctx) or out.overlaps(qraw)) return error.Aliased;
         const pipe = if (wide) &a.gate_f32 else &a.gate_bf16;
         try pipe.bind(&.{ ctx.bind(), qraw.bind(), out.bind() });
@@ -345,6 +346,42 @@ test "gatePlan derives the word count and refuses torn rows" {
     try testing.expectError(error.Invalid, gatePlan(4 * 2048, 4 * 2048 + 1, 4 * 4096, 4));
     try testing.expectError(error.Invalid, gatePlan(4 * 2048, 4 * 2048, 4 * 4095, 4));
     try testing.expectError(error.Invalid, gatePlan(0, 0, 0, 0));
+}
+
+test "attend refuses cache views that are not bf16 before any dispatch" {
+    var a: Attention = undefined;
+    var cmds: Commands = undefined;
+    var buf: Buffer = undefined;
+    buf.len = 4 << 20;
+    const cache = kv_heads * 128 * head_dim;
+    const q = try View.init(&buf, .bf16, 0, query_heads * head_dim);
+    const y = try View.init(&buf, .bf16, 1 << 20, query_heads * head_dim);
+    const k = try View.init(&buf, .bf16, 2 << 20, cache);
+    const v = try View.init(&buf, .bf16, 3 << 20, cache);
+    const k_f32 = try View.init(&buf, .f32, 2 << 20, cache);
+    const v_u16 = try View.init(&buf, .u16, 3 << 20, cache);
+    try testing.expectError(error.Invalid, a.attend(&cmds, y, q, k_f32, v, 0, 1, 128, 0));
+    try testing.expectError(error.Invalid, a.attend(&cmds, y, q, k, v_u16, 0, 1, 128, 0));
+}
+
+test "gateOutput accepts only bf16 or f32 views" {
+    var a: Attention = undefined;
+    var cmds: Commands = undefined;
+    var buf: Buffer = undefined;
+    buf.len = 1 << 20;
+    const elems = gate_row_elems;
+    const out32 = try View.init(&buf, .u32, 0, elems);
+    const ctx32 = try View.init(&buf, .u32, 1 << 16, elems);
+    const qraw32 = try View.init(&buf, .u32, 1 << 17, 2 * elems);
+    try testing.expectError(error.Invalid, a.gateOutput(&cmds, out32, ctx32, qraw32, 1, 0));
+    const out16 = try View.init(&buf, .u16, 0, elems);
+    const ctx16 = try View.init(&buf, .u16, 1 << 16, elems);
+    const qraw16 = try View.init(&buf, .u16, 1 << 17, 2 * elems);
+    try testing.expectError(error.Invalid, a.gateOutput(&cmds, out16, ctx16, qraw16, 1, 0));
+    const out = try View.init(&buf, .bf16, 0, elems);
+    const ctx16m = try View.init(&buf, .u16, 1 << 16, elems);
+    const qraw = try View.init(&buf, .bf16, 1 << 17, 2 * elems);
+    try testing.expectError(error.Invalid, a.gateOutput(&cmds, out, ctx16m, qraw, 1, 0));
 }
 
 test "rope push flags match the masks the embedded rope shader actually tests" {

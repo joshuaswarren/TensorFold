@@ -122,7 +122,7 @@ void main() {
     }
   }
 
-  if (lane == 0u) {
+  if (!isq && !isk && lane == 0u) {
     vec2 gates = oracle_gate(SPLIT_LOAD(ain.v[t * 16u + hv]),
                           SPLIT_LOAD(bin.v[t * 16u + hv]),
                           alog.v[hv],

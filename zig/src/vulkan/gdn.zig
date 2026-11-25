@@ -553,3 +553,12 @@ test "gdn push flags match the masks the embedded shaders actually test" {
     try testing.expect(std.mem.indexOf(u8, src.gdn_conv_decode, "(params.flags & 1u)") != null);
     try testing.expect(std.mem.indexOf(u8, src.gdn_conv_decode, "(params.flags & 2u)") != null);
 }
+
+test "gdn split stores the gates from the value workgroups only" {
+    // The Q and K workgroups of a head computed the same gate entries and stored them
+    // unsynchronized beside the V workgroup's store; only the V workgroup writes now.
+    const src = @import("vulkan_comp_sources").gdn_split;
+    try testing.expect(std.mem.indexOf(u8, src, "if (!isq && !isk && lane == 0u)") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "g_out.v[t * 16u + hv]"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, "beta.v[t * 16u + hv]"));
+}

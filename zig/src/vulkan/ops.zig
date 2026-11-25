@@ -152,6 +152,7 @@ pub const Ops = struct {
     pub fn deinit(o: *Ops) void {
         o.qmm_bf16.deinit();
         o.qmm_q4_vec4.deinit();
+        o.qmm_f32.deinit();
         o.qmm_q4_tile.deinit();
         o.qmm_q4_tile_rows.deinit();
         o.qmm_q4_tile_f32.deinit();
@@ -256,6 +257,7 @@ pub const Ops = struct {
 };
 
 const testing = std.testing;
+const c = @import("vk");
 
 test "gather plans derive the window and refuse torn shapes" {
     const plan = try gatherPlan(6 * 128, 512 * 128, 6, 512);
@@ -295,4 +297,45 @@ test "dispatch groups round up without wrapping" {
     try testing.expectEqual([3]u32{ 1, 1, 1 }, dispatchGroups(256, 256));
     try testing.expectEqual([3]u32{ 2, 1, 1 }, dispatchGroups(257, 256));
     try testing.expectEqual([3]u32{ (1 << 32) / 256, 1, 1 }, dispatchGroups(std.math.maxInt(u32), 256));
+}
+
+test "ops deinit destroys every pipeline the struct holds" {
+    const Calls = struct {
+        var pipelines: usize = 0;
+        var buffers: usize = 0;
+        fn destroyPipeline(_: c.VkDevice, _: c.VkPipeline, _: ?*const c.VkAllocationCallbacks) callconv(.c) void {
+            pipelines += 1;
+        }
+        fn destroyPool(_: c.VkDevice, _: c.VkDescriptorPool, _: ?*const c.VkAllocationCallbacks) callconv(.c) void {}
+        fn destroyPipeLayout(_: c.VkDevice, _: c.VkPipelineLayout, _: ?*const c.VkAllocationCallbacks) callconv(.c) void {}
+        fn destroySetLayout(_: c.VkDevice, _: c.VkDescriptorSetLayout, _: ?*const c.VkAllocationCallbacks) callconv(.c) void {}
+        fn destroyBuffer(_: c.VkDevice, _: c.VkBuffer, _: ?*const c.VkAllocationCallbacks) callconv(.c) void {
+            buffers += 1;
+        }
+        fn freeMemory(_: c.VkDevice, _: c.VkDeviceMemory, _: ?*const c.VkAllocationCallbacks) callconv(.c) void {}
+    };
+    var api: device.DeviceApi = undefined;
+    api.vkDestroyPipeline = Calls.destroyPipeline;
+    api.vkDestroyDescriptorPool = Calls.destroyPool;
+    api.vkDestroyPipelineLayout = Calls.destroyPipeLayout;
+    api.vkDestroyDescriptorSetLayout = Calls.destroySetLayout;
+    api.vkDestroyBuffer = Calls.destroyBuffer;
+    api.vkFreeMemory = Calls.freeMemory;
+    var dev: Device = undefined;
+    dev.api = api;
+    dev.handle = @ptrFromInt(0x1000);
+    var o: Ops = undefined;
+    o.dev = &dev;
+    var want: usize = 0;
+    const info = @typeInfo(Ops).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        if (T == dispatch.Pipeline) {
+            @field(o, name) = .{ .dev = &dev, .layout = undefined, .local = .{ 1, 1, 1 } };
+            want += 1;
+        }
+    }
+    o.dummy = .{ .dev = &dev, .handle = @ptrFromInt(0x2000), .memory = @ptrFromInt(0x3000), .len = 0, .kind = .device, .mapped = null, .coherent = false };
+    o.deinit();
+    try testing.expectEqual(want, Calls.pipelines);
+    try testing.expectEqual(@as(usize, 1), Calls.buffers);
 }
