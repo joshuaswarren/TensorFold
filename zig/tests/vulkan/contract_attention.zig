@@ -107,6 +107,36 @@ pub fn finiteRows(case: TileCase) u64 {
     return case.poison_from - case.prefix;
 }
 
+/// A served-shape P*V parity case against the parent's per-row kernel: the tiled prefill's
+/// output must byte-match the row decoded alone at the same geometry, in the bf16 and f32 arms.
+///
+/// The geometry is the fitted 254-token prompt's real chunk and key counts: four prefill
+/// chunks of at most 64 rows at prefixes 0/64/128/192 inside the served 1024-key context;
+/// row r sees prefix+r+1 keys.
+///
+/// The reported divergence (PR #3431 vs its #3417 parent, RTX 5060 Ti) is one f32 ULP in
+/// P*V with scores and softmax byte-identical. The dyadic fixture values cannot show it:
+/// every dyadic product and sum is exact, so any accumulation order or FMA contraction
+/// yields identical bits. These cases plant dense full-mantissa bf16 data instead.
+///
+/// Equality on a corrected head: this case passes when `tiled` is byte-identical to the
+/// per-row output (`std.mem.indexOfDiff` null) in both arms, and `tf-attention-contract`
+/// returns passed=total with the sdpa-pv MILESTONE lines printed.
+pub const PvCase = struct {
+    name: []const u8,
+    rows: u64,
+    prefix: u64,
+    capacity: u64 = 1024, // the served --context; valid keys per call are prefix + rows
+};
+
+// The served 254-token prompt decomposes into these 64-row prefill chunks (last is 62 rows).
+pub const pv_parity_cases = [_]PvCase{
+    .{ .name = "served-254 chunk0 64r@0", .rows = 64, .prefix = 0 },
+    .{ .name = "served-254 chunk1 64r@64", .rows = 64, .prefix = 64 },
+    .{ .name = "served-254 chunk2 64r@128", .rows = 64, .prefix = 128 },
+    .{ .name = "served-254 chunk3 62r@192", .rows = 62, .prefix = 192 },
+};
+
 // Attend f64 dots/max/softmax/output for n=prefix+r+1 in (kv_head,capacity,head_dim); matches fx.Attend.init order.
 pub fn attendRef(
     a: std.mem.Allocator,

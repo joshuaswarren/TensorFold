@@ -130,6 +130,12 @@ fn probe(a: std.mem.Allocator, clock: Elapsed, vendor: ?u32, timeout: u64) !bool
         const f32_ok = if (bf16_ok) try sdpaTileGate(a, clock, &dev, &cmds, staging, &attn, case, 0x71e5, timeout, true) else false;
         passed += @intFromBool(bf16_ok and f32_ok);
     }
+    for (ca.pv_parity_cases, 0..) |case, i| {
+        total += 1;
+        const bf16_ok = try sdpaPvGate(a, clock, &dev, &cmds, staging, &attn, case, 0x4e34 + @as(u64, i), timeout, false);
+        const f32_ok = try sdpaPvGate(a, clock, &dev, &cmds, staging, &attn, case, 0x4e34 + @as(u64, i), timeout, true);
+        passed += @intFromBool(bf16_ok and f32_ok);
+    }
     std.debug.print("RESULT attention-contract elapsed_ms={d} on \"{s}\": passed={d} total={d}\n", .{ clock.ms(), name, passed, total });
     return passed == total;
 }
@@ -463,6 +469,97 @@ fn sdpaTileGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmd
         "tiled byte-identical to per-row decode, {d} finite rows finite, {d} plant rows non-finite{s}\n", .{
         clock.ms(), case.name,  arm,                                             case.rows, case.prefix, case.poison_from, case.capacity,
         finite,     plant_rows, if (case.zero_qk) ", row 0 exactly 1.0" else "",
+    });
+    return true;
+}
+
+// Full-mantissa bf16 in [-2, 2): only dense data exposes an accumulation-order or FMA-contraction
+// difference; the dyadic fixture's exact products round identically under every order.
+fn sampleDense(rng: std.Random) u16 {
+    return cx.toBf16(rng.float(f32) * 4.0 - 2.0);
+}
+
+// Served-shape P*V parity: dense data at the fitted 254-token prompt's chunk geometry; the
+// tiled P*V must byte-match each row decoded alone by sdpa_rows, the parent's path. A FAIL
+// prints the flat output index (decoded to row/head/dim) and both values of the first
+// differing P*V element. On a corrected head indexOfDiff is null in both arms.
+fn sdpaPvGate(a: std.mem.Allocator, clock: Elapsed, dev: *const vk.Device, cmds: *vk.Commands, staging: vk.Buffer, attn: *vk.Attention, case: ca.PvCase, seed: u64, timeout: u64, comptime wide: bool) !bool {
+    const El = if (wide) u32 else u16;
+    const arm: []const u8 = if (wide) "f32" else "bf16";
+    const row_elems: u64 = fx.heads * fx.head_dim;
+    const q_len: usize = @intCast(case.rows * row_elems);
+    const cache_elems: usize = @intCast(fx.kv_heads * case.capacity * fx.head_dim);
+    const q_bits = try a.alloc(u16, q_len);
+    defer a.free(q_bits);
+    const k_bits = try a.alloc(u16, cache_elems);
+    defer a.free(k_bits);
+    const v_bits = try a.alloc(u16, cache_elems);
+    defer a.free(v_bits);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    for (q_bits) |*x| x.* = sampleDense(rng);
+    for (k_bits) |*x| x.* = sampleDense(rng);
+    for (v_bits) |*x| x.* = sampleDense(rng);
+    var keys = try upload16(dev, cmds, staging, k_bits, timeout);
+    defer keys.deinit();
+    var values = try upload16(dev, cmds, staging, v_bits, timeout);
+    defer values.deinit();
+    // Wide q rides the f32 path: bf16 widens exactly, so both arms see identical queries over the same bf16 cache.
+    var q = if (wide) wq: {
+        const words = try a.alloc(u32, q_len);
+        defer a.free(words);
+        for (q_bits, 0..) |bits, i| words[i] = @bitCast(@as(f32, @floatCast(cx.fromBf16(bits))));
+        break :wq try upload32(dev, cmds, staging, words, timeout);
+    } else try upload16(dev, cmds, staging, q_bits, timeout);
+    defer q.deinit();
+    const q_view = try vk.tensor.View.init(&q, if (wide) .f32 else .bf16, 0, @intCast(q_len));
+    const keys_view = try vk.tensor.View.init(&keys, .bf16, 0, @intCast(k_bits.len));
+    const values_view = try vk.tensor.View.init(&values, .bf16, 0, @intCast(v_bits.len));
+    const tiled = try a.alloc(El, q_len);
+    defer a.free(tiled);
+    {
+        const shell_poison: El = if (wide) 0x7fc00000 else fx.poison16;
+        const shell = try a.alloc(El, q_len + fx.tail);
+        defer a.free(shell);
+        @memset(shell, shell_poison);
+        var out = try uploadWords(El, dev, cmds, staging, shell, timeout);
+        defer out.deinit();
+        const y_view = try vk.tensor.View.init(&out, if (wide) .f32 else .bf16, 0, @intCast(q_len));
+        try vk.orExit(attn.attend(cmds, y_view, q_view, keys_view, values_view, null, case.prefix, case.rows, case.capacity, timeout));
+        try fetch(cmds, staging, out, std.mem.sliceAsBytes(tiled), timeout);
+    }
+    const old = try a.alloc(El, q_len);
+    defer a.free(old);
+    {
+        const shell_poison: El = if (wide) 0x7fc00000 else fx.poison16;
+        const shell = try a.alloc(El, @intCast(row_elems + fx.tail));
+        defer a.free(shell);
+        @memset(shell, shell_poison);
+        var one = try uploadWords(El, dev, cmds, staging, shell, timeout);
+        defer one.deinit();
+        const y_view = try vk.tensor.View.init(&one, if (wide) .f32 else .bf16, 0, @intCast(row_elems));
+        for (0..@as(usize, @intCast(case.rows))) |r| {
+            const q_row = try q_view.slice(@intCast(r * row_elems), @intCast(row_elems));
+            try vk.orExit(vk.upload(cmds, one, 0, staging, std.mem.sliceAsBytes(shell), timeout));
+            try vk.orExit(attn.attend(cmds, y_view, q_row, keys_view, values_view, null, case.prefix + @as(u64, r), 1, case.capacity, timeout));
+            try fetch(cmds, staging, one, std.mem.sliceAsBytes(old[@intCast(r * row_elems)..][0..@intCast(row_elems)]), timeout);
+        }
+    }
+    if (std.mem.indexOfDiff(El, tiled, old)) |at| {
+        const tv: f32 = if (wide) @bitCast(tiled[at]) else @floatCast(cx.fromBf16(tiled[at]));
+        const ov: f32 = if (wide) @bitCast(old[at]) else @floatCast(cx.fromBf16(old[at]));
+        const rem = at % @as(usize, @intCast(row_elems));
+        std.debug.print("FAIL sdpa-pv case=\"{s}\" {s}: first differing P*V value at flat element {d} " ++
+            "(row {d}, head {d}, dim {d}): tiled={d} per-row={d} delta={e}\n", .{
+            case.name,                   arm,                        at,
+            at / @as(usize, @intCast(row_elems)), rem / @as(usize, @intCast(fx.head_dim)), rem % @as(usize, @intCast(fx.head_dim)),
+            tv, ov, tv - ov,
+        });
+        return false;
+    }
+    std.debug.print("MILESTONE sdpa-pv elapsed_ms={d} case=\"{s}\" {s} rows={d} prefix={d} capacity={d}: " ++
+        "tiled P*V byte-identical to per-row sdpa_rows\n", .{
+        clock.ms(), case.name, arm, case.rows, case.prefix, case.capacity,
     });
     return true;
 }
