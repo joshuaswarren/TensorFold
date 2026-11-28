@@ -427,13 +427,31 @@ void main() {
     }
   }
 
-  // Single-key exact transport: sgid 0 alone holds the state, and a finite
-  // lone score is weight one. Widening V[0] directly keeps -0.0 (0x8000) and
-  // subnormal bits the +0.0 merge terms would drop.
+  // Single-key exact transport: a finite lone score is weight one, and
+  // widening V[0] directly keeps -0.0 (0x8000) and subnormal bits the +0.0
+  // merge terms would drop. Only sgid 0 holds key 0's state, so the score is
+  // recomputed here — the finite gate stays uniform across subgroups — and
+  // each subgroup writes its own 2*sgid slice of every 64-dim pair block,
+  // matching the store_pair output partition.
   if (params.matrix_k == 1u) {
-    if (sgid == 0u && !isnan(max_score) && !isinf(max_score)) {
+    uint k0_base = params.rhs_offset + kv_head * params.shape[1] +
+        q_dim * params.in_strides[0];
+    float lone = 0.0;
+    for (uint p = 0u; p < PAIRS; ++p) {
+      lone = fma(
+          q0[p],
+          LD16(key_data.values[k0_base + p * 64u * params.in_strides[0]]),
+          lone);
+      lone = fma(
+          q1[p],
+          LD16(key_data.values[
+              k0_base + (p * 64u + 1u) * params.in_strides[0]]),
+          lone);
+    }
+    lone = subgroupAdd(lone);
+    if (!isnan(lone) && !isinf(lone)) {
       uint v_base = params.aux_offset + kv_head * params.in_strides[1] +
-          q_dim * params.in_strides[3];
+          2u * sgid * params.in_strides[3];
       for (uint p = 0u; p < PAIRS; ++p) {
         store_pair(head, lane, p,
             LD16(value_data.values[
