@@ -1,5 +1,12 @@
 #version 460
-// qmm.comp q4 g64 transposed bf16, 16-byte loads, one batch, zero offsets; same arithmetic; see ops_q4.qmmVariant.
+
+// Clean-room implementation of docs/spec/vulkan-qmm-q4.md section 2.
+// 16-byte vectorized row-major 4-bit affine projection, BF16 in and out:
+//   out[m, n] = sum_k x[m, k] * (float(q[n, k]) * scale[n, k/64] + bias[n, k/64])
+// One thread per output element, grid-stride loop, float32 accumulation.
+// Weight row n is K/32 uvec4 vectors; x row m is K/8 uvec4 vectors (8 bf16 each).
+// Group g covers uvec4 weights 2g..2g+1 and uvec4 x rows 8g..8g+7.
+
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 
@@ -45,47 +52,69 @@ layout(push_constant) uniform Params {
   uint out_strides[4];
 } params;
 
-uint16_t bf16_store(float value) {
-  uint bits = floatBitsToUint(value);
-  if (isnan(value)) {
-    return uint16_t((bits >> 16) | 0x40u);
-  }
-  return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+float bf16_widen(uint16_t h) {
+  return uintBitsToFloat(uint(h) << 16u);
 }
 
-float bf16_value(uint16_t x) {
-  return uintBitsToFloat(uint(x) << 16u);
+// IEEE-754 round-to-nearest-even narrowing, quieting NaN.
+uint16_t bf16_narrow(float x) {
+  uint u = floatBitsToUint(x);
+  if ((u & 0x7fffffffu) > 0x7f800000u) {
+    return uint16_t((u >> 16u) | 0x0040u);
+  }
+  uint lsb = (u >> 16u) & 1u;
+  return uint16_t((u + 0x7fffu + lsb) >> 16u);
+}
+
+// Two bf16 lanes packed in one word: low lane first.
+float bf16_low(uint pair) {
+  return uintBitsToFloat(pair << 16u);
+}
+float bf16_high(uint pair) {
+  return uintBitsToFloat(pair & 0xffff0000u);
 }
 
 void main() {
   uint groups_per_row = params.matrix_k / 64u;
+  uint w_vecs_per_col = params.matrix_k / 32u;
+  uint x_vecs_per_row = params.matrix_k / 8u;
   uint total = params.matrix_m * params.matrix_n;
   uint stride = gl_NumWorkGroups.x * 256u;
-  for (uint index = gl_GlobalInvocationID.x; index < total; index += stride) {
+
+  for (uint index = gl_GlobalInvocationID.x; index < total;
+       index += stride) {
     uint row = index / params.matrix_n;
     uint column = index - row * params.matrix_n;
-    uint w_vec = column * (params.matrix_k / 32u);
-    uint x_vec = row * (params.matrix_k / 8u);
-    uint param_base = column * groups_per_row;
-    float accumulator = 0.0;
+    // Offsets are elements of the bound type; the host's 16-byte alignment
+    // guarantee keeps them uvec4-aligned.
+    uint w_base = params.rhs_offset / 4u + column * w_vecs_per_col;
+    uint x_base = params.lhs_offset / 8u + row * x_vecs_per_row;
+    uint param_base =
+        params.aux_offset + column * groups_per_row;
+    uint bias_base =
+        params.aux_size + column * groups_per_row;
+    float acc = 0.0;
     for (uint group = 0u; group < groups_per_row; ++group) {
-      float scale = bf16_value(scales.values[param_base + group]);
-      float bias = bf16_value(biases.values[param_base + group]);
-      for (uint half_group = 0u; half_group < 2u; ++half_group) {
-        uvec4 w4 = input_w.values[w_vec + group * 2u + half_group];
-        for (uint t = 0u; t < 4u; ++t) {
-          uint word = w4[t];
-          uvec4 x8 = input_x.values[x_vec + group * 8u + half_group * 4u + t];
-          for (uint pair = 0u; pair < 4u; ++pair) {
-            uint x_pair = x8[pair];
-            accumulator += uintBitsToFloat(x_pair << 16u) *
-                (scale * float((word >> (pair * 8u)) & 0xfu) + bias);
-            accumulator += uintBitsToFloat(x_pair & 0xffff0000u) *
-                (scale * float((word >> (pair * 8u + 4u)) & 0xfu) + bias);
+      float scale = bf16_widen(scales.values[param_base + group]);
+      float bias = bf16_widen(biases.values[bias_base + group]);
+      // Two weight vectors a group; each word holds eight 4-bit codes.
+      for (uint v = 0u; v < 2u; ++v) {
+        uvec4 wv = input_w.values[w_base + group * 2u + v];
+        for (uint word_i = 0u; word_i < 4u; ++word_i) {
+          uint word = wv[word_i];
+          // Four x vectors a weight word: two elements per x word lane.
+          uvec4 xv = input_x
+              .values[x_base + group * 8u + v * 4u + word_i];
+          for (uint pair_i = 0u; pair_i < 4u; ++pair_i) {
+            uint xp = xv[pair_i];
+            uint q0 = (word >> (pair_i * 8u)) & 0xfu;
+            uint q1 = (word >> (pair_i * 8u + 4u)) & 0xfu;
+            acc += bf16_low(xp) * (float(q0) * scale + bias);
+            acc += bf16_high(xp) * (float(q1) * scale + bias);
           }
         }
       }
     }
-    output_data.values[params.output_offset + index] = bf16_store(accumulator);
+    output_data.values[params.output_offset + index] = bf16_narrow(acc);
   }
 }
