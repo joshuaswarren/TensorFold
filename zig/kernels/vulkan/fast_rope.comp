@@ -67,6 +67,7 @@ float rope_load(uint abs_index) {
 }
 #ifdef ACT_OUT_BF16
 // F32 rope with a bf16 cache write: element addressing, RNE store.
+#extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 layout(set = 0, binding = 1, std430) writeonly buffer Output {
   uint16_t values[];
@@ -178,8 +179,8 @@ void main() {
         float inv0 = 1.0f / freqs_data.values[params.aux_offset + i0];
         float inv1 = 1.0f / freqs_data.values[params.aux_offset + i1];
 #else
-        float inv0 = exp(-float(i0) * params.beta);
-        float inv1 = exp(-float(i1) * params.beta);
+        float inv0 = rope_inv_freq(i0);
+        float inv1 = rope_inv_freq(i1);
 #endif
         float cos0 = rope_round(omarchy_trig_cos(position * inv0));
         float sin0 = rope_round(omarchy_trig_sin(position * inv0));
@@ -245,7 +246,7 @@ void main() {
 #ifdef USE_FREQS
         float inv_freq = 1.0f / freqs_data.values[params.aux_offset + i];
 #else
-        float inv_freq = exp(-float(i) * params.beta);
+        float inv_freq = rope_inv_freq(i);
 #endif
         float theta = position * inv_freq;
         float cos_t = rope_round(omarchy_trig_cos(theta));
@@ -282,7 +283,7 @@ void main() {
 #ifdef USE_FREQS
             float inv_freq = 1.0f / freqs_data.values[params.aux_offset + i];
 #else
-            float inv_freq = exp(-float(i) * params.beta);
+            float inv_freq = rope_inv_freq(i);
 #endif
             float theta = position * inv_freq;
             float cos_t = rope_round(omarchy_trig_cos(theta));
@@ -338,7 +339,7 @@ void main() {
 #ifdef USE_FREQS
       float inv_freq = 1.0f / freqs_data.values[params.aux_offset + i];
 #else
-      float inv_freq = exp(-float(i) * params.beta);
+      float inv_freq = rope_inv_freq(i);
 #endif
       float theta = position * inv_freq;
       float cos_t = rope_round(omarchy_trig_cos(theta));
@@ -387,7 +388,7 @@ void main() {
 #ifdef USE_FREQS
       float inv_freq = 1.0f / freqs_data.values[params.aux_offset + i];
 #else
-      float inv_freq = exp(-float(i) * params.beta);
+      float inv_freq = rope_inv_freq(i);
 #endif
       float theta = position * inv_freq;
       float cos_t = rope_round(omarchy_trig_cos(theta));

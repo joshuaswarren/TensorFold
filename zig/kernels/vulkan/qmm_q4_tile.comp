@@ -1,6 +1,17 @@
 #version 460
-// qmm_q4_vec4 over tiled weights, 32 columns a tile: words [tile][k/32][lane], scales [tile][group][lane].
-// ACT_F32: x rows and the output are f32 (two vec4 a group of eight), scales and biases stay bf16.
+
+// Clean-room implementation of docs/spec/vulkan-qmm-q4.md section 3.
+// 32-column tiled 4-bit affine projection:
+//   out[m, n] = sum_k x[m, k] * (float(q[n, k]) * scale[n, k/64] + bias[n, k/64])
+// One thread per output element, grid-stride loop, float32 accumulation,
+// single round-to-nearest-even bf16 store (or raw f32 under -DACT_F32).
+//
+// Host-repacked tiled weight layout (tile.zig): column c has tile = c / 32,
+// lane = c % 32. Weight uvec4 j in [0, K/32) lives at uvec4 index
+// ((tile * vectors + j) * 32 + lane); the group's scale and bias bf16 live at
+// uint16 index ((tile * groups + g) * 32 + lane). Consecutive threads over
+// columns of one row make lanes load contiguous 16-byte vectors.
+
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 
@@ -10,11 +21,18 @@ layout(local_size_x = 256) in;
 layout(set = 0, binding = 0, std430) readonly buffer InputX {
   vec4 values[];
 } input_x;
+layout(set = 0, binding = 4, std430) writeonly buffer Output {
+  float values[];
+} output_data;
 #else
 layout(set = 0, binding = 0, std430) readonly buffer InputX {
   uvec4 values[];
 } input_x;
+layout(set = 0, binding = 4, std430) writeonly buffer Output {
+  uint16_t values[];
+} output_data;
 #endif
+
 layout(set = 0, binding = 1, std430) readonly buffer InputW {
   uvec4 values[];
 } input_w;
@@ -24,15 +42,6 @@ layout(set = 0, binding = 2, std430) readonly buffer Scales {
 layout(set = 0, binding = 3, std430) readonly buffer Biases {
   uint16_t values[];
 } biases;
-#ifdef ACT_F32
-layout(set = 0, binding = 4, std430) writeonly buffer Output {
-  float values[];
-} output_data;
-#else
-layout(set = 0, binding = 4, std430) writeonly buffer Output {
-  uint16_t values[];
-} output_data;
-#endif
 
 layout(push_constant) uniform Params {
   uint count;
@@ -58,63 +67,102 @@ layout(push_constant) uniform Params {
   uint out_strides[4];
 } params;
 
-uint16_t bf16_store(float value) {
-  uint bits = floatBitsToUint(value);
-  if (isnan(value)) {
-    return uint16_t((bits >> 16) | 0x40u);
-  }
-  return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+float bf16_widen(uint16_t h) {
+  return uintBitsToFloat(uint(h) << 16u);
 }
 
-float bf16_value(uint16_t x) {
-  return uintBitsToFloat(uint(x) << 16u);
+// IEEE-754 round-to-nearest-even narrowing, quieting NaN.
+uint16_t bf16_narrow(float x) {
+  uint u = floatBitsToUint(x);
+  if ((u & 0x7fffffffu) > 0x7f800000u) {
+    return uint16_t((u >> 16u) | 0x0040u);
+  }
+  uint lsb = (u >> 16u) & 1u;
+  return uint16_t((u + 0x7fffu + lsb) >> 16u);
+}
+
+// Two bf16 lanes packed in one word: low lane first.
+float bf16_low(uint pair) {
+  return uintBitsToFloat(pair << 16u);
+}
+float bf16_high(uint pair) {
+  return uintBitsToFloat(pair & 0xffff0000u);
 }
 
 void main() {
-  uint groups_per_row = params.matrix_k / 64u;
+  uint vectors = params.matrix_k / 32u;
+  uint groups = params.matrix_k / 64u;
   uint total = params.matrix_m * params.matrix_n;
   uint stride = gl_NumWorkGroups.x * 256u;
-  for (uint index = gl_GlobalInvocationID.x; index < total; index += stride) {
+  // x vector count per row: 8 bf16 or 4 f32 elements per 16-byte load.
+#ifdef ACT_F32
+  uint x_vecs_per_row = params.matrix_k / 4u;
+#else
+  uint x_vecs_per_row = params.matrix_k / 8u;
+#endif
+
+  for (uint index = gl_GlobalInvocationID.x; index < total;
+       index += stride) {
     uint row = index / params.matrix_n;
     uint column = index - row * params.matrix_n;
-    uint tile = column >> 5u;
-    uint lane = column & 31u;
-    uint w_base = tile * params.matrix_k + lane;
-    uint x_vec = row * (params.matrix_k / 8u);
-    uint param_base = tile * (groups_per_row * 32u) + lane;
-    float accumulator = 0.0;
-    for (uint group = 0u; group < groups_per_row; ++group) {
-      float scale = bf16_value(scales.values[param_base + group * 32u]);
-      float bias = bf16_value(biases.values[param_base + group * 32u]);
-      for (uint half_group = 0u; half_group < 2u; ++half_group) {
-        uvec4 w4 = input_w.values[w_base + (group * 2u + half_group) * 32u];
-        for (uint t = 0u; t < 4u; ++t) {
-          uint word = w4[t];
-          uint x_at = x_vec + group * 8u + half_group * 4u + t;
+    uint tile = column / 32u;
+    uint lane = column - tile * 32u;
+    uint w_base =
+        params.rhs_offset / 4u + (tile * vectors) * 32u + lane;
+    uint x_base = params.lhs_offset /
 #ifdef ACT_F32
-          vec4 x_lo = input_x.values[x_at * 2u];
-          vec4 x_hi = input_x.values[x_at * 2u + 1u];
-          for (uint e = 0u; e < 8u; ++e) {
-            float xv = e < 4u ? x_lo[e] : x_hi[e - 4u];
-            accumulator += xv * (scale * float((word >> (e * 4u)) & 0xfu) + bias);
-          }
+        4u
 #else
-          uvec4 x8 = input_x.values[x_at];
-          for (uint pair = 0u; pair < 4u; ++pair) {
-            uint x_pair = x8[pair];
-            accumulator += uintBitsToFloat(x_pair << 16u) *
-                (scale * float((word >> (pair * 8u)) & 0xfu) + bias);
-            accumulator += uintBitsToFloat(x_pair & 0xffff0000u) *
-                (scale * float((word >> (pair * 8u + 4u)) & 0xfu) + bias);
+        8u
+#endif
+        + row * x_vecs_per_row;
+    uint scale_base =
+        params.aux_offset + (tile * groups) * 32u + lane;
+    uint bias_base =
+        params.aux_size + (tile * groups) * 32u + lane;
+    float acc = 0.0;
+    for (uint group = 0u; group < groups; ++group) {
+      float scale = bf16_widen(scales.values[scale_base + group * 32u]);
+      float bias = bf16_widen(biases.values[bias_base + group * 32u]);
+      for (uint v = 0u; v < 2u; ++v) {
+        uvec4 wv = input_w.values[w_base + (group * 2u + v) * 32u];
+        for (uint word_i = 0u; word_i < 4u; ++word_i) {
+          uint word = wv[word_i];
+#ifdef ACT_F32
+          // Eight elements per weight word: two f32 vec4 loads.
+          vec4 xa = input_x.values[x_base +
+              group * 16u + v * 8u + word_i * 2u];
+          vec4 xb = input_x.values[x_base +
+              group * 16u + v * 8u + word_i * 2u + 1u];
+          acc += xa.x * (float(word & 0xfu) * scale + bias);
+          acc += xa.y * (float((word >> 4u) & 0xfu) * scale + bias);
+          acc += xa.z * (float((word >> 8u) & 0xfu) * scale + bias);
+          acc += xa.w * (float((word >> 12u) & 0xfu) * scale + bias);
+          acc += xb.x * (float((word >> 16u) & 0xfu) * scale + bias);
+          acc += xb.y * (float((word >> 20u) & 0xfu) * scale + bias);
+          acc += xb.z * (float((word >> 24u) & 0xfu) * scale + bias);
+          acc += xb.w * (float((word >> 28u) & 0xfu) * scale + bias);
+#else
+          // One x uvec4 a weight word: a word pair per two codes.
+          uvec4 xv = input_x.values[x_base +
+              group * 8u + v * 4u + word_i];
+          for (uint pair_i = 0u; pair_i < 4u; ++pair_i) {
+            uint xp = xv[pair_i];
+            acc += bf16_low(xp) *
+                (float((word >> (pair_i * 8u)) & 0xfu) * scale + bias);
+            acc += bf16_high(xp) *
+                (float((word >> (pair_i * 8u + 4u)) & 0xfu) * scale +
+                    bias);
           }
 #endif
         }
       }
     }
 #ifdef ACT_F32
-    output_data.values[params.output_offset + index] = accumulator;
+    output_data.values[params.output_offset + index] = acc;
 #else
-    output_data.values[params.output_offset + index] = bf16_store(accumulator);
+    output_data.values[params.output_offset + index] =
+        bf16_narrow(acc);
 #endif
   }
 }

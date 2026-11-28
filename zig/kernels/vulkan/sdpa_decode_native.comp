@@ -245,6 +245,28 @@ void main() {
   }
   barrier();
 
+  // Single-key exact transport: a finite lone score is softmax weight one, and
+  // widening V[0] directly keeps -0.0 (0x8000) and subnormal bits that a
+  // zero-start accumulate would lose.
+  if (key_end == 1u) {
+    float single_score = s_stream[0];
+    if (!isnan(single_score) && !isinf(single_score)) {
+      if (thread < SDPA_DIM) {
+        uint d = thread;
+        float v0 = bf16_load(
+            value_data.values[v_batch + kv_head * params.in_strides[1] +
+                d * params.in_strides[3]]);
+#ifdef SDPA_ROWS
+        output_data.values[o_batch + head * params.shape[0] +
+            row * params.out_strides[0] + d] = OUT_STORE(v0);
+#else
+        output_data.values[o_batch + head * SDPA_DIM + d] = OUT_STORE(v0);
+#endif
+      }
+      return;
+    }
+  }
+
   // Row max: strided scan then the 256-lane binary tree.
   if (thread < 256u) {
     float local_max = uintBitsToFloat(0xff800000u);
@@ -403,6 +425,43 @@ void main() {
           exp_score * LD16(value_data.values[
               v_base + (p * 64u + 1u) * params.in_strides[3]]));
     }
+  }
+
+  // Single-key exact transport: a finite lone score is weight one, and
+  // widening V[0] directly keeps -0.0 (0x8000) and subnormal bits the +0.0
+  // merge terms would drop. Only sgid 0 holds key 0's state, so the score is
+  // recomputed here — the finite gate stays uniform across subgroups — and
+  // each subgroup writes its own 2*sgid slice of every 64-dim pair block,
+  // matching the store_pair output partition.
+  if (params.matrix_k == 1u) {
+    uint k0_base = params.rhs_offset + kv_head * params.shape[1] +
+        q_dim * params.in_strides[0];
+    float lone = 0.0;
+    for (uint p = 0u; p < PAIRS; ++p) {
+      lone = fma(
+          q0[p],
+          LD16(key_data.values[k0_base + p * 64u * params.in_strides[0]]),
+          lone);
+      lone = fma(
+          q1[p],
+          LD16(key_data.values[
+              k0_base + (p * 64u + 1u) * params.in_strides[0]]),
+          lone);
+    }
+    lone = subgroupAdd(lone);
+    if (!isnan(lone) && !isinf(lone)) {
+      uint v_base = params.aux_offset + kv_head * params.in_strides[1] +
+          2u * sgid * params.in_strides[3];
+      for (uint p = 0u; p < PAIRS; ++p) {
+        store_pair(head, lane, p,
+            LD16(value_data.values[
+                v_base + p * 64u * params.in_strides[3]]),
+            LD16(value_data.values[
+                v_base + (p * 64u + 1u) * params.in_strides[3]]),
+            1.0);
+      }
+    }
+    return;
   }
 
   if (lane == 0u) {
